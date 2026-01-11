@@ -21,6 +21,8 @@ For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
 ## About
 
+This is RunKV version of vLLM.
+
 vLLM is a fast and easy-to-use library for LLM inference and serving.
 
 Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has evolved into a community-driven project with contributions from both academia and industry.
