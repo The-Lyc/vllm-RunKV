@@ -11,8 +11,7 @@ from contextlib import contextmanager
 from copy import copy, deepcopy
 from functools import reduce
 from itertools import product
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
-
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, TypeAlias, cast
 import numpy as np
 import torch
 import torch.distributed
@@ -112,6 +111,7 @@ from vllm.v1.attention.backends.utils import (
     reorder_batch_to_split_decodes_and_prefills,
     split_attn_metadata,
 )
+from vllm.v1.core.kv_cache_offload_config import RunKVOffloadConfig
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -311,6 +311,286 @@ class ExecuteModelState(NamedTuple):
     cudagraph_stats: CUDAGraphStat | None
 
 
+class PagedBlockMapper:
+    """Map logical KV blocks on CPU to a limited set of GPU staging slots.
+    
+    Design Overview:
+    ----------------
+    This mapper enables KV cache offloading by maintaining:
+    - CPU: Full KV cache storage (authoritative, managed by vLLM scheduler)
+      - Contains ALL KV data for all sequences
+      - Indexed by "logical block ID" (assigned by scheduler)
+    - GPU: Limited staging buffers (ring of `num_device_buffers` buffers)
+      - Each buffer has `capacity` staging slots (much smaller than CPU)
+      - Indexed by "staging slot" (0 to capacity-1)
+    
+    Key Concepts:
+    - Logical block ID: CPU-side block ID from scheduler's allocation (can be large)
+    - Staging slot: GPU buffer index (0 to capacity-1), temporary mapping per step
+    - Physical block table: Maps (req, block_idx) -> staging_slot for attention kernels
+    - Slot mapping: Maps token position -> flat index in GPU buffer for KV write
+    
+    Capacity Relationship:
+    - CPU can hold N_cpu blocks (e.g., thousands)
+    - GPU staging buffer holds N_gpu blocks (e.g., hundreds), N_gpu << N_cpu
+    - Each step, we select which CPU blocks to stage into GPU slots
+    - If a step needs more unique blocks than N_gpu, it fails
+    
+    Per-step workflow:
+    1. prepare_step(): Collect ALL logical blocks needed, assign staging slots,
+       build physical block table & slot mapping for attention kernels
+    2. load_layer(): Before each attention layer, copy CPU->GPU for that layer
+    3. flush_layer(): After each attention layer, copy GPU->CPU for dirty blocks
+    
+    The attention kernel uses physical_block_table to index into GPU staging
+    buffers, which temporarily hold the KV data for all blocks needed this step.
+    """
+
+    def __init__(
+        self,
+        block_size: int,
+        gpu_buffers: dict[int, torch.Tensor],
+        cpu_caches_per_layer: dict[str, torch.Tensor],
+        device: torch.device,
+    ) -> None:
+        """Initialize the PagedBlockMapper.
+        
+        Args:
+            block_size: Number of tokens per KV block.
+            gpu_buffers: Dict mapping buffer_idx -> GPU staging tensor.
+                Each buffer has shape [staging_capacity, ...] where staging_capacity
+                is the number of blocks that can be held in GPU memory.
+            cpu_caches_per_layer: Dict mapping layer_name -> CPU KV tensor.
+                Each tensor has shape [total_cpu_blocks, ...] where total_cpu_blocks
+                is the full capacity managed by the scheduler.
+            device: Target GPU device.
+        """
+        self.block_size = block_size
+        self.gpu_buffers = gpu_buffers
+        self.cpu_caches_per_layer = cpu_caches_per_layer
+        self.device = device
+
+        # Staging capacity: how many blocks each GPU buffer can hold
+        # This is SMALLER than CPU capacity
+        any_buffer = next(iter(gpu_buffers.values()))
+        self.capacity = any_buffer.shape[0]  # GPU staging slots available
+        self.num_buffers = len(gpu_buffers)
+        
+        # Mapping: logical_block_id (CPU) -> staging_slot (GPU)
+        # Rebuilt each step based on which blocks are needed
+        self.mapping: dict[int, int] = {}
+        
+        # Track which logical blocks are being written to this step
+        # (these need to be flushed back to CPU after the layer)
+        self.dirty_blocks: set[int] = set()
+        
+        # CUDA stream for async CPU<->GPU transfers
+        self.transfer_stream = torch.cuda.Stream(device=device)
+
+    def _assign_slots(self, logical_block_ids: list[int]) -> None:
+        """Assign GPU staging slots for the given logical blocks.
+        
+        This method maps each unique logical block ID (CPU) to a staging slot
+        (GPU) in the range [0, capacity). The mapping is rebuilt each step.
+        
+        Args:
+            logical_block_ids: List of unique logical block IDs (CPU-side) that
+                need to be staged to GPU this step. These come from the scheduler's
+                block allocation and represent all blocks needed for attention.
+            
+        Raises:
+            RuntimeError: If more blocks are needed than GPU staging capacity.
+                This means the batch is too large or sequences too long for
+                the configured staging buffer size.
+        """
+        self.mapping.clear()
+        if len(logical_block_ids) > self.capacity:
+            raise RuntimeError(
+                f"This step needs {len(logical_block_ids)} unique blocks but GPU "
+                f"staging buffer only has {self.capacity} slots. "
+                f"Options: increase max_staging_blocks, reduce batch size, "
+                f"or reduce max sequence length."
+            )
+        for slot, logical_id in enumerate(logical_block_ids):
+            self.mapping[logical_id] = slot
+
+    def prepare_step(
+        self,
+        logical_block_table: np.ndarray,
+        num_blocks_per_row: np.ndarray,
+        req_indices: np.ndarray,
+        positions: np.ndarray,
+        max_num_blocks_per_req: int,
+        num_reqs: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, set[int]]:
+        """Build per-step physical block table and slot mapping.
+        
+        This method:
+        1. Identifies "dirty" blocks (blocks where new KV will be written)
+        2. Collects ALL logical blocks referenced by scheduled requests
+           (attention needs full history, not just current tokens)
+        3. Assigns staging slots for all needed blocks
+        4. Builds physical_block_table for attention kernel
+        5. Builds slot_mapping for KV cache write operations (reshape_and_cache)
+        
+        NOTE: The logical_block_table is read from input_batch.block_table,
+        which has ALREADY been updated by _update_states() with the scheduler's
+        block allocations BEFORE this method is called. So we are reading
+        the authoritative block allocation from the scheduler.
+        
+        How these outputs are used by attention kernels:
+        - physical_block_table: Passed to CommonAttentionMetadata.block_table_tensor,
+          used by paged attention kernels to look up KV blocks
+        - slot_mapping: Passed to CommonAttentionMetadata.slot_mapping,
+          used by reshape_and_cache kernel to write new KV data
+        - Both are substituted in _build_attention_metadata() when use_runkv=True
+        
+        Args:
+            logical_block_table: CPU logical block table [max_reqs, max_blocks].
+                Entry [i, j] is the logical block ID for request i's j-th block.
+                This comes from input_batch.block_table which is already updated.
+            num_blocks_per_row: Number of valid blocks per request.
+            req_indices: Indices of requests scheduled this step.
+            positions: Token positions being processed this step.
+            max_num_blocks_per_req: Max blocks per request (for output shape).
+            num_reqs: Number of requests this step.
+            
+        Returns:
+            physical_block_table: [num_reqs, max_num_blocks_per_req] tensor
+                where entry [i, j] is the GPU STAGING SLOT (not logical ID) for
+                request i's j-th block. Attention kernel uses this to index
+                into GPU staging buffer.
+            slot_mapping: [num_tokens] tensor. vLLM's slot_mapping convention:
+                slot_mapping[i] = block_idx * block_size + offset_in_block
+                Here block_idx is the staging slot (GPU), not logical block ID.
+                Used by reshape_and_cache to write token i's KV into GPU buffer.
+            dirty_blocks: Set of logical block IDs that will be written to.
+                These need to be flushed back to CPU after the layer.
+        """
+        # Determine which blocks contain the tokens being processed this step
+        # (these are "dirty" - they will be written to by the attention layer)
+        block_indices = positions // self.block_size
+        self.dirty_blocks.clear()
+        for req_idx, blk_idx in zip(req_indices.tolist(), block_indices.tolist()):
+            logical_id = int(logical_block_table[req_idx, blk_idx])
+            self.dirty_blocks.add(logical_id)
+        
+        # Collect ALL logical blocks referenced by scheduled requests
+        # Attention needs full history for each sequence, not just current tokens
+        # TODO: This could be optimized by having scheduler provide this list directly
+        all_needed: list[int] = []
+        seen: set[int] = set()
+        for row in range(num_reqs):
+            row_blocks = int(num_blocks_per_row[row])
+            for col in range(row_blocks):
+                logical_id = int(logical_block_table[row, col])
+                if logical_id not in seen:
+                    seen.add(logical_id)
+                    all_needed.append(logical_id)
+
+        # Assign GPU staging slots for all needed blocks
+        self._assign_slots(all_needed)
+
+        # Build physical block table: [num_reqs, max_num_blocks_per_req]
+        # Each entry is a STAGING SLOT (GPU index), not a logical block ID
+        physical_block_table = torch.full(
+            (num_reqs, max_num_blocks_per_req),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        for row in range(num_reqs):
+            row_blocks = int(num_blocks_per_row[row])
+            if row_blocks == 0:
+                continue
+            logical_row = logical_block_table[row, :row_blocks]
+            mapped = [self.mapping[int(bid)] for bid in logical_row]
+            physical_block_table[row, :row_blocks] = torch.tensor(
+                mapped, dtype=torch.int32, device=self.device
+            )
+
+        # Build slot_mapping for tokens being processed this step.
+        # vLLM convention: slot_mapping[token_i] = block_idx * block_size + offset
+        # The reshape_and_cache kernel uses this to compute:
+        #   block_idx = slot_mapping[token_i] / block_size  -> which GPU staging slot
+        #   block_offset = slot_mapping[token_i] % block_size  -> position within block
+        # Here we use staging_slot (GPU buffer index) as block_idx.
+        slot_mapping = torch.full(
+            (positions.shape[0],), -1, dtype=torch.int64, device=self.device
+        )
+        block_offsets = positions % self.block_size
+        for i, (req_idx, blk_idx, offset) in enumerate(
+            zip(req_indices.tolist(), block_indices.tolist(), block_offsets.tolist())
+        ):
+            logical_id = int(logical_block_table[req_idx, blk_idx])
+            staging_slot = self.mapping[logical_id]
+            slot_mapping[i] = staging_slot * self.block_size + int(offset)
+
+        # Return a copy of dirty_blocks because:
+        # 1. We need logical IDs to know which CPU blocks to update
+        # 2. The mapping from logical_id -> staging_slot is ephemeral
+        # 3. flush_layer uses logical IDs to update the correct CPU blocks
+        return physical_block_table, slot_mapping, set(self.dirty_blocks)
+
+    def load_layer(self, layer_name: str, layer_idx: int) -> int:
+        """Copy mapped logical blocks from CPU to GPU staging buffer.
+        
+        Before each attention layer runs, this method stages all needed
+        KV data from CPU to the appropriate GPU ring buffer.
+        
+        Args:
+            layer_name: Name of the attention layer (for CPU cache lookup).
+            layer_idx: Index of the layer (for ring buffer selection).
+            
+        Returns:
+            buffer_idx: The GPU buffer index used for this layer.
+        """
+        if not self.mapping:
+            return 0
+        buffer_idx = layer_idx % self.num_buffers
+        gpu_buffer = self.gpu_buffers[buffer_idx]
+        cpu_cache = self.cpu_caches_per_layer[layer_name]
+        
+        # Copy all mapped blocks from CPU to GPU staging slots
+        # Use non-blocking copy with dedicated stream for overlap
+        with torch.cuda.stream(self.transfer_stream):
+            for logical_id, slot in self.mapping.items():
+                gpu_buffer[slot].copy_(cpu_cache[logical_id], non_blocking=True)
+        
+        # Synchronize to ensure data is available before attention computes
+        self.transfer_stream.synchronize()
+        return buffer_idx
+
+    def flush_layer(
+        self, layer_name: str, layer_idx: int, dirty_blocks: set[int]
+    ) -> None:
+        """Copy dirty blocks from GPU staging buffer back to CPU.
+        
+        After each attention layer runs, this method writes back the
+        blocks that were modified (i.e., blocks where new KV was written).
+        
+        Args:
+            layer_name: Name of the attention layer (for CPU cache lookup).
+            layer_idx: Index of the layer (for ring buffer selection).
+            dirty_blocks: Set of logical block IDs that were written to.
+        """
+        if not dirty_blocks:
+            return
+        buffer_idx = layer_idx % self.num_buffers
+        gpu_buffer = self.gpu_buffers[buffer_idx]
+        cpu_cache = self.cpu_caches_per_layer[layer_name]
+        
+        # Copy only dirty blocks back to CPU
+        with torch.cuda.stream(self.transfer_stream):
+            for logical_id in dirty_blocks:
+                slot = self.mapping.get(logical_id)
+                if slot is None:
+                    continue
+                cpu_cache[logical_id].copy_(gpu_buffer[slot], non_blocking=True)
+        
+        # Synchronize to ensure CPU cache is updated before next step
+        self.transfer_stream.synchronize()
+
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
@@ -329,6 +609,14 @@ class GPUModelRunner(
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+
+        # offloading parameters
+        self.kv_offload_config = vllm_config.kv_offload_config
+        
+        if self.kv_offload_config and self.kv_offload_config.enabled:
+            self.use_runkv = True
+        else:
+            self.use_runkv = False  
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
 
@@ -416,6 +704,17 @@ class GPUModelRunner(
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
+
+        # Paging KV: CPU full cache + limited GPU buffers
+        self.kv_buffers: dict[int, torch.Tensor] = {}
+        self.cpu_kv_caches_per_layer: dict[str, torch.Tensor] = {}
+        self.layer_name_to_idx: dict[str, int] = {}
+        self.paged_block_mappers: list[PagedBlockMapper] = []
+        self.paged_dirty_blocks: list[set[int]] = []
+        self._staging_blocks_per_buffer: int = 0  # Set in _allocate_kv_buffer_tensors
+        self.paged_block_tables: list[torch.Tensor] = []
+        self.paged_slot_mappings: list[torch.Tensor] = []
+        self.runkv_hooks: list[Any] = []
 
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
@@ -1361,7 +1660,8 @@ class GPUModelRunner(
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
-        self.input_batch.block_table.commit_block_table(num_reqs)
+        if not self.use_runkv:
+            self.input_batch.block_table.commit_block_table(num_reqs)
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -1454,8 +1754,19 @@ class GPUModelRunner(
 
                 output_idx += num_sched
 
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+        if self.use_runkv:
+            # Build per-step physical mapping using staging buffers
+            # (scheduler_output already encodes the CPU-side logical allocation).
+            self._prepare_paged_block_tables(
+                req_indices,
+                positions_np,
+                total_num_scheduled_tokens,
+                num_reqs,
+                scheduler_output,
+            )
+        else:
+            self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
+            self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
@@ -1564,6 +1875,118 @@ class GPUModelRunner(
             spec_decode_metadata,
         )
 
+    def _prepare_paged_block_tables(
+        self,
+        req_indices: np.ndarray,
+        positions_np: np.ndarray,
+        total_num_scheduled_tokens: int,
+        num_reqs: int,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """Build per-step physical block table and slot mapping for RunKV.
+        
+        This method is called AFTER _update_states() has already processed
+        scheduler_output and updated input_batch.block_table with the new
+        block allocations. So we read the authoritative block allocation
+        from input_batch.block_table, not directly from scheduler_output.
+        
+        The outputs (paged_block_tables, paged_slot_mappings) are then used
+        by _build_attention_metadata() to construct CommonAttentionMetadata,
+        which replaces the normal block_table_tensor and slot_mapping when
+        use_runkv is True.
+
+        Args:
+            req_indices: Request indices for tokens scheduled this step.
+            positions_np: Token positions being processed this step.
+            total_num_scheduled_tokens: Total tokens scheduled.
+            num_reqs: Number of requests this step.
+            scheduler_output: Scheduler output (kept for potential future use).
+        """
+        logical_tables = [
+            bt.get_numpy_array() for bt in self.input_batch.block_table.block_tables
+        ]
+        num_blocks_per_row = [
+            bt.num_blocks_per_row for bt in self.input_batch.block_table.block_tables
+        ]
+
+        for gid, mapper in enumerate(self.paged_block_mappers):
+            logical_table = logical_tables[gid]
+            num_blocks = num_blocks_per_row[gid]
+            max_num_blocks_per_req = self.input_batch.block_table[
+                gid
+            ].max_num_blocks_per_req
+            self.paged_block_tables[gid].fill_(-1)
+            self.paged_slot_mappings[gid].fill_(-1)
+
+            physical_table, slot_mapping, touched = mapper.prepare_step(
+                logical_table,
+                num_blocks,
+                req_indices,
+                positions_np,
+                max_num_blocks_per_req,
+                num_reqs,
+            )
+            self.paged_block_tables[gid][: num_reqs, : max_num_blocks_per_req] = (
+                physical_table
+            )
+            self.paged_slot_mappings[gid][:total_num_scheduled_tokens] = slot_mapping
+            self.paged_dirty_blocks[gid] = touched
+
+    def _flush_paged_blocks(self) -> None:
+        """Write back staging buffers for blocks touched in the current step."""
+        for gid, mapper in enumerate(self.paged_block_mappers):
+            dirty = self.paged_dirty_blocks[gid]
+            dirty.clear()
+
+    def _register_runkv_hooks(self, layer_to_gid: dict[str, int]) -> None:
+        """Register pre/post hooks to stage KV into ring buffers per layer."""
+        for handle in self.runkv_hooks:
+            handle.remove()
+        self.runkv_hooks.clear()
+
+        for layer_name, attn_module in self.compilation_config.static_forward_context.items():
+            if layer_name not in layer_to_gid or layer_name not in self.layer_name_to_idx:
+                continue
+            gid = layer_to_gid[layer_name]
+            layer_idx = self.layer_name_to_idx[layer_name]
+            pre_hook = functools.partial(
+                self._runkv_pre_hook,
+                layer_name=layer_name,
+                layer_idx=layer_idx,
+                gid=gid,
+            )
+            post_hook = functools.partial(
+                self._runkv_post_hook,
+                layer_name=layer_name,
+                layer_idx=layer_idx,
+                gid=gid,
+            )
+            self.runkv_hooks.append(attn_module.register_forward_pre_hook(pre_hook))
+            self.runkv_hooks.append(attn_module.register_forward_hook(post_hook))
+
+    def _runkv_pre_hook(
+        self,
+        module: nn.Module,
+        inputs: tuple[Any, ...],
+        layer_name: str,
+        layer_idx: int,
+        gid: int,
+    ) -> None:
+        self.paged_block_mappers[gid].load_layer(layer_name, layer_idx)
+
+    def _runkv_post_hook(
+        self,
+        module: nn.Module,
+        inputs: tuple[Any, ...],
+        output: Any,
+        layer_name: str,
+        layer_idx: int,
+        gid: int,
+    ) -> None:
+        self.paged_block_mappers[gid].flush_layer(
+            layer_name, layer_idx, self.paged_dirty_blocks[gid]
+        )
+
     def _build_attention_metadata(
         self,
         num_tokens: int,
@@ -1628,6 +2051,13 @@ class GPUModelRunner(
                 blk_table = self.input_batch.block_table[kv_cache_gid]
                 blk_table_tensor = blk_table.get_device_tensor(num_reqs_padded)
                 slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_padded]
+                if self.use_runkv:
+                    blk_table_tensor = self.paged_block_tables[kv_cache_gid][
+                        :num_reqs_padded
+                    ]
+                    slot_mapping = self.paged_slot_mappings[kv_cache_gid][
+                        :num_tokens_padded
+                    ]
 
             # Fill unused with -1. Needed for reshape_and_cache in full cuda
             # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
@@ -3304,6 +3734,10 @@ class GPUModelRunner(
 
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
+
+                if self.use_runkv:
+                    # Flush staging buffers back to CPU after KV writes.
+                    self._flush_paged_blocks()
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -5307,9 +5741,221 @@ class GPUModelRunner(
                 num_speculative_tokens=self.num_spec_tokens,
             )
 
+    def _compute_staging_buffer_size(
+        self, 
+        kv_cache_config: KVCacheConfig,
+        kv_offload_config: RunKVOffloadConfig,
+    ) -> int:
+        """Compute the number of blocks for each GPU staging buffer.
+        
+        The staging buffer capacity determines how many KV blocks can be
+        held in GPU memory simultaneously. This limits the batch size and
+        sequence lengths that can be processed in a single step.
+        
+        Returns:
+            Number of blocks per staging buffer.
+        """
+        # If explicitly configured, use that value
+        if kv_offload_config.max_staging_blocks is not None:
+            return kv_offload_config.max_staging_blocks
+        
+        # Otherwise, compute based on available GPU memory
+        # Get available GPU memory
+        free_memory, total_memory = torch.cuda.mem_get_info(self.device)
+        
+        # Use configured fraction of free memory for staging
+        staging_memory = int(free_memory * kv_offload_config.gpu_memory_fraction)
+        
+        # Get the page size from the first KV cache tensor
+        if not kv_cache_config.kv_cache_tensors:
+            raise RuntimeError("No KV cache tensors configured")
+        
+        # Calculate bytes per block from the first tensor's configuration
+        first_tensor = kv_cache_config.kv_cache_tensors[0]
+        total_cpu_blocks = 0
+        bytes_per_block = 0
+        
+        for kv_cache_group in kv_cache_config.kv_cache_groups:
+            kv_cache_spec = kv_cache_group.kv_cache_spec
+            if isinstance(kv_cache_spec, AttentionSpec):
+                bytes_per_block = kv_cache_spec.page_size_bytes
+                break
+        
+        if bytes_per_block == 0:
+            # Fallback: estimate from tensor size and assumed block count
+            # This is a rough estimate
+            bytes_per_block = first_tensor.size // max(1, self.max_num_reqs * 10)
+            logger.warning(
+                f"Could not determine page_size_bytes, using estimate: {bytes_per_block}"
+            )
+        
+        # Divide memory by (num_buffers * bytes_per_block) to get blocks per buffer
+        num_buffers = kv_offload_config.num_device_buffers
+        blocks_per_buffer = staging_memory // (num_buffers * bytes_per_block)
+        
+        # Ensure at least some minimum capacity
+        min_blocks = 64  # At least 64 blocks per buffer
+        blocks_per_buffer = max(blocks_per_buffer, min_blocks)
+        
+        logger.info(
+            f"RunKV staging buffer: {blocks_per_buffer} blocks per buffer, "
+            f"{num_buffers} buffers, {bytes_per_block} bytes/block, "
+            f"total staging memory: {blocks_per_buffer * num_buffers * bytes_per_block / (1024**2):.1f} MB"
+        )
+        
+        return blocks_per_buffer
+
+    def _allocate_kv_buffer_tensors(
+        self, kv_cache_config: KVCacheConfig, kv_offload_config: RunKVOffloadConfig
+    ) -> dict[int, torch.Tensor]:
+        """Allocate GPU staging buffers for RunKV offloading.
+        
+        These buffers are SMALLER than the full CPU KV cache. The size is 
+        determined by:
+        1. Explicit max_staging_blocks configuration, OR
+        2. Computed from available GPU memory and gpu_memory_fraction
+        
+        Each buffer can hold `staging_blocks` number of KV blocks, where
+        each block contains `block_size` tokens worth of KV data.
+        """
+        kv_buffer_raw_tensors: dict[int, torch.Tensor] = {}
+        num_device_buffers = kv_offload_config.num_device_buffers
+        
+        # Compute staging capacity (blocks per buffer)
+        staging_blocks = self._compute_staging_buffer_size(
+            kv_cache_config, kv_offload_config
+        )
+        
+        # Store for later use by PagedBlockMapper
+        self._staging_blocks_per_buffer = staging_blocks
+
+        for buffer_idx, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
+            if buffer_idx >= num_device_buffers:
+                break
+            
+            # Calculate buffer size: staging_blocks * bytes_per_block
+            # The original tensor size is for the full CPU cache
+            # We need to scale it down proportionally
+            full_cpu_blocks = 0
+            bytes_per_block = 0
+            
+            for kv_cache_group in kv_cache_config.kv_cache_groups:
+                kv_cache_spec = kv_cache_group.kv_cache_spec
+                if isinstance(kv_cache_spec, AttentionSpec):
+                    bytes_per_block = kv_cache_spec.page_size_bytes
+                    full_cpu_blocks = kv_cache_tensor.size // bytes_per_block
+                    break
+            
+            if bytes_per_block == 0:
+                # Fallback: use a fraction of the original size
+                buffer_size = kv_cache_tensor.size // 10  # 10% of CPU cache
+                logger.warning(
+                    f"Could not determine page_size_bytes for buffer {buffer_idx}, "
+                    f"using {buffer_size} bytes"
+                )
+            else:
+                buffer_size = staging_blocks * bytes_per_block
+            
+            tensor = torch.zeros(buffer_size, dtype=torch.int8, device=self.device)
+            kv_buffer_raw_tensors[buffer_idx] = tensor
+            
+            logger.debug(
+                f"Allocated staging buffer {buffer_idx}: {staging_blocks} blocks, "
+                f"{buffer_size / (1024**2):.1f} MB "
+                f"(CPU cache has {full_cpu_blocks} blocks)"
+            )
+
+        return kv_buffer_raw_tensors
+
+    def _reshape_kv_buffer_tensors(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kv_offlaod_config: RunKVOffloadConfig,
+        kv_buffer_raw_tensors: dict[int, torch.Tensor],
+        kernel_block_sizes: list[int],
+    ) -> dict[int, torch.Tensor]:
+        """
+        Reshape the KV buffer tensors to the desired shape and dtype.
+
+        Args:
+            kv_cache_config: The KV cache config
+            kv_cache_raw_tensors: The KV cache buffer of each layer, with
+                correct size but uninitialized shape.
+            kernel_block_sizes: The kernel block sizes for each KV cache group.
+        Returns:
+            Dict[str, torch.Tensor]: A map between layer names to their
+            corresponding memory buffer for KV cache.
+        """
+        #TODO: best to manage buffers within a whole tensor to reshape whenever needed
+        kv_buffers: dict[int, torch.Tensor] = {}
+        for group in self._kv_cache_spec_attn_group_iterator():
+            kv_cache_spec = group.kv_cache_spec
+            attn_backend = group.backend
+            if group.kv_cache_group_id == len(kernel_block_sizes):
+                # There may be a last group for layers without kv cache.
+                continue
+            kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
+            for buffer_idx, layer_name in enumerate(group.layer_names):
+                if layer_name in self.runner_only_attn_layers:
+                    continue
+                raw_tensor = kv_buffer_raw_tensors[buffer_idx]
+                assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+                num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                if isinstance(kv_cache_spec, AttentionSpec):
+                    num_blocks_per_kv_block = (
+                        kv_cache_spec.block_size // kernel_block_size
+                    )
+                    kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+
+                    kv_cache_shape = attn_backend.get_kv_cache_shape(
+                        kernel_num_blocks,
+                        kernel_block_size,
+                        kv_cache_spec.num_kv_heads,
+                        kv_cache_spec.head_size,
+                        cache_dtype_str=self.cache_config.cache_dtype,
+                    )
+                    dtype = kv_cache_spec.dtype
+                    try:
+                        kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
+                        assert len(kv_cache_stride_order) == len(kv_cache_shape)
+                    except (AttributeError, NotImplementedError):
+                        kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
+                    # The allocation respects the backend-defined stride order
+                    # to ensure the semantic remains consistent for each
+                    # backend. We first obtain the generic kv cache shape and
+                    # then permute it according to the stride order which could
+                    # result in a non-contiguous tensor.
+                    kv_cache_shape = tuple(
+                        kv_cache_shape[i] for i in kv_cache_stride_order
+                    )
+                    # Maintain original KV shape view.
+                    inv_order = [
+                        kv_cache_stride_order.index(i)
+                        for i in range(len(kv_cache_stride_order))
+                    ]
+                    kv_buffers[buffer_idx] = (
+                        kv_buffer_raw_tensors[buffer_idx]
+                        .view(dtype)
+                        .view(kv_cache_shape)
+                        .permute(*inv_order)
+                    )
+                else:
+                    raise NotImplementedError
+                if buffer_idx >= kv_offlaod_config.num_device_buffers - 1:
+                    break
+
+        return kv_buffers
+
     def _allocate_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig
     ) -> dict[str, torch.Tensor]:
+        # if using RunKV, allocate paging blocks(bound with GPUModelRunner to do real paging) on CPU
+        paging_tensor_device = None
+        if self.use_runkv:
+            paging_tensor_device = torch.device("cpu")
+        else:
+            paging_tensor_device = self.device
+
         """
         Initializes the KV cache buffer with the correct size. The buffer needs
         to be reshaped to the desired shape before being used by the models.
@@ -5323,7 +5969,7 @@ class GPUModelRunner(
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             tensor = torch.zeros(
-                kv_cache_tensor.size, dtype=torch.int8, device=self.device
+                kv_cache_tensor.size, dtype=torch.int8, device=paging_tensor_device
             )
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
@@ -5539,7 +6185,7 @@ class GPUModelRunner(
 
         # Try creating KV caches optimized for kv-connector transfers
         cache_dtype = self.cache_config.cache_dtype
-        if self.use_uniform_kv_cache(self.attn_groups, cache_dtype):
+        if self.use_uniform_kv_cache(self.attn_groups, cache_dtype) and self.use_runkv is not True:
             kv_caches, cross_layers_kv_cache, attn_backend = (
                 self.allocate_uniform_kv_caches(
                     kv_cache_config,
@@ -5561,6 +6207,19 @@ class GPUModelRunner(
                 kv_cache_config, kv_cache_raw_tensors, kernel_block_sizes
             )
 
+        if self.use_runkv:
+            kv_buffer_raw_tensors = self._allocate_kv_buffer_tensors(
+                kv_cache_config, self.kv_offload_config
+            )
+            kv_buffers = self._reshape_kv_buffer_tensors(
+                kv_cache_config,
+                self.kv_offload_config,
+                kv_buffer_raw_tensors,
+                kernel_block_sizes,
+            )
+            self.kv_buffers = dict(kv_buffers)
+            self.cpu_kv_caches_per_layer = dict(kv_caches)
+
         # Set up cross-layer KV cache sharing
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
@@ -5569,12 +6228,71 @@ class GPUModelRunner(
         num_attn_module = (
             2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
         )
+
+        """ 
+        (1) if use RunKV policy, bind CPU kv tensors to ModelRunner's kv_caches and bind GPU buffer tensors to forward context
+        (2) if use original bind policy in vLLM, bind GPU kv tensors to both ModelRunner and forward context
+        """
         bind_kv_cache(
             kv_caches,
             self.compilation_config.static_forward_context,
             self.kv_caches,
             num_attn_module,
         )
+
+        if self.use_runkv:
+            # Override forward_context to point to staging GPU buffers.
+            buffer_indices = list(self.kv_buffers.keys())
+            self.layer_name_to_idx.clear()
+            for layer_idx, layer_name in enumerate(kv_caches.keys()):
+                self.layer_name_to_idx[layer_name] = layer_idx
+                if layer_name not in self.compilation_config.static_forward_context:
+                    continue
+                buf_idx = buffer_indices[layer_idx % len(buffer_indices)]
+                attn_module = self.compilation_config.static_forward_context[layer_name]
+                attn_module.kv_cache = [
+                    self.kv_buffers[buf_idx] for _ in range(len(attn_module.kv_cache))
+                ]
+
+            # Build paged block mappers per KV cache group.
+            self.paged_block_mappers.clear()
+            self.paged_dirty_blocks.clear()
+            self.paged_block_tables.clear()
+            self.paged_slot_mappings.clear()
+            group_block_sizes = [
+                kv_cache_group.kv_cache_spec.block_size
+                for kv_cache_group in kv_cache_config.kv_cache_groups
+            ]
+            for group_idx, block_size in enumerate(group_block_sizes):
+                mapper = PagedBlockMapper(
+                    block_size,
+                    self.kv_buffers,
+                    self.cpu_kv_caches_per_layer,
+                    self.device,
+                )
+                self.paged_block_mappers.append(mapper)
+                self.paged_dirty_blocks.append(set())
+                # Allocate staging tensors matching input_batch shapes.
+                max_num_blocks = self.input_batch.block_table[group_idx].max_num_blocks_per_req
+                self.paged_block_tables.append(
+                    torch.zeros(
+                        (self.max_num_reqs, max_num_blocks),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                )
+                self.paged_slot_mappings.append(
+                    torch.zeros(
+                        (self.max_num_tokens,),
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                )
+            layer_to_gid: dict[str, int] = {}
+            for gid, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+                for layer_name in kv_cache_group.layer_names:
+                    layer_to_gid[layer_name] = gid
+            self._register_runkv_hooks(layer_to_gid)
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(

@@ -44,6 +44,7 @@ from .scheduler import SchedulerConfig
 from .speculative import SpeculativeConfig
 from .structured_outputs import StructuredOutputsConfig
 from .utils import SupportsHash, config
+from vllm.v1.core.kv_cache_offload_config import RunKVOffloadConfig
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -234,6 +235,8 @@ class VllmConfig:
     """Additional config for specified platform. Different platforms may
     support different configs. Make sure the configs are valid for the platform
     you are using. Contents must be hashable."""
+    kv_offload_config: RunKVOffloadConfig = Field(default_factory=RunKVOffloadConfig)
+    """The configurations for RunKV layer-wise KV cache offload."""
     instance_id: str = ""
     """The ID of the vLLM instance."""
     optimization_level: OptimizationLevel = OptimizationLevel.O2
