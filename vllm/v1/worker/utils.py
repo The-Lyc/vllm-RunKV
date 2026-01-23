@@ -309,6 +309,7 @@ def bind_kv_cache(
     forward_context: dict[str, Attention],
     runner_kv_caches: list[torch.Tensor],
     num_attn_module: int = 1,
+    forward_kv_caches: dict[str, torch.Tensor] | None = None,
 ) -> None:
     """
     Bind the allocated KV cache to both ModelRunner and forward context so
@@ -318,13 +319,16 @@ def bind_kv_cache(
       1) Fills the ModelRunner's kv cache list (`runner_kv_caches`) with
          kv_caches.
       2) Associates each attention layer in the `forward_context` with its
-         corresponding KV cache in kv_caches.
+         corresponding KV cache in `forward_kv_caches` (or kv_caches if None).
 
     Args:
         kv_caches: The allocated kv_caches with layer names as keys.
         forward_context: The global forward context containing all Attention
             layers with layer names as keys.
         runner_kv_caches: The kv_cache declared by ModelRunner.
+        forward_kv_caches: KV cache tensors to bind to `forward_context`. This
+            can be different from `kv_caches` (e.g., when using GPU staging
+            buffers for forward while keeping CPU caches bound to ModelRunner).
     """
     # Bind kv_caches to ModelRunner
     assert len(runner_kv_caches) == 0
@@ -359,9 +363,19 @@ def bind_kv_cache(
         runner_kv_caches.append(kv_caches[layer_name])
 
     # Bind kv_caches to forward context
-    for layer_name, kv_cache in kv_caches.items():
+    kv_caches_for_forward = (
+        kv_caches if forward_kv_caches is None else forward_kv_caches
+    )
+    for layer_name, kv_cache in kv_caches_for_forward.items():
+        if layer_name not in forward_context:
+            continue
         # NOTE: Use list because of v0 PP virtual engine.
-        forward_context[layer_name].kv_cache = [kv_cache]
+        attn_module = forward_context[layer_name]
+        existing = getattr(attn_module, "kv_cache", None)
+        if isinstance(existing, list) and len(existing) > 0:
+            attn_module.kv_cache = [kv_cache for _ in range(len(existing))]
+        else:
+            attn_module.kv_cache = [kv_cache]
 
 
 def is_residual_scattered_for_sp(
