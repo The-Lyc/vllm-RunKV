@@ -94,6 +94,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.network_utils import get_ip
 from vllm.utils.torch_utils import resolve_kv_cache_dtype_string
+from vllm.v1.core.kv_cache_offload_config import RunKVOffloadConfig
 from vllm.v1.sample.logits_processor import LogitsProcessor
 
 if TYPE_CHECKING:
@@ -577,6 +578,9 @@ class EngineArgs:
     )
     tokens_only: bool = False
 
+    # RunKV layer-wise KV cache offload configuration
+    kv_offload_config: RunKVOffloadConfig | dict[str, Any] | None = None
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -935,6 +939,49 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
+        )
+
+        # RunKV layer-wise KV cache offload arguments
+        runkv_group = parser.add_argument_group(
+            title="RunKV Offload Config",
+            description="Configuration for RunKV layer-wise KV cache "
+            "offloading to CPU.",
+        )
+        runkv_group.add_argument(
+            "--enable-runkv",
+            action="store_true",
+            default=False,
+            help="Enable RunKV layer-wise KV cache offloading to CPU. "
+            "This allows processing longer sequences by keeping KV cache "
+            "on CPU and staging to GPU per-layer.",
+        )
+        runkv_group.add_argument(
+            "--runkv-num-device-buffers",
+            type=int,
+            default=3,
+            help="Number of GPU staging buffers (ring buffer count) for RunKV. "
+            "Default: 3",
+        )
+        runkv_group.add_argument(
+            "--runkv-max-staging-blocks",
+            type=int,
+            default=None,
+            help="Maximum number of KV blocks per GPU staging buffer. "
+            "If not set, computed based on gpu_memory_fraction.",
+        )
+        runkv_group.add_argument(
+            "--runkv-gpu-memory-fraction",
+            type=float,
+            default=0.1,
+            help="Fraction of GPU memory to use for RunKV staging buffers (0.0-1.0). "
+            "Only used if --runkv-max-staging-blocks is not set. Default: 0.1",
+        )
+        runkv_group.add_argument(
+            "--runkv-cpu-memory-gb",
+            type=float,
+            default=None,
+            help="CPU memory limit for RunKV KV cache offload in GB. "
+            "If not set, uses available CPU memory.",
         )
 
         # Multimodal related configs
@@ -1737,6 +1784,9 @@ class EngineArgs:
             compilation_config.max_cudagraph_capture_size = (
                 self.max_cudagraph_capture_size
             )
+        # Build RunKV offload config
+        kv_offload_config = self._build_kv_offload_config()
+
         config = VllmConfig(
             model_config=model_config,
             cache_config=cache_config,
@@ -1756,9 +1806,38 @@ class EngineArgs:
             profiler_config=self.profiler_config,
             additional_config=self.additional_config,
             optimization_level=self.optimization_level,
+            kv_offload_config=kv_offload_config,
         )
 
         return config
+
+    def _build_kv_offload_config(self) -> RunKVOffloadConfig:
+        """Build RunKV offload configuration from args."""
+        # If kv_offload_config is already provided as a dict or object, use it
+        if self.kv_offload_config is not None:
+            if isinstance(self.kv_offload_config, dict):
+                return RunKVOffloadConfig(**self.kv_offload_config)
+            return self.kv_offload_config
+
+        # Build from individual CLI arguments
+        # Check if --enable-runkv was passed
+        enable_runkv = getattr(self, "enable_runkv", False)
+        if not enable_runkv:
+            return RunKVOffloadConfig(enabled=False)
+
+        # Build config from CLI args
+        cpu_memory_limit = None
+        runkv_cpu_memory_gb = getattr(self, "runkv_cpu_memory_gb", None)
+        if runkv_cpu_memory_gb is not None:
+            cpu_memory_limit = int(runkv_cpu_memory_gb * 1024**3)
+
+        return RunKVOffloadConfig(
+            enabled=True,
+            num_device_buffers=getattr(self, "runkv_num_device_buffers", 3),
+            max_staging_blocks=getattr(self, "runkv_max_staging_blocks", None),
+            gpu_memory_fraction=getattr(self, "runkv_gpu_memory_fraction", 0.1),
+            cpu_memory_limit=cpu_memory_limit,
+        )
 
     def _check_feature_supported(self, model_config: ModelConfig):
         """Raise an error if the feature is not supported."""

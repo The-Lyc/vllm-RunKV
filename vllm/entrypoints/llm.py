@@ -78,6 +78,7 @@ from vllm.tokenizers.mistral import MistralTokenizer
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.collection_utils import as_iter, is_list_of
 from vllm.utils.counter import Counter
+from vllm.v1.core.kv_cache_offload_config import RunKVOffloadConfig
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.sample.logits_processor import LogitsProcessor
@@ -180,6 +181,11 @@ class LLM:
             dictionary or an AttentionConfig instance. If a dictionary, it will
             be converted to an AttentionConfig. Allows specifying the attention
             backend and other attention-related settings.
+        kv_offload_config: Configuration for RunKV layer-wise KV cache
+            offloading to CPU. Can be a dictionary or a RunKVOffloadConfig
+            instance. When enabled, KV cache is stored on CPU and staged to
+            GPU per-layer, allowing longer sequences with limited GPU memory.
+            Example: `{"enabled": True, "num_device_buffers": 3}`.
         **kwargs: Arguments for [`EngineArgs`][vllm.EngineArgs].
 
     Note:
@@ -221,6 +227,7 @@ class LLM:
         attention_config: dict[str, Any] | AttentionConfig | None = None,
         kv_cache_memory_bytes: int | None = None,
         compilation_config: int | dict[str, Any] | CompilationConfig | None = None,
+        kv_offload_config: dict[str, Any] | RunKVOffloadConfig | None = None,
         logits_processors: list[str | type[LogitsProcessor]] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -281,6 +288,14 @@ class LLM:
         profiler_config_instance = _make_config(profiler_config, ProfilerConfig)
         attention_config_instance = _make_config(attention_config, AttentionConfig)
 
+        # Process kv_offload_config - convert dict to RunKVOffloadConfig if needed
+        kv_offload_config_instance = None
+        if kv_offload_config is not None:
+            if isinstance(kv_offload_config, dict):
+                kv_offload_config_instance = RunKVOffloadConfig(**kv_offload_config)
+            else:
+                kv_offload_config_instance = kv_offload_config
+
         # warn about single-process data parallel usage.
         _dp_size = int(kwargs.get("data_parallel_size", 1))
         _distributed_executor_backend = kwargs.get("distributed_executor_backend")
@@ -326,6 +341,7 @@ class LLM:
             profiler_config=profiler_config_instance,
             attention_config=attention_config_instance,
             compilation_config=compilation_config_instance,
+            kv_offload_config=kv_offload_config_instance,
             logits_processors=logits_processors,
             **kwargs,
         )
