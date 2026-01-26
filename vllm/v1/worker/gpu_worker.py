@@ -296,6 +296,19 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
+        # RunKV offload has two distinct memory budgets:
+        # 1) CPU KV cache backing store (can be large; optionally capped by
+        #    kv_offload_config.cpu_memory_limit).
+        # 2) GPU staging buffers used at runtime for per-layer paging.
+        # We still run a profile to estimate a safe GPU staging budget, but the
+        # KV cache "capacity" used for sizing the backing store can be
+        # configured independently.
+        use_runkv = (
+            getattr(self.model_runner, "use_runkv", False)
+            and getattr(self.model_runner, "kv_offload_config", None) is not None
+            and getattr(self.model_runner.kv_offload_config, "enabled", False)
+        )
+
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
@@ -314,6 +327,30 @@ class Worker(WorkerBase):
                 "correspondingly."
             )
             logger.info(msg)
+
+            # For RunKV, treat this as the GPU staging budget baseline.
+            if use_runkv:
+                self.model_runner.available_gpu_memory_bytes_for_staging = int(
+                    kv_cache_memory_bytes
+                )
+                cpu_limit = getattr(
+                    self.model_runner.kv_offload_config, "cpu_memory_limit", None
+                )
+                if cpu_limit is not None:
+                    if cpu_limit <= 0:
+                        raise ValueError(
+                            "kv_offload_config.cpu_memory_limit must be > 0 bytes "
+                            f"when set (got {cpu_limit})."
+                        )
+                    logger.info_once(
+                        "RunKV enabled: using cpu_memory_limit=%s bytes for CPU KV "
+                        "cache backing store; using kv_cache_memory_bytes=%s bytes "
+                        "as GPU staging budget baseline.",
+                        cpu_limit,
+                        kv_cache_memory_bytes,
+                        scope="local",
+                    )
+                    return int(cpu_limit)
             return kv_cache_memory_bytes
 
         torch.cuda.empty_cache()
@@ -365,6 +402,47 @@ class Worker(WorkerBase):
             scope="local",
         )
         gc.collect()
+
+        # Expose the profiled GPU budget to the model runner so that RunKV
+        # staging buffers can be sized based on a meaningful budget instead of
+        # a transient "free memory right now" snapshot.
+        if use_runkv:
+            self.model_runner.available_gpu_memory_bytes_for_staging = int(
+                self.available_kv_cache_memory_bytes
+            )
+
+            cpu_limit = getattr(
+                self.model_runner.kv_offload_config, "cpu_memory_limit", None
+            )
+            if cpu_limit is not None:
+                if cpu_limit <= 0:
+                    raise ValueError(
+                        "kv_offload_config.cpu_memory_limit must be > 0 bytes "
+                        f"when set (got {cpu_limit})."
+                    )
+                try:
+                    # local import to avoid hard dependency at import time
+                    import psutil
+
+                    avail = psutil.virtual_memory().available
+                    if cpu_limit > avail:
+                        logger.warning(
+                            "RunKV cpu_memory_limit=%s bytes exceeds current "
+                            "available system memory=%s bytes; allocation may OOM.",
+                            cpu_limit,
+                            avail,
+                        )
+                except Exception:
+                    # Best-effort warning only.
+                    pass
+                logger.info_once(
+                    "RunKV enabled: using cpu_memory_limit=%s bytes for CPU KV cache "
+                    "backing store; profiled GPU staging budget baseline is %.2f GiB.",
+                    cpu_limit,
+                    format_gib(int(self.available_kv_cache_memory_bytes)),
+                    scope="local",
+                )
+                return int(cpu_limit)
 
         return int(self.available_kv_cache_memory_bytes)
 

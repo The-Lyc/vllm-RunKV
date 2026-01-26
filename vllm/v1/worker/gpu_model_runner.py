@@ -714,6 +714,12 @@ class GPUModelRunner(
         self.paged_block_mappers: list[PagedBlockMapper] = []
         self.paged_dirty_blocks: list[set[int]] = []
         self._staging_blocks_per_buffer: int = 0  # Set in _allocate_kv_buffer_tensors
+        # Best-effort budget (bytes) for sizing RunKV GPU staging buffers.
+        # This is populated by
+        # vllm.v1.worker.gpu_worker.Worker.determine_available_memory() after
+        # profiling, but may be missing in some flows (e.g., DP scale-up where
+        # profiling is skipped), in which case we fall back to cuda mem_get_info.
+        self.available_gpu_memory_bytes_for_staging: int | None = None
         self.paged_block_tables: list[torch.Tensor] = []
         self.paged_slot_mappings: list[torch.Tensor] = []
         self.runkv_hooks: list[Any] = []
@@ -5768,11 +5774,17 @@ class GPUModelRunner(
             return kv_offload_config.max_staging_blocks
 
         # Otherwise, compute based on available GPU memory
-        # Get available GPU memory
-        free_memory, total_memory = torch.cuda.mem_get_info(self.device)
+        # Get current available GPU memory.
+        free_memory, _ = torch.cuda.mem_get_info(self.device)
 
-        # Use configured fraction of free memory for staging
-        staging_memory = int(free_memory * kv_offload_config.gpu_memory_fraction)
+        # Prefer a profiled budget (post model load/profile) if available.
+        # Always clamp by the current free memory to avoid over-allocation.
+        base_memory = free_memory
+        if self.available_gpu_memory_bytes_for_staging is not None:
+            base_memory = min(base_memory, self.available_gpu_memory_bytes_for_staging)
+
+        # Use configured fraction of the selected base memory for staging.
+        staging_memory = int(base_memory * kv_offload_config.gpu_memory_fraction)
 
         # Get the page size from the first KV cache tensor
         if not kv_cache_config.kv_cache_tensors:
@@ -5807,11 +5819,14 @@ class GPUModelRunner(
 
         logger.info(
             "RunKV staging buffer: %d blocks per buffer, %d buffers, "
-            "%d bytes/block, total staging memory: %.1f MB",
+            "%d bytes/block, total staging memory: %.1f MB "
+            "(base_memory=%.2f GiB, gpu_memory_fraction=%.3f)",
             blocks_per_buffer,
             num_buffers,
             bytes_per_block,
             blocks_per_buffer * num_buffers * bytes_per_block / (1024**2),
+            base_memory / (1024**3),
+            kv_offload_config.gpu_memory_fraction,
         )
 
         return blocks_per_buffer
@@ -6280,9 +6295,12 @@ class GPUModelRunner(
             self.paged_dirty_blocks.clear()
             self.paged_block_tables.clear()
             self.paged_slot_mappings.clear()
+            # Use the BlockTable's block_size, which is the kernel block size.
+            # This matches how slot_mapping and block_table indices are computed
+            # (and handles virtual block splitting when kernel_block_size !=
+            # kv_manager block_size).
             group_block_sizes = [
-                kv_cache_group.kv_cache_spec.block_size
-                for kv_cache_group in kv_cache_config.kv_cache_groups
+                bt.block_size for bt in self.input_batch.block_table.block_tables
             ]
             for group_idx, block_size in enumerate(group_block_sizes):
                 mapper = PagedBlockMapper(
