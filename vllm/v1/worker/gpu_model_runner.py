@@ -371,10 +371,21 @@ class PagedBlockMapper:
         self.cpu_caches_per_layer = cpu_caches_per_layer
         self.device = device
 
-        # Staging capacity: how many blocks each GPU buffer can hold
-        # This is SMALLER than CPU capacity
+        # Determine which dimension indexes KV-cache blocks.
+        # Common layouts are:
+        # - (num_blocks, 2, ...)  -> blocks_dim=0
+        # - (2, num_blocks, ...)  -> blocks_dim=1
         any_buffer = next(iter(gpu_buffers.values()))
-        self.capacity = any_buffer.shape[0]  # GPU staging slots available
+        if any_buffer.ndim >= 2 and any_buffer.shape[0] == 2:
+            self._blocks_dim = 1
+        else:
+            # Default to block-first. This also covers cases without an explicit
+            # KV=2 dimension in the first two axes (e.g., simplified test tensors).
+            self._blocks_dim = 0
+
+        # Staging capacity: how many blocks each GPU buffer can hold.
+        # This is SMALLER than CPU capacity.
+        self.capacity = int(any_buffer.shape[self._blocks_dim])
         self.num_buffers = len(gpu_buffers)
 
         # Mapping: logical_block_id (CPU) -> staging_slot (GPU)
@@ -387,6 +398,43 @@ class PagedBlockMapper:
 
         # CUDA stream for async CPU<->GPU transfers
         self.transfer_stream = torch.cuda.Stream(device=device)
+
+    def _validate_shapes_for_layer(
+        self, *, layer_name: str, gpu_buffer: torch.Tensor, cpu_cache: torch.Tensor
+    ) -> None:
+        if gpu_buffer.ndim != cpu_cache.ndim:
+            raise RuntimeError(
+                "RunKV staging/cpu cache rank mismatch for layer "
+                f"{layer_name}: gpu.ndim={gpu_buffer.ndim} cpu.ndim={cpu_cache.ndim}"
+            )
+
+        # All dims except the blocks dim must match.
+        for dim in range(gpu_buffer.ndim):
+            if dim == self._blocks_dim:
+                continue
+            if gpu_buffer.shape[dim] != cpu_cache.shape[dim]:
+                raise RuntimeError(
+                    "RunKV staging/cpu cache shape mismatch for layer "
+                    f"{layer_name} at dim={dim}: gpu={tuple(gpu_buffer.shape)} "
+                    f"cpu={tuple(cpu_cache.shape)} (blocks_dim={self._blocks_dim})"
+                )
+
+    def _copy_block(
+        self,
+        *,
+        dst: torch.Tensor,
+        dst_block_id: int,
+        src: torch.Tensor,
+        src_block_id: int,
+        non_blocking: bool,
+    ) -> None:
+        # Select along the blocks dimension. `.select` drops the selected
+        # dimension, which is fine as long as both tensors share the same
+        # non-block dims (validated by _validate_shapes_for_layer).
+        dst.select(self._blocks_dim, dst_block_id).copy_(
+            src.select(self._blocks_dim, src_block_id),
+            non_blocking=non_blocking,
+        )
 
     def _assign_slots(self, logical_block_ids: list[int]) -> None:
         """Assign GPU staging slots for the given logical blocks.
@@ -551,12 +599,21 @@ class PagedBlockMapper:
         buffer_idx = layer_idx % self.num_buffers
         gpu_buffer = self.gpu_buffers[buffer_idx]
         cpu_cache = self.cpu_caches_per_layer[layer_name]
+        self._validate_shapes_for_layer(
+            layer_name=layer_name, gpu_buffer=gpu_buffer, cpu_cache=cpu_cache
+        )
 
         # Copy all mapped blocks from CPU to GPU staging slots
         # Use non-blocking copy with dedicated stream for overlap
         with torch.cuda.stream(self.transfer_stream):
             for logical_id, slot in self.mapping.items():
-                gpu_buffer[slot].copy_(cpu_cache[logical_id], non_blocking=True)
+                self._copy_block(
+                    dst=gpu_buffer,
+                    dst_block_id=slot,
+                    src=cpu_cache,
+                    src_block_id=logical_id,
+                    non_blocking=True,
+                )
 
         # Synchronize to ensure data is available before attention computes
         self.transfer_stream.synchronize()
@@ -580,6 +637,9 @@ class PagedBlockMapper:
         buffer_idx = layer_idx % self.num_buffers
         gpu_buffer = self.gpu_buffers[buffer_idx]
         cpu_cache = self.cpu_caches_per_layer[layer_name]
+        self._validate_shapes_for_layer(
+            layer_name=layer_name, gpu_buffer=gpu_buffer, cpu_cache=cpu_cache
+        )
 
         # Copy only dirty blocks back to CPU
         with torch.cuda.stream(self.transfer_stream):
@@ -587,7 +647,13 @@ class PagedBlockMapper:
                 slot = self.mapping.get(logical_id)
                 if slot is None:
                     continue
-                cpu_cache[logical_id].copy_(gpu_buffer[slot], non_blocking=True)
+                self._copy_block(
+                    dst=cpu_cache,
+                    dst_block_id=logical_id,
+                    src=gpu_buffer,
+                    src_block_id=slot,
+                    non_blocking=True,
+                )
 
         # Synchronize to ensure CPU cache is updated before next step
         self.transfer_stream.synchronize()
