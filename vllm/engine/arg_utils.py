@@ -981,7 +981,16 @@ class EngineArgs:
             type=float,
             default=None,
             help="CPU memory limit for RunKV KV cache offload in GB. "
-            "If not set, uses available CPU memory.",
+            "If not set, uses available CPU memory multiplied by "
+            "--runkv-cpu-memory-fraction.",
+        )
+        runkv_group.add_argument(
+            "--runkv-cpu-memory-fraction",
+            type=float,
+            default=0.9,
+            help="When --runkv-cpu-memory-gb is not set, cap the RunKV CPU KV "
+            "cache backing store to (available_system_memory * fraction). "
+            "Default: 0.9",
         )
 
         # Multimodal related configs
@@ -1837,6 +1846,7 @@ class EngineArgs:
             max_staging_blocks=getattr(self, "runkv_max_staging_blocks", None),
             gpu_memory_fraction=getattr(self, "runkv_gpu_memory_fraction", 0.1),
             cpu_memory_limit=cpu_memory_limit,
+            cpu_memory_fraction=getattr(self, "runkv_cpu_memory_fraction", 0.9),
         )
 
     def _check_feature_supported(self, model_config: ModelConfig):

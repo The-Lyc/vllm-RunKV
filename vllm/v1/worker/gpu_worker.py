@@ -309,10 +309,88 @@ class Worker(WorkerBase):
             and getattr(self.model_runner.kv_offload_config, "enabled", False)
         )
 
+        def _get_runkv_cpu_memory_limit_bytes() -> tuple[int, str]:
+            """Return the CPU KV cache backing store limit in bytes.
+
+            If the user provides an explicit cpu_memory_limit, use it; otherwise
+            derive a safe limit from current available system memory.
+            """
+            cfg = self.model_runner.kv_offload_config
+            cpu_limit = getattr(cfg, "cpu_memory_limit", None)
+
+            # local import to avoid hard dependency at import time
+            import psutil
+
+            avail = psutil.virtual_memory().available
+            cpu_fraction = getattr(cfg, "cpu_memory_fraction", 0.7)
+            if not (0.0 < cpu_fraction <= 1.0):
+                raise ValueError(
+                    "kv_offload_config.cpu_memory_fraction must be in (0, 1] "
+                    f"(got {cpu_fraction})."
+                )
+            derived = int(avail * cpu_fraction)
+            if derived <= 0:
+                raise ValueError(
+                    "Derived RunKV cpu_memory_limit must be > 0 bytes "
+                    f"(available={avail}, fraction={cpu_fraction})."
+                )
+
+            if cpu_limit is not None:
+                if cpu_limit <= 0:
+                    raise ValueError(
+                        "kv_offload_config.cpu_memory_limit must be > 0 bytes "
+                        f"when set (got {cpu_limit})."
+                    )
+                try:
+                    if cpu_limit > derived:
+                        logger.warning(
+                            "RunKV cpu_memory_limit=%s bytes exceeds current "
+                            "available system memory=%s bytes; clamping to %s bytes "
+                            "(available*cpu_memory_fraction=%s).",
+                            cpu_limit,
+                            avail,
+                            derived,
+                            cpu_fraction,
+                        )
+                        return derived, f"explicit_clamped(available*{cpu_fraction})"
+                except Exception:
+                    # Best-effort warning only.
+                    pass
+                return int(cpu_limit), "explicit"
+
+            return derived, f"available*{cpu_fraction}"
+
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
             self.model_runner.profile_run()
+
+            # For RunKV, treat this as the GPU staging budget baseline.
+            if use_runkv:
+                msg = (
+                    f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
+                    f"GiB, reserved {format_gib(kv_cache_memory_bytes)} GiB GPU memory "
+                    "as RunKV staging budget baseline (kv_cache_memory_bytes) and "
+                    "skipped GPU memory profiling. This does not respect the "
+                    "gpu_memory_utilization config. Only use kv_cache_memory_bytes "
+                    "config when you want manual control of the GPU staging budget. "
+                    "If OOM'ed, update kv_cache_memory_bytes accordingly."
+                )
+                logger.info(msg)
+                self.model_runner.available_gpu_memory_bytes_for_staging = int(
+                    kv_cache_memory_bytes
+                )
+                cpu_limit, cpu_limit_src = _get_runkv_cpu_memory_limit_bytes()
+                logger.info_once(
+                    "RunKV enabled: using cpu_memory_limit=%s bytes (%s) for CPU KV "
+                    "cache backing store; using kv_cache_memory_bytes=%s bytes as "
+                    "GPU staging budget baseline.",
+                    cpu_limit,
+                    cpu_limit_src,
+                    kv_cache_memory_bytes,
+                    scope="local",
+                )
+                return int(cpu_limit)
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -327,30 +405,6 @@ class Worker(WorkerBase):
                 "correspondingly."
             )
             logger.info(msg)
-
-            # For RunKV, treat this as the GPU staging budget baseline.
-            if use_runkv:
-                self.model_runner.available_gpu_memory_bytes_for_staging = int(
-                    kv_cache_memory_bytes
-                )
-                cpu_limit = getattr(
-                    self.model_runner.kv_offload_config, "cpu_memory_limit", None
-                )
-                if cpu_limit is not None:
-                    if cpu_limit <= 0:
-                        raise ValueError(
-                            "kv_offload_config.cpu_memory_limit must be > 0 bytes "
-                            f"when set (got {cpu_limit})."
-                        )
-                    logger.info_once(
-                        "RunKV enabled: using cpu_memory_limit=%s bytes for CPU KV "
-                        "cache backing store; using kv_cache_memory_bytes=%s bytes "
-                        "as GPU staging budget baseline.",
-                        cpu_limit,
-                        kv_cache_memory_bytes,
-                        scope="local",
-                    )
-                    return int(cpu_limit)
             return kv_cache_memory_bytes
 
         torch.cuda.empty_cache()
@@ -410,39 +464,16 @@ class Worker(WorkerBase):
             self.model_runner.available_gpu_memory_bytes_for_staging = int(
                 self.available_kv_cache_memory_bytes
             )
-
-            cpu_limit = getattr(
-                self.model_runner.kv_offload_config, "cpu_memory_limit", None
+            cpu_limit, cpu_limit_src = _get_runkv_cpu_memory_limit_bytes()
+            logger.info_once(
+                "RunKV enabled: using cpu_memory_limit=%s bytes (%s) for CPU KV cache "
+                "backing store; profiled GPU staging budget baseline is %.2f GiB.",
+                cpu_limit,
+                cpu_limit_src,
+                format_gib(int(self.available_kv_cache_memory_bytes)),
+                scope="local",
             )
-            if cpu_limit is not None:
-                if cpu_limit <= 0:
-                    raise ValueError(
-                        "kv_offload_config.cpu_memory_limit must be > 0 bytes "
-                        f"when set (got {cpu_limit})."
-                    )
-                try:
-                    # local import to avoid hard dependency at import time
-                    import psutil
-
-                    avail = psutil.virtual_memory().available
-                    if cpu_limit > avail:
-                        logger.warning(
-                            "RunKV cpu_memory_limit=%s bytes exceeds current "
-                            "available system memory=%s bytes; allocation may OOM.",
-                            cpu_limit,
-                            avail,
-                        )
-                except Exception:
-                    # Best-effort warning only.
-                    pass
-                logger.info_once(
-                    "RunKV enabled: using cpu_memory_limit=%s bytes for CPU KV cache "
-                    "backing store; profiled GPU staging budget baseline is %.2f GiB.",
-                    cpu_limit,
-                    format_gib(int(self.available_kv_cache_memory_bytes)),
-                    scope="local",
-                )
-                return int(cpu_limit)
+            return int(cpu_limit)
 
         return int(self.available_kv_cache_memory_bytes)
 
