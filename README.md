@@ -21,7 +21,7 @@ For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
 ## About
 
-This is RunKV version of vLLM.
+This is RunKV version of vLLM(Forked From vanilla vLLM).
 
 vLLM is a fast and easy-to-use library for LLM inference and serving.
 
