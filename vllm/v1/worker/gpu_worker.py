@@ -367,16 +367,6 @@ class Worker(WorkerBase):
 
             # For RunKV, treat this as the GPU staging budget baseline.
             if use_runkv:
-                msg = (
-                    f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
-                    f"GiB, reserved {format_gib(kv_cache_memory_bytes)} GiB GPU memory "
-                    "as RunKV staging budget baseline (kv_cache_memory_bytes) and "
-                    "skipped GPU memory profiling. This does not respect the "
-                    "gpu_memory_utilization config. Only use kv_cache_memory_bytes "
-                    "config when you want manual control of the GPU staging budget. "
-                    "If OOM'ed, update kv_cache_memory_bytes accordingly."
-                )
-                logger.info(msg)
                 self.model_runner.available_gpu_memory_bytes_for_staging = int(
                     kv_cache_memory_bytes
                 )
@@ -384,11 +374,11 @@ class Worker(WorkerBase):
                 logger.info_once(
                     "RunKV enabled: using cpu_memory_limit=%s bytes (%s) for CPU KV "
                     "cache backing store; using kv_cache_memory_bytes=%s bytes as "
-                    "GPU staging budget baseline.",
+                    "GPU staging budget baseline; skipped GPU memory profiling.",
                     cpu_limit,
                     cpu_limit_src,
                     kv_cache_memory_bytes,
-                    scope="local",
+                    scope="global",
                 )
                 return int(cpu_limit)
 
