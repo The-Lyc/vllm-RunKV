@@ -6443,39 +6443,47 @@ class GPUModelRunner(
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
 
-        if self.use_runkv:
-            total_blocks = kv_cache_config.num_blocks
-            total_bytes = sum(
-                tensor.size for tensor in kv_cache_config.kv_cache_tensors
+        total_blocks = kv_cache_config.num_blocks
+        total_bytes = sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
+
+        page_sizes: set[int] = set()
+        block_sizes: set[int] = set()
+        for group in kv_cache_config.kv_cache_groups:
+            group_spec = group.kv_cache_spec
+            layer_specs = (
+                group_spec.kv_cache_specs.values()
+                if isinstance(group_spec, UniformTypeKVCacheSpecs)
+                else (group_spec,)
             )
+            for spec in layer_specs:
+                if isinstance(spec, AttentionSpec):
+                    page_sizes.add(spec.page_size_bytes)
+                    block_sizes.add(spec.block_size)
 
-            page_sizes: set[int] = set()
-            block_sizes: set[int] = set()
-            for group in kv_cache_config.kv_cache_groups:
-                group_spec = group.kv_cache_spec
-                layer_specs = (
-                    group_spec.kv_cache_specs.values()
-                    if isinstance(group_spec, UniformTypeKVCacheSpecs)
-                    else (group_spec,)
-                )
-                for spec in layer_specs:
-                    if isinstance(spec, AttentionSpec):
-                        page_sizes.add(spec.page_size_bytes)
-                        block_sizes.add(spec.block_size)
+        def _fmt_int_set(values: set[int]) -> str:
+            if not values:
+                return "unknown"
+            if len(values) == 1:
+                return str(next(iter(values)))
+            sorted_vals = sorted(values)
+            if len(sorted_vals) <= 4:
+                return ",".join(map(str, sorted_vals))
+            return f"{sorted_vals[0]}..{sorted_vals[-1]}(n={len(sorted_vals)})"
 
-            def _fmt_int_set(values: set[int]) -> str:
-                if not values:
-                    return "unknown"
-                if len(values) == 1:
-                    return str(next(iter(values)))
-                sorted_vals = sorted(values)
-                if len(sorted_vals) <= 4:
-                    return ",".join(map(str, sorted_vals))
-                return f"{sorted_vals[0]}..{sorted_vals[-1]}(n={len(sorted_vals)})"
-
+        if self.use_runkv:
             logger.info_once(
                 "RunKV enabled: CPU KV cache backing store: num_blocks=%d, "
                 "total_size=%.2f GiB, page_size_bytes=%s, block_size_tokens=%s",
+                total_blocks,
+                total_bytes / (1024**3),
+                _fmt_int_set(page_sizes),
+                _fmt_int_set(block_sizes),
+                scope="global",
+            )
+        else:
+            logger.info_once(
+                "GPU KV cache allocation: num_blocks=%d, total_size=%.2f GiB, "
+                "page_size_bytes=%s, block_size_tokens=%s",
                 total_blocks,
                 total_bytes / (1024**3),
                 _fmt_int_set(page_sizes),
