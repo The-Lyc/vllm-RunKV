@@ -12,15 +12,34 @@ This script tests RunKV under high concurrency scenarios:
 
 Usage:
     python test_runkv_e2e_concurrent.py [--model MODEL] [--num-requests N]
-    [--concurrency C]
+
+Profiling with Nsight Systems:
+    # Method 1: Profile entire run with vLLM's built-in NVTX scopes
+    VLLM_NVTX_SCOPES_FOR_PROFILING=1 nsys profile -o vllm_profile \
+        --trace=cuda,nvtx \
+        python test_runkv_e2e_concurrent.py --num-requests 50
+
+    # Method 2: Profile with layer-wise NVTX tracing (more detailed)
+    VLLM_NVTX_SCOPES_FOR_PROFILING=1 nsys profile -o vllm_detailed \
+        --trace=cuda,nvtx \
+        python test_runkv_e2e_concurrent.py --num-requests 50 \
+        --enable-layerwise-nvtx-tracing
+
+    # Method 3: Use --profile flag to control capture range
+    nsys profile -o vllm_inference \
+        --capture-range=cudaProfilerApi \
+        --capture-range-end=stop \
+        --trace=cuda,nvtx \
+        python test_runkv_e2e_concurrent.py --num-requests 50 --profile
 
 Requirements:
     - CUDA available
     - vLLM installed with RunKV support
+    - nvtx package (pip install nvtx) for NVTX markers
 
 Example:
     python test_runkv_e2e_concurrent.py --model "~/hf_models/Qwen3-0.6B" \
-        --num-requests 100 --concurrency 32
+        --num-requests 100 --use-very-long-prompts
 """
 
 import argparse
@@ -31,6 +50,50 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+
+# ============================================================================
+# Profiling Utilities
+# ============================================================================
+@contextlib.contextmanager
+def nvtx_range(name: str, color: str = "blue"):
+    """
+    Context manager for NVTX range marking.
+    Only active when VLLM_NVTX_SCOPES_FOR_PROFILING=1 is set.
+    """
+    if os.environ.get("VLLM_NVTX_SCOPES_FOR_PROFILING", "0") == "1":
+        try:
+            import nvtx
+
+            with nvtx.annotate(name, color=color):
+                yield
+        except ImportError:
+            yield
+    else:
+        yield
+
+
+def cuda_profiler_start():
+    """Start CUDA profiler (for nsys --capture-range=cudaProfilerApi)."""
+    try:
+        import torch.cuda
+
+        torch.cuda.cudart().cudaProfilerStart()
+        print("[PROFILE] CUDA profiler started")
+    except Exception as e:
+        print(f"[PROFILE] Could not start CUDA profiler: {e}")
+
+
+def cuda_profiler_stop():
+    """Stop CUDA profiler."""
+    try:
+        import torch.cuda
+
+        torch.cuda.cudart().cudaProfilerStop()
+        print("[PROFILE] CUDA profiler stopped")
+    except Exception as e:
+        print(f"[PROFILE] Could not stop CUDA profiler: {e}")
+
 
 # Sample prompts with varying lengths for realistic testing
 SAMPLE_PROMPTS = [
@@ -387,6 +450,7 @@ def _build_engine(
     gpu_memory_utilization: float,
     kv_offload_config,
     max_num_seqs: int = 256,
+    enable_layerwise_nvtx_tracing: bool = False,
 ):
     from vllm.engine.arg_utils import EngineArgs
     from vllm.usage.usage_lib import UsageContext
@@ -402,6 +466,7 @@ def _build_engine(
         disable_log_stats=True,
         max_num_seqs=max_num_seqs,
         kv_offload_config=kv_offload_config,
+        enable_layerwise_nvtx_tracing=enable_layerwise_nvtx_tracing,
     )
     vllm_config = engine_args.create_engine_config(UsageContext.ENGINE_CONTEXT)
     executor_class = Executor.get_class(vllm_config)
@@ -513,9 +578,17 @@ def run_concurrent_requests(
     requests: list[tuple[str, str, int]],
     max_steps: int,
     verbose: bool = False,
+    enable_profiling: bool = False,
 ) -> tuple[list[RequestResult], float]:
     """
     Run multiple requests concurrently through the engine.
+
+    Args:
+        engine: The LLM engine instance
+        requests: List of (request_id, prompt, max_tokens) tuples
+        max_steps: Maximum engine steps to wait
+        verbose: Print progress output
+        enable_profiling: Enable CUDA profiler during execution
 
     Returns:
         (list of RequestResult, total_time_seconds)
@@ -533,53 +606,65 @@ def run_concurrent_requests(
     # Add all requests to the engine
     overall_start = time.time()
 
-    for request_id, prompt, max_tokens in requests:
-        params = SamplingParams(
-            max_tokens=max_tokens,
-            temperature=0.0,
-            top_p=1.0,
-            output_kind=RequestOutputKind.FINAL_ONLY,
-        )
-        engine.add_request(request_id=request_id, prompt=prompt, params=params)
-        pending_requests.add(request_id)
-        start_times[request_id] = time.time()
-        request_params[request_id] = (prompt, max_tokens)
+    with nvtx_range("add_requests", color="green"):
+        for request_id, prompt, max_tokens in requests:
+            params = SamplingParams(
+                max_tokens=max_tokens,
+                temperature=0.0,
+                top_p=1.0,
+                output_kind=RequestOutputKind.FINAL_ONLY,
+            )
+            engine.add_request(request_id=request_id, prompt=prompt, params=params)
+            pending_requests.add(request_id)
+            start_times[request_id] = time.time()
+            request_params[request_id] = (prompt, max_tokens)
 
     if verbose:
         print(f"Added {len(requests)} requests to engine")
 
+    # Start profiling if enabled (after warmup/setup)
+    if enable_profiling:
+        cuda_profiler_start()
+
     # Process until all requests complete
     step = 0
-    while pending_requests and step < max_steps:
-        step_outputs = engine.step()
+    try:
+        with nvtx_range("inference_loop", color="blue"):
+            while pending_requests and step < max_steps:
+                with nvtx_range(f"step_{step}", color="yellow"):
+                    step_outputs = engine.step()
 
-        for out in step_outputs:
-            req_id = getattr(out, "request_id", None)
-            if req_id is None or req_id not in pending_requests:
-                continue
+                for out in step_outputs:
+                    req_id = getattr(out, "request_id", None)
+                    if req_id is None or req_id not in pending_requests:
+                        continue
 
-            if out.finished:
-                end_time = time.time()
-                latency_ms = (end_time - start_times[req_id]) * 1000
-                prompt, max_tokens = request_params[req_id]
+                    if out.finished:
+                        end_time = time.time()
+                        latency_ms = (end_time - start_times[req_id]) * 1000
+                        prompt, max_tokens = request_params[req_id]
 
-                text = out.outputs[0].text if out.outputs else ""
-                num_tokens = len(out.outputs[0].token_ids) if out.outputs else 0
+                        text = out.outputs[0].text if out.outputs else ""
+                        num_tokens = len(out.outputs[0].token_ids) if out.outputs else 0
 
-                results[req_id] = RequestResult(
-                    request_id=req_id,
-                    prompt=prompt,
-                    output_text=text,
-                    num_tokens=num_tokens,
-                    latency_ms=latency_ms,
-                    finished=True,
-                )
-                pending_requests.remove(req_id)
+                        results[req_id] = RequestResult(
+                            request_id=req_id,
+                            prompt=prompt,
+                            output_text=text,
+                            num_tokens=num_tokens,
+                            latency_ms=latency_ms,
+                            finished=True,
+                        )
+                        pending_requests.remove(req_id)
 
-                if verbose and len(results) % 10 == 0:
-                    print(f"Completed {len(results)}/{len(requests)} requests")
+                        if verbose and len(results) % 10 == 0:
+                            print(f"Completed {len(results)}/{len(requests)} requests")
 
-        step += 1
+                step += 1
+    finally:
+        # Stop profiling
+        if enable_profiling:
+            cuda_profiler_stop()
 
     overall_time = time.time() - overall_start
 
@@ -715,20 +800,37 @@ def run_benchmark(
     kv_offload_config,
     label: str = "",
     verbose: bool = False,
+    enable_profiling: bool = False,
+    enable_layerwise_nvtx_tracing: bool = False,
 ) -> tuple[list[RequestResult], BenchmarkStats]:
-    """Run a full benchmark with the given configuration."""
+    """Run a full benchmark with the given configuration.
+
+    Args:
+        enable_profiling: If True, start CUDA profiler during inference
+                         (for nsys --capture-range=cudaProfilerApi)
+        enable_layerwise_nvtx_tracing: If True, enable per-layer NVTX markers
+    """
     print(f"\n{'=' * 60}")
     print(f"Running benchmark: {label or 'unnamed'}")
+    if enable_profiling:
+        print(
+            "[PROFILE] Profiling enabled - use nsys with"
+            " --capture-range=cudaProfilerApi"
+        )
+    if enable_layerwise_nvtx_tracing:
+        print("[PROFILE] Layer-wise NVTX tracing enabled")
     print(f"{'=' * 60}")
 
-    engine = _build_engine(
-        model_name=model_name,
-        dtype="float16",
-        max_model_len=max_model_len,
-        gpu_memory_utilization=gpu_memory_utilization,
-        kv_offload_config=kv_offload_config,
-        max_num_seqs=max_num_seqs,
-    )
+    with nvtx_range("build_engine", color="purple"):
+        engine = _build_engine(
+            model_name=model_name,
+            dtype="float16",
+            max_model_len=max_model_len,
+            gpu_memory_utilization=gpu_memory_utilization,
+            kv_offload_config=kv_offload_config,
+            max_num_seqs=max_num_seqs,
+            enable_layerwise_nvtx_tracing=enable_layerwise_nvtx_tracing,
+        )
 
     try:
         # Verify RunKV is active if enabled
@@ -754,6 +856,7 @@ def run_benchmark(
             requests=requests,
             max_steps=max_steps,
             verbose=verbose,
+            enable_profiling=enable_profiling,
         )
 
         # Compute and print stats
@@ -883,14 +986,30 @@ def main():
         action="store_true",
         help="Run an extended stress test with more requests and variations",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable CUDA profiling (use with nsys --capture-range=cudaProfilerApi)",
+    )
+    parser.add_argument(
+        "--enable-layerwise-nvtx-tracing",
+        action="store_true",
+        help="Enable per-layer NVTX markers for detailed profiling",
+    )
 
     args = parser.parse_args()
+
+    print("=" * 60, flush=True)
+    print("RunKV High-Concurrency E2E Test", flush=True)
+    print("=" * 60, flush=True)
 
     # Expand and validate model path
     args.model = os.path.expandvars(os.path.expanduser(args.model))
     model_path = Path(args.model)
     if args.model.startswith((".", os.sep)) or "~" in args.model or model_path.exists():
-        args.model = str(model_path.expanduser().resolve(strict=False))
+        # Avoid Path.resolve() here: it can be very slow on some network filesystems
+        # (and it's unnecessary for our validation logic).
+        args.model = str(model_path.expanduser().absolute())
         model_path = Path(args.model)
         if model_path.is_dir() and not (model_path / "config.json").exists():
             print(
@@ -899,10 +1018,6 @@ def main():
                 "or pass a HuggingFace repo id like 'namespace/repo_name'."
             )
             sys.exit(1)
-
-    print("=" * 60)
-    print("RunKV High-Concurrency E2E Test")
-    print("=" * 60)
 
     # Check CUDA
     if not args.skip_cuda_check and not check_cuda():
@@ -954,6 +1069,8 @@ def main():
             kv_offload_config=baseline_config,
             label="Baseline (RunKV disabled)",
             verbose=args.verbose,
+            enable_profiling=False,  # Don't profile baseline
+            enable_layerwise_nvtx_tracing=args.enable_layerwise_nvtx_tracing,
         )
 
     # Run RunKV benchmark
@@ -985,6 +1102,8 @@ def main():
         kv_offload_config=runkv_config,
         label="RunKV enabled",
         verbose=args.verbose,
+        enable_profiling=args.profile,
+        enable_layerwise_nvtx_tracing=args.enable_layerwise_nvtx_tracing,
     )
 
     # Compare results if baseline was run
