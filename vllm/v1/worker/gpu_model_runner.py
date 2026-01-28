@@ -596,28 +596,37 @@ class PagedBlockMapper:
         """
         if not self.mapping:
             return 0
-        buffer_idx = layer_idx % self.num_buffers
-        gpu_buffer = self.gpu_buffers[buffer_idx]
-        cpu_cache = self.cpu_caches_per_layer[layer_name]
-        self._validate_shapes_for_layer(
-            layer_name=layer_name, gpu_buffer=gpu_buffer, cpu_cache=cpu_cache
-        )
 
-        # Copy all mapped blocks from CPU to GPU staging slots
-        # Use non-blocking copy with dedicated stream for overlap
-        with torch.cuda.stream(self.transfer_stream):
-            for logical_id, slot in self.mapping.items():
-                self._copy_block(
-                    dst=gpu_buffer,
-                    dst_block_id=slot,
-                    src=cpu_cache,
-                    src_block_id=logical_id,
-                    non_blocking=True,
-                )
+        with record_function_or_nullcontext(
+            f"runkv:load_layer:{layer_name}:L{layer_idx}"
+        ):
+            buffer_idx = layer_idx % self.num_buffers
+            gpu_buffer = self.gpu_buffers[buffer_idx]
+            cpu_cache = self.cpu_caches_per_layer[layer_name]
+            self._validate_shapes_for_layer(
+                layer_name=layer_name, gpu_buffer=gpu_buffer, cpu_cache=cpu_cache
+            )
 
-        # Synchronize to ensure data is available before attention computes
-        self.transfer_stream.synchronize()
-        return buffer_idx
+            # Copy all mapped blocks from CPU to GPU staging slots
+            # Use non-blocking copy with dedicated stream for overlap
+            num_blocks = len(self.mapping)
+            with (
+                record_function_or_nullcontext(f"runkv:h2d_copy:{num_blocks}_blocks"),
+                torch.cuda.stream(self.transfer_stream),
+            ):
+                for logical_id, slot in self.mapping.items():
+                    self._copy_block(
+                        dst=gpu_buffer,
+                        dst_block_id=slot,
+                        src=cpu_cache,
+                        src_block_id=logical_id,
+                        non_blocking=True,
+                    )
+
+            # Synchronize to ensure data is available before attention computes
+            with record_function_or_nullcontext("runkv:h2d_sync"):
+                self.transfer_stream.synchronize()
+            return buffer_idx
 
     def flush_layer(
         self, layer_name: str, layer_idx: int, dirty_blocks: set[int]
@@ -634,29 +643,38 @@ class PagedBlockMapper:
         """
         if not dirty_blocks:
             return
-        buffer_idx = layer_idx % self.num_buffers
-        gpu_buffer = self.gpu_buffers[buffer_idx]
-        cpu_cache = self.cpu_caches_per_layer[layer_name]
-        self._validate_shapes_for_layer(
-            layer_name=layer_name, gpu_buffer=gpu_buffer, cpu_cache=cpu_cache
-        )
 
-        # Copy only dirty blocks back to CPU
-        with torch.cuda.stream(self.transfer_stream):
-            for logical_id in dirty_blocks:
-                slot = self.mapping.get(logical_id)
-                if slot is None:
-                    continue
-                self._copy_block(
-                    dst=cpu_cache,
-                    dst_block_id=logical_id,
-                    src=gpu_buffer,
-                    src_block_id=slot,
-                    non_blocking=True,
-                )
+        with record_function_or_nullcontext(
+            f"runkv:flush_layer:{layer_name}:L{layer_idx}"
+        ):
+            buffer_idx = layer_idx % self.num_buffers
+            gpu_buffer = self.gpu_buffers[buffer_idx]
+            cpu_cache = self.cpu_caches_per_layer[layer_name]
+            self._validate_shapes_for_layer(
+                layer_name=layer_name, gpu_buffer=gpu_buffer, cpu_cache=cpu_cache
+            )
 
-        # Synchronize to ensure CPU cache is updated before next step
-        self.transfer_stream.synchronize()
+            # Copy only dirty blocks back to CPU
+            num_dirty = len(dirty_blocks)
+            with (
+                record_function_or_nullcontext(f"runkv:d2h_copy:{num_dirty}_blocks"),
+                torch.cuda.stream(self.transfer_stream),
+            ):
+                for logical_id in dirty_blocks:
+                    slot = self.mapping.get(logical_id)
+                    if slot is None:
+                        continue
+                    self._copy_block(
+                        dst=cpu_cache,
+                        dst_block_id=logical_id,
+                        src=gpu_buffer,
+                        src_block_id=slot,
+                        non_blocking=True,
+                    )
+
+            # Synchronize to ensure CPU cache is updated before next step
+            with record_function_or_nullcontext("runkv:d2h_sync"):
+                self.transfer_stream.synchronize()
 
 
 class GPUModelRunner(
