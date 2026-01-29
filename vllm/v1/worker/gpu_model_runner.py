@@ -396,8 +396,19 @@ class PagedBlockMapper:
         # (these need to be flushed back to CPU after the layer)
         self.dirty_blocks: set[int] = set()
 
-        # CUDA stream for async CPU<->GPU transfers
-        self.transfer_stream = torch.cuda.Stream(device=device)
+        # CUDA streams for async CPU<->GPU transfers
+        # Separate streams for load and offload to enable overlap
+        self.load_stream = torch.cuda.Stream(device=device)
+        self.offload_stream = torch.cuda.Stream(device=device)
+
+        # Events to track async transfer completion
+        # Maps layer_idx -> event for load completion
+        self.load_events: dict[int, torch.cuda.Event] = {}
+        # Maps layer_idx -> event for offload completion
+        self.offload_events: dict[int, torch.cuda.Event] = {}
+
+        # Track total number of layers (set during first step)
+        self.num_layers: int = 0
 
     def _validate_shapes_for_layer(
         self, *, layer_name: str, gpu_buffer: torch.Tensor, cpu_cache: torch.Tensor
@@ -581,11 +592,11 @@ class PagedBlockMapper:
         # 3. flush_layer uses logical IDs to update the correct CPU blocks
         return physical_block_table, slot_mapping, set(self.dirty_blocks)
 
-    def load_layer(self, layer_name: str, layer_idx: int) -> int:
-        """Copy mapped logical blocks from CPU to GPU staging buffer.
+    def load_layer_async(self, layer_name: str, layer_idx: int) -> int:
+        """Asynchronously copy mapped logical blocks from CPU to GPU staging buffer.
 
-        Before each attention layer runs, this method stages all needed
-        KV data from CPU to the appropriate GPU ring buffer.
+        This method starts the transfer but does NOT wait for completion.
+        Call sync_load_layer() before using the data.
 
         Args:
             layer_name: Name of the attention layer (for CPU cache lookup).
@@ -598,7 +609,7 @@ class PagedBlockMapper:
             return 0
 
         with record_function_or_nullcontext(
-            f"runkv:load_layer:{layer_name}:L{layer_idx}"
+            f"runkv:load_layer_async:{layer_name}:L{layer_idx}"
         ):
             buffer_idx = layer_idx % self.num_buffers
             gpu_buffer = self.gpu_buffers[buffer_idx]
@@ -612,7 +623,7 @@ class PagedBlockMapper:
             num_blocks = len(self.mapping)
             with (
                 record_function_or_nullcontext(f"runkv:h2d_copy:{num_blocks}_blocks"),
-                torch.cuda.stream(self.transfer_stream),
+                torch.cuda.stream(self.load_stream),
             ):
                 for logical_id, slot in self.mapping.items():
                     self._copy_block(
@@ -622,19 +633,58 @@ class PagedBlockMapper:
                         src_block_id=logical_id,
                         non_blocking=True,
                     )
+                # Record event after all copies are queued
+                event = torch.cuda.Event()
+                event.record(self.load_stream)
+                self.load_events[layer_idx] = event
 
-            # Synchronize to ensure data is available before attention computes
-            with record_function_or_nullcontext("runkv:h2d_sync"):
-                self.transfer_stream.synchronize()
             return buffer_idx
 
-    def flush_layer(
+    def sync_load_layer(self, layer_idx: int) -> None:
+        """Wait for async load of specified layer to complete.
+
+        This should be called before the attention computation for the layer
+        to ensure all KV data is available on GPU.
+
+        Args:
+            layer_idx: Index of the layer to sync.
+        """
+        event = self.load_events.get(layer_idx)
+        if event is not None:
+            with record_function_or_nullcontext(f"runkv:h2d_sync:L{layer_idx}"):
+                # Make the default stream wait for the load stream
+                event.wait(torch.cuda.current_stream())
+            # Clean up the event
+            del self.load_events[layer_idx]
+
+    def load_layer(self, layer_name: str, layer_idx: int) -> int:
+        """Copy mapped logical blocks from CPU to GPU staging buffer (synchronous).
+
+        Before each attention layer runs, this method stages all needed
+        KV data from CPU to the appropriate GPU ring buffer.
+
+        This is a synchronous version that waits for completion.
+        For pipelined execution, use load_layer_async() + sync_load_layer().
+
+        Args:
+            layer_name: Name of the attention layer (for CPU cache lookup).
+            layer_idx: Index of the layer (for ring buffer selection).
+
+        Returns:
+            buffer_idx: The GPU buffer index used for this layer.
+        """
+        buffer_idx = self.load_layer_async(layer_name, layer_idx)
+        self.sync_load_layer(layer_idx)
+        return buffer_idx
+
+    def flush_layer_async(
         self, layer_name: str, layer_idx: int, dirty_blocks: set[int]
     ) -> None:
-        """Copy dirty blocks from GPU staging buffer back to CPU.
+        """Asynchronously copy dirty blocks from GPU staging buffer back to CPU.
 
-        After each attention layer runs, this method writes back the
-        blocks that were modified (i.e., blocks where new KV was written).
+        This method starts the transfer but does NOT wait for completion.
+        The offload happens on a separate stream to overlap with compute.
+        Call sync_offload_layer() if you need to wait for completion.
 
         Args:
             layer_name: Name of the attention layer (for CPU cache lookup).
@@ -645,7 +695,7 @@ class PagedBlockMapper:
             return
 
         with record_function_or_nullcontext(
-            f"runkv:flush_layer:{layer_name}:L{layer_idx}"
+            f"runkv:flush_layer_async:{layer_name}:L{layer_idx}"
         ):
             buffer_idx = layer_idx % self.num_buffers
             gpu_buffer = self.gpu_buffers[buffer_idx]
@@ -654,12 +704,20 @@ class PagedBlockMapper:
                 layer_name=layer_name, gpu_buffer=gpu_buffer, cpu_cache=cpu_cache
             )
 
+            # First, wait for the compute stream to finish writing to the GPU buffer
+            # by recording an event on the current (compute) stream
+            compute_event = torch.cuda.Event()
+            compute_event.record(torch.cuda.current_stream())
+
             # Copy only dirty blocks back to CPU
             num_dirty = len(dirty_blocks)
             with (
                 record_function_or_nullcontext(f"runkv:d2h_copy:{num_dirty}_blocks"),
-                torch.cuda.stream(self.transfer_stream),
+                torch.cuda.stream(self.offload_stream),
             ):
+                # Wait for compute to complete before starting D2H copy
+                compute_event.wait(self.offload_stream)
+
                 for logical_id in dirty_blocks:
                     slot = self.mapping.get(logical_id)
                     if slot is None:
@@ -671,10 +729,54 @@ class PagedBlockMapper:
                         src_block_id=slot,
                         non_blocking=True,
                     )
+                # Record event after all copies are queued
+                event = torch.cuda.Event()
+                event.record(self.offload_stream)
+                self.offload_events[layer_idx] = event
 
-            # Synchronize to ensure CPU cache is updated before next step
-            with record_function_or_nullcontext("runkv:d2h_sync"):
-                self.transfer_stream.synchronize()
+    def sync_offload_layer(self, layer_idx: int) -> None:
+        """Wait for async offload of specified layer to complete.
+
+        This is typically only needed at the end of a step to ensure
+        all dirty blocks have been written back to CPU before the next step.
+
+        Args:
+            layer_idx: Index of the layer to sync.
+        """
+        event = self.offload_events.get(layer_idx)
+        if event is not None:
+            with record_function_or_nullcontext(f"runkv:d2h_sync:L{layer_idx}"):
+                event.synchronize()
+            del self.offload_events[layer_idx]
+
+    def sync_all_offloads(self) -> None:
+        """Wait for all pending async offloads to complete.
+
+        Call this at the end of a forward step to ensure all dirty blocks
+        have been written back to CPU.
+        """
+        with record_function_or_nullcontext("runkv:d2h_sync_all"):
+            for layer_idx in list(self.offload_events.keys()):
+                self.sync_offload_layer(layer_idx)
+
+    def flush_layer(
+        self, layer_name: str, layer_idx: int, dirty_blocks: set[int]
+    ) -> None:
+        """Copy dirty blocks from GPU staging buffer back to CPU (synchronous).
+
+        After each attention layer runs, this method writes back the
+        blocks that were modified (i.e., blocks where new KV was written).
+
+        This is a synchronous version that waits for completion.
+        For pipelined execution, use flush_layer_async() + sync_all_offloads().
+
+        Args:
+            layer_name: Name of the attention layer (for CPU cache lookup).
+            layer_idx: Index of the layer (for ring buffer selection).
+            dirty_blocks: Set of logical block IDs that were written to.
+        """
+        self.flush_layer_async(layer_name, layer_idx, dirty_blocks)
+        self.sync_offload_layer(layer_idx)
 
 
 class GPUModelRunner(
@@ -807,6 +909,9 @@ class GPUModelRunner(
         self.paged_block_tables: list[torch.Tensor] = []
         self.paged_slot_mappings: list[torch.Tensor] = []
         self.runkv_hooks: list[Any] = []
+        # Async pipeline state for RunKV
+        self._runkv_layer_info: list[tuple[str, int, int]] = []
+        self._runkv_num_layers: int = 0
 
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
@@ -2031,10 +2136,58 @@ class GPUModelRunner(
             dirty.clear()
 
     def _register_runkv_hooks(self, layer_to_gid: dict[str, int]) -> None:
-        """Register pre/post hooks to stage KV into ring buffers per layer."""
+        """Register pre/post hooks to stage KV into ring buffers per layer.
+
+        Async Pipeline Strategy:
+        -------------------------
+        Layer 0 (first layer):
+          - pre_hook: sync load layer 0 KV, then async prefetch layer 1 KV
+          - post_hook: async offload layer 0 dirty blocks
+
+        Layer N (0 < N < num_layers - 1):
+          - pre_hook: sync wait for layer N KV load, then async prefetch layer N+1 KV
+          - post_hook: async offload layer N dirty blocks
+
+        Layer N-1 (last layer):
+          - pre_hook: sync wait for layer N-1 KV load (no prefetch)
+          - post_hook: async offload layer N-1 dirty blocks
+
+        End of forward:
+          - sync_all_offloads() to ensure all dirty blocks are written back
+        """
         for handle in self.runkv_hooks:
             handle.remove()
         self.runkv_hooks.clear()
+
+        # Count total number of layers for prefetch boundary checking
+        num_layers = len(self.layer_name_to_idx)
+
+        # Store layer info for async pipeline
+        # Build ordered list of (layer_name, layer_idx, gid) tuples
+        layer_info: list[tuple[str, int, int]] = []
+        for (
+            layer_name,
+            attn_module,
+        ) in self.compilation_config.static_forward_context.items():
+            if (
+                layer_name not in layer_to_gid
+                or layer_name not in self.layer_name_to_idx
+            ):
+                continue
+            gid = layer_to_gid[layer_name]
+            layer_idx = self.layer_name_to_idx[layer_name]
+            layer_info.append((layer_name, layer_idx, gid))
+
+        # Sort by layer_idx to get correct order
+        layer_info.sort(key=lambda x: x[1])
+
+        # Store for use in hooks
+        self._runkv_layer_info = layer_info
+        self._runkv_num_layers = num_layers
+
+        # Update num_layers in all mappers
+        for mapper in self.paged_block_mappers:
+            mapper.num_layers = num_layers
 
         for (
             layer_name,
@@ -2062,6 +2215,18 @@ class GPUModelRunner(
             self.runkv_hooks.append(attn_module.register_forward_pre_hook(pre_hook))
             self.runkv_hooks.append(attn_module.register_forward_hook(post_hook))
 
+    def _get_next_layer_info(
+        self, current_layer_idx: int
+    ) -> tuple[str, int, int] | None:
+        """
+        Get (layer_name, layer_idx, gid) for the next layer,
+        or None if last layer.
+        """
+        for layer_name, layer_idx, gid in self._runkv_layer_info:
+            if layer_idx == current_layer_idx + 1:
+                return (layer_name, layer_idx, gid)
+        return None
+
     def _runkv_pre_hook(
         self,
         module: nn.Module,
@@ -2070,7 +2235,32 @@ class GPUModelRunner(
         layer_idx: int,
         gid: int,
     ) -> None:
-        self.paged_block_mappers[gid].load_layer(layer_name, layer_idx)
+        """Pre-hook for async KV loading pipeline.
+
+        For layer 0:
+          - Synchronously load layer 0 KV
+          - Start async prefetch of layer 1 KV (if exists)
+
+        For layer N > 0:
+          - Wait for layer N KV async load to complete (was prefetched by layer N-1)
+          - Start async prefetch of layer N+1 KV (if exists)
+        """
+        mapper = self.paged_block_mappers[gid]
+
+        if layer_idx == 0:
+            # First layer: sync load this layer's KV
+            mapper.load_layer(layer_name, layer_idx)
+        else:
+            # Other layers: wait for prefetch from previous layer to complete
+            mapper.sync_load_layer(layer_idx)
+
+        # Prefetch next layer's KV (if not the last layer)
+        next_layer_info = self._get_next_layer_info(layer_idx)
+        if next_layer_info is not None:
+            next_layer_name, next_layer_idx, next_gid = next_layer_info
+            # Use the mapper for the next layer's KV cache group
+            next_mapper = self.paged_block_mappers[next_gid]
+            next_mapper.load_layer_async(next_layer_name, next_layer_idx)
 
     def _runkv_post_hook(
         self,
@@ -2081,9 +2271,26 @@ class GPUModelRunner(
         layer_idx: int,
         gid: int,
     ) -> None:
-        self.paged_block_mappers[gid].flush_layer(
+        """Post-hook for async KV offloading pipeline.
+
+        Start async offload of this layer's dirty blocks.
+        The offload overlaps with compute of subsequent layers.
+
+        sync_all_offloads() must be called at the end of forward pass
+        to ensure all data is written back before the next step.
+        """
+        self.paged_block_mappers[gid].flush_layer_async(
             layer_name, layer_idx, self.paged_dirty_blocks[gid]
         )
+
+    def _sync_all_runkv_offloads(self) -> None:
+        """Synchronize all pending async offloads.
+
+        Must be called at the end of each forward pass to ensure
+        all dirty blocks are written back to CPU before the next step.
+        """
+        for mapper in self.paged_block_mappers:
+            mapper.sync_all_offloads()
 
     def _build_attention_metadata(
         self,
@@ -3803,6 +4010,12 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
+            # Sync all pending async offloads after model forward completes.
+            # This ensures all dirty KV blocks are written back to CPU
+            # before the next step.
+            if self.use_runkv:
+                self._sync_all_runkv_offloads()
+
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -4982,6 +5195,10 @@ class GPUModelRunner(
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+
+            # Sync all pending async offloads after model forward completes.
+            if self.use_runkv:
+                self._sync_all_runkv_offloads()
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
