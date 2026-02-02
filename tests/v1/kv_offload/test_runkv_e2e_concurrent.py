@@ -904,14 +904,14 @@ def main():
     parser.add_argument(
         "--cpu-memory-gb",
         type=float,
-        default=100.0,
-        help="CPU memory limit for RunKV in GB (default: 100.0)",
+        default=20.0,
+        help="CPU memory limit for RunKV in GB (default: 20.0)",
     )
     parser.add_argument(
         "--cpu-memory-fraction",
         type=float,
-        default=0.7,
-        help="CPU memory fraction for RunKV (default: 0.7)",
+        default=0.2,
+        help="CPU memory fraction for RunKV (default: 0.2)",
     )
     parser.add_argument(
         "--compare-baseline",

@@ -210,7 +210,7 @@ def main():
     parser.add_argument(
         "--cpu-memory-gb",
         type=float,
-        default=100.0,
+        default=20.0,
         help="CPU memory limit for RunKV KV cache offloading in GB. "
         "Set <= 0 to derive from available system memory and "
         "--cpu-memory-fraction. Default: 100.0",
@@ -218,9 +218,9 @@ def main():
     parser.add_argument(
         "--cpu-memory-fraction",
         type=float,
-        default=0.7,
+        default=0.2,
         help="When --cpu-memory-gb <= 0, cap the RunKV CPU KV cache backing store "
-        "to (available_system_memory * fraction). Default: 0.7",
+        "to (available_system_memory * fraction). Default: 0.2",
     )
     parser.add_argument(
         "--compare-baseline",

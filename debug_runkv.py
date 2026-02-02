@@ -106,7 +106,7 @@ def main() -> None:
 
     # RunKV knobs
     parser.add_argument("--num-device-buffers", type=int, default=3)
-    parser.add_argument("--gpu-memory-fraction", type=float, default=0.5)
+    parser.add_argument("--gpu-memory-fraction", type=float, default=0.8)
     parser.add_argument("--max-staging-blocks", type=int, default=0)
     parser.add_argument(
         "--cpu-memory-gb",
@@ -117,7 +117,7 @@ def main() -> None:
     parser.add_argument(
         "--cpu-memory-fraction",
         type=float,
-        default=0.7,
+        default=0.2,
         help="Used when --cpu-memory-gb <= 0.",
     )
     parser.add_argument(
