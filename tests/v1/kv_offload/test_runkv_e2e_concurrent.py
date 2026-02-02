@@ -68,7 +68,13 @@ def nvtx_range(name: str, color: str = "blue"):
             with nvtx.annotate(name, color=color):
                 yield
         except ImportError:
-            yield
+            try:
+                import torch.cuda.nvtx as torch_nvtx
+
+                with torch_nvtx.range(name):
+                    yield
+            except Exception:
+                yield
     else:
         yield
 
@@ -998,6 +1004,11 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Ensure vLLM's NVTX scopes are enabled when doing profiling / layerwise tracing.
+    # This must happen before importing vLLM so that vllm.envs reads the env var.
+    if args.profile or args.enable_layerwise_nvtx_tracing:
+        os.environ.setdefault("VLLM_NVTX_SCOPES_FOR_PROFILING", "1")
 
     print("=" * 60, flush=True)
     print("RunKV High-Concurrency E2E Test", flush=True)

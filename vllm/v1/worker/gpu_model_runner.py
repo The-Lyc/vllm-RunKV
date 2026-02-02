@@ -691,13 +691,17 @@ class PagedBlockMapper:
                     dst_indices = self._dst_indices_pinned[:num_blocks]
 
                     # Single kernel launch reads indices via UVA
-                    self._batch_copy_fn(
-                        gpu_buffer,  # dst: GPU staging buffer
-                        cpu_cache,  # src: CPU cache (pinned)
-                        dst_indices,  # dst block indices (pinned, UVA)
-                        src_indices,  # src block indices (pinned, UVA)
-                        self._blocks_dim,
-                    )
+                    with record_function_or_nullcontext(
+                        "runkv_kernels:batch_copy_blocks"
+                        f":h2d:L{layer_idx}:{num_blocks}_blocks"
+                    ):
+                        self._batch_copy_fn(
+                            gpu_buffer,  # dst: GPU staging buffer
+                            cpu_cache,  # src: CPU cache (pinned)
+                            dst_indices,  # dst block indices (pinned, UVA)
+                            src_indices,  # src block indices (pinned, UVA)
+                            self._blocks_dim,
+                        )
                 else:
                     # Fallback to per-block copy
                     for logical_id, slot in self.mapping.items():
@@ -813,17 +817,21 @@ class PagedBlockMapper:
                         )
 
                         # Single kernel launch reads indices via UVA
-                        self._batch_copy_fn(
-                            cpu_cache,  # dst: CPU cache (pinned)
-                            gpu_buffer,  # src: GPU staging buffer
-                            self._dirty_dst_indices_pinned[
-                                :idx
-                            ],  # dst block indices (pinned, UVA)
-                            self._dirty_src_indices_pinned[
-                                :idx
-                            ],  # src block indices (pinned, UVA)
-                            self._blocks_dim,
-                        )
+                        with record_function_or_nullcontext(
+                            "runkv_kernels:batch_copy_blocks"
+                            f":d2h:L{layer_idx}:{idx}_blocks"
+                        ):
+                            self._batch_copy_fn(
+                                cpu_cache,  # dst: CPU cache (pinned)
+                                gpu_buffer,  # src: GPU staging buffer
+                                self._dirty_dst_indices_pinned[
+                                    :idx
+                                ],  # dst block indices (pinned, UVA)
+                                self._dirty_src_indices_pinned[
+                                    :idx
+                                ],  # src block indices (pinned, UVA)
+                                self._blocks_dim,
+                            )
                 else:
                     # Fallback to per-block copy
                     for logical_id in dirty_blocks:
