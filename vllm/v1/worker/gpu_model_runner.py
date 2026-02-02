@@ -187,6 +187,17 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
+# RunKV batch copy kernel support (standalone extension module)
+def _get_runkv_batch_copy():
+    """Get the batch copy function from standalone runkv_kernels module."""
+    try:
+        import runkv_kernels
+
+        return runkv_kernels.batch_copy_blocks
+    except ImportError:
+        return None
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -410,6 +421,42 @@ class PagedBlockMapper:
         # Track total number of layers (set during first step)
         self.num_layers: int = 0
 
+        # UVA batch copy support
+        # Try to load the batch copy kernel (built-in or standalone)
+        batch_copy_fn = _get_runkv_batch_copy()
+        self.use_batch_copy = batch_copy_fn is not None
+        self._batch_copy_fn = batch_copy_fn
+
+        if self.use_batch_copy:
+            # Pre-allocate pinned memory for index arrays
+            # These are accessed via UVA by the GPU kernel
+            # Size them to handle max possible blocks per step
+            max_indices = self.capacity
+            self._src_indices_pinned = torch.empty(
+                max_indices, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+            self._dst_indices_pinned = torch.empty(
+                max_indices, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+            # Also for dirty blocks (offload)
+            self._dirty_src_indices_pinned = torch.empty(
+                max_indices, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+            self._dirty_dst_indices_pinned = torch.empty(
+                max_indices, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+            # Pre-computed indices for current step (set in _assign_slots)
+            self._current_num_blocks = 0
+            logger.info(
+                "RunKV: Using UVA batch copy kernel (max %d blocks)",
+                max_indices,
+            )
+        else:
+            logger.warning(
+                "RunKV: UVA batch copy kernel not available, using per-block copy. "
+                "To enable, run: python setup_runkv.py build_ext --inplace"
+            )
+
     def _validate_shapes_for_layer(
         self, *, layer_name: str, gpu_buffer: torch.Tensor, cpu_cache: torch.Tensor
     ) -> None:
@@ -473,6 +520,18 @@ class PagedBlockMapper:
             )
         for slot, logical_id in enumerate(logical_block_ids):
             self.mapping[logical_id] = slot
+
+        # Pre-fill indices for batch copy (avoid Python for-loop in load_layer_async)
+        if self.use_batch_copy:
+            num_blocks = len(logical_block_ids)
+            self._current_num_blocks = num_blocks
+            if num_blocks > 0:
+                # Convert mapping to tensors efficiently
+                # logical_block_ids are CPU indices, slots are GPU indices
+                logical_ids_tensor = torch.tensor(logical_block_ids, dtype=torch.int64)
+                slots_tensor = torch.arange(num_blocks, dtype=torch.int64)
+                self._src_indices_pinned[:num_blocks].copy_(logical_ids_tensor)
+                self._dst_indices_pinned[:num_blocks].copy_(slots_tensor)
 
     def prepare_step(
         self,
@@ -625,14 +684,30 @@ class PagedBlockMapper:
                 record_function_or_nullcontext(f"runkv:h2d_copy:{num_blocks}_blocks"),
                 torch.cuda.stream(self.load_stream),
             ):
-                for logical_id, slot in self.mapping.items():
-                    self._copy_block(
-                        dst=gpu_buffer,
-                        dst_block_id=slot,
-                        src=cpu_cache,
-                        src_block_id=logical_id,
-                        non_blocking=True,
+                if self.use_batch_copy and num_blocks > 0:
+                    # Use UVA batch copy kernel - single kernel launch!
+                    # Indices are pre-filled in _assign_slots (called from prepare_step)
+                    src_indices = self._src_indices_pinned[:num_blocks]
+                    dst_indices = self._dst_indices_pinned[:num_blocks]
+
+                    # Single kernel launch reads indices via UVA
+                    self._batch_copy_fn(
+                        gpu_buffer,  # dst: GPU staging buffer
+                        cpu_cache,  # src: CPU cache (pinned)
+                        dst_indices,  # dst block indices (pinned, UVA)
+                        src_indices,  # src block indices (pinned, UVA)
+                        self._blocks_dim,
                     )
+                else:
+                    # Fallback to per-block copy
+                    for logical_id, slot in self.mapping.items():
+                        self._copy_block(
+                            dst=gpu_buffer,
+                            dst_block_id=slot,
+                            src=cpu_cache,
+                            src_block_id=logical_id,
+                            non_blocking=True,
+                        )
                 # Record event after all copies are queued
                 event = torch.cuda.Event()
                 event.record(self.load_stream)
@@ -718,17 +793,50 @@ class PagedBlockMapper:
                 # Wait for compute to complete before starting D2H copy
                 compute_event.wait(self.offload_stream)
 
-                for logical_id in dirty_blocks:
-                    slot = self.mapping.get(logical_id)
-                    if slot is None:
-                        continue
-                    self._copy_block(
-                        dst=cpu_cache,
-                        dst_block_id=logical_id,
-                        src=gpu_buffer,
-                        src_block_id=slot,
-                        non_blocking=True,
-                    )
+                if self.use_batch_copy and num_dirty > 0:
+                    # Use UVA batch copy kernel - single kernel launch!
+                    # Pack indices via list comprehension + tensor.
+                    # Avoid per-block loop on the Python side.
+                    valid_pairs = [
+                        (self.mapping[lid], lid)
+                        for lid in dirty_blocks
+                        if lid in self.mapping
+                    ]
+                    if valid_pairs:
+                        slots, logical_ids = zip(*valid_pairs)
+                        idx = len(valid_pairs)
+                        self._dirty_src_indices_pinned[:idx] = torch.tensor(
+                            slots, dtype=torch.int64
+                        )
+                        self._dirty_dst_indices_pinned[:idx] = torch.tensor(
+                            logical_ids, dtype=torch.int64
+                        )
+
+                        # Single kernel launch reads indices via UVA
+                        self._batch_copy_fn(
+                            cpu_cache,  # dst: CPU cache (pinned)
+                            gpu_buffer,  # src: GPU staging buffer
+                            self._dirty_dst_indices_pinned[
+                                :idx
+                            ],  # dst block indices (pinned, UVA)
+                            self._dirty_src_indices_pinned[
+                                :idx
+                            ],  # src block indices (pinned, UVA)
+                            self._blocks_dim,
+                        )
+                else:
+                    # Fallback to per-block copy
+                    for logical_id in dirty_blocks:
+                        slot = self.mapping.get(logical_id)
+                        if slot is None:
+                            continue
+                        self._copy_block(
+                            dst=cpu_cache,
+                            dst_block_id=logical_id,
+                            src=gpu_buffer,
+                            src_block_id=slot,
+                            non_blocking=True,
+                        )
                 # Record event after all copies are queued
                 event = torch.cuda.Event()
                 event.record(self.offload_stream)
@@ -2237,28 +2345,30 @@ class GPUModelRunner(
     ) -> None:
         """Pre-hook for async KV loading pipeline.
 
-        For layer 0:
-          - Synchronously load layer 0 KV
-          - Start async prefetch of layer 1 KV (if exists)
+        Timeline for layer N:
+        ----------------------
+        1. If N == 0: start async load of layer 0
+        2. Sync wait for layer N's load event (GPU-side wait, non-blocking to CPU)
+        3. Start async prefetch of layer N+1 (if exists)
+        4. Return -> attention compute starts on default stream
 
-        For layer N > 0:
-          - Wait for layer N KV async load to complete (was prefetched by layer N-1)
-          - Start async prefetch of layer N+1 KV (if exists)
+        Since prefetch is dispatched to load_stream and compute runs on
+        default stream, they execute in parallel on GPU.
         """
         mapper = self.paged_block_mappers[gid]
 
         if layer_idx == 0:
-            # First layer: sync load this layer's KV
-            mapper.load_layer(layer_name, layer_idx)
-        else:
-            # Other layers: wait for prefetch from previous layer to complete
-            mapper.sync_load_layer(layer_idx)
+            # First layer: start async load
+            mapper.load_layer_async(layer_name, layer_idx)
 
-        # Prefetch next layer's KV (if not the last layer)
+        # Wait for current layer's KV to be ready (GPU-side sync)
+        # This makes default stream wait for load_stream's event
+        mapper.sync_load_layer(layer_idx)
+
+        # Prefetch next layer's KV (dispatched to load_stream, runs parallel to compute)
         next_layer_info = self._get_next_layer_info(layer_idx)
         if next_layer_info is not None:
             next_layer_name, next_layer_idx, next_gid = next_layer_info
-            # Use the mapper for the next layer's KV cache group
             next_mapper = self.paged_block_mappers[next_gid]
             next_mapper.load_layer_async(next_layer_name, next_layer_idx)
 
@@ -6297,9 +6407,13 @@ class GPUModelRunner(
             corresponding memory buffer for KV cache.
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+        should_pin = paging_tensor_device.type == "cpu"
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             tensor = torch.zeros(
-                kv_cache_tensor.size, dtype=torch.int8, device=paging_tensor_device
+                kv_cache_tensor.size,
+                dtype=torch.int8,
+                device=paging_tensor_device,
+                pin_memory=should_pin,
             )
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
