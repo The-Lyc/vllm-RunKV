@@ -393,9 +393,19 @@ def record_function_or_nullcontext(name: str) -> AbstractContextManager:
     if envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING:
         func = record_function
     elif envs.VLLM_NVTX_SCOPES_FOR_PROFILING:
-        import nvtx
+        try:
+            import nvtx  # type: ignore[import-not-found]
 
-        func = nvtx.annotate
+            func = nvtx.annotate
+        except Exception:
+            # Fall back to PyTorch's built-in NVTX bindings to avoid requiring
+            # the separate `nvtx` Python package.
+            try:
+                import torch.cuda.nvtx as torch_nvtx
+
+                func = torch_nvtx.range
+            except Exception:
+                func = contextlib.nullcontext
 
     _PROFILER_FUNC = func
     return func(name)
