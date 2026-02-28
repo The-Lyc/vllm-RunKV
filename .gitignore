@@ -197,6 +197,15 @@ AGENTS.md
 # Results
 *.csv
 
+# Nsight Systems (nsys) profiling outputs
+*.nsys-rep
+*.qdrep
+*.qdstrm
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
 # Python pickle files
 *.pkl
 
@@ -214,6 +223,9 @@ hip_compat.h
 
 # Benchmark dataset
 benchmarks/**/*.json
+
+# Benchmark results / reports (local artifacts)
+benchmarks/**/benchmark_results/
 
 # Linting
 actionlint
