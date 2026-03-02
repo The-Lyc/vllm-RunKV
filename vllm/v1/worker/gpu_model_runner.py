@@ -652,7 +652,12 @@ class PagedBlockMapper:
         # 3. flush_layer uses logical IDs to update the correct CPU blocks
         return physical_block_table, slot_mapping, set(self.dirty_blocks)
 
-    def load_layer_async(self, layer_name: str, layer_idx: int) -> int:
+    def load_layer_async(
+        self,
+        layer_name: str,
+        layer_idx: int,
+        skip_block_ids: set[int] | None = None,
+    ) -> int:
         """Asynchronously copy mapped logical blocks from CPU to GPU staging buffer.
 
         This method starts the transfer but does NOT wait for completion.
@@ -661,6 +666,8 @@ class PagedBlockMapper:
         Args:
             layer_name: Name of the attention layer (for CPU cache lookup).
             layer_idx: Index of the layer (for ring buffer selection).
+            skip_block_ids: Logical block IDs to skip loading from CPU. These
+                blocks are expected to be filled by another path (e.g., recompute).
 
         Returns:
             buffer_idx: The GPU buffer index used for this layer.
@@ -678,34 +685,59 @@ class PagedBlockMapper:
                 layer_name=layer_name, gpu_buffer=gpu_buffer, cpu_cache=cpu_cache
             )
 
+            skip = skip_block_ids or set()
+
             # Copy all mapped blocks from CPU to GPU staging slots
             # Use non-blocking copy with dedicated stream for overlap
-            num_blocks = len(self.mapping)
+            num_blocks = len(self.mapping) - len(skip)
             with (
-                record_function_or_nullcontext(f"runkv:h2d_copy:{num_blocks}_blocks"),
+                record_function_or_nullcontext(
+                    f"runkv:h2d_copy:{max(num_blocks, 0)}_blocks"
+                ),
                 torch.cuda.stream(self.load_stream),
             ):
-                if self.use_batch_copy and num_blocks > 0:
-                    # Use UVA batch copy kernel - single kernel launch!
-                    # Indices are pre-filled in _assign_slots (called from prepare_step)
-                    src_indices = self._src_indices_pinned[:num_blocks]
-                    dst_indices = self._dst_indices_pinned[:num_blocks]
+                if self.use_batch_copy:
+                    copy_count = 0
+                    if skip:
+                        # Build filtered (logical_id -> slot) pairs.
+                        valid_pairs = [
+                            (logical_id, slot)
+                            for logical_id, slot in self.mapping.items()
+                            if logical_id not in skip
+                        ]
+                        copy_count = len(valid_pairs)
+                        if copy_count > 0:
+                            logical_ids, slots = zip(*valid_pairs)
+                            self._src_indices_pinned[:copy_count] = torch.tensor(
+                                logical_ids, dtype=torch.int64
+                            )
+                            self._dst_indices_pinned[:copy_count] = torch.tensor(
+                                slots, dtype=torch.int64
+                            )
+                    else:
+                        # Fast path: use pre-filled full-step indices.
+                        copy_count = len(self.mapping)
 
-                    # Single kernel launch reads indices via UVA
-                    with record_function_or_nullcontext(
-                        "runkv_kernels:batch_copy_blocks"
-                        f":h2d:L{layer_idx}:{num_blocks}_blocks"
-                    ):
-                        self._batch_copy_fn(
-                            gpu_buffer,  # dst: GPU staging buffer
-                            cpu_cache,  # src: CPU cache (pinned)
-                            dst_indices,  # dst block indices (pinned, UVA)
-                            src_indices,  # src block indices (pinned, UVA)
-                            self._blocks_dim,
-                        )
+                    if copy_count > 0:
+                        src_indices = self._src_indices_pinned[:copy_count]
+                        dst_indices = self._dst_indices_pinned[:copy_count]
+                        # Single kernel launch reads indices via UVA.
+                        with record_function_or_nullcontext(
+                            "runkv_kernels:batch_copy_blocks"
+                            f":h2d:L{layer_idx}:{copy_count}_blocks"
+                        ):
+                            self._batch_copy_fn(
+                                gpu_buffer,  # dst: GPU staging buffer
+                                cpu_cache,  # src: CPU cache (pinned)
+                                dst_indices,  # dst block indices (pinned, UVA)
+                                src_indices,  # src block indices (pinned, UVA)
+                                self._blocks_dim,
+                            )
                 else:
                     # Fallback to per-block copy
                     for logical_id, slot in self.mapping.items():
+                        if logical_id in skip:
+                            continue
                         self._copy_block(
                             dst=gpu_buffer,
                             dst_block_id=slot,
@@ -737,7 +769,12 @@ class PagedBlockMapper:
             # Clean up the event
             del self.load_events[layer_idx]
 
-    def load_layer(self, layer_name: str, layer_idx: int) -> int:
+    def load_layer(
+        self,
+        layer_name: str,
+        layer_idx: int,
+        skip_block_ids: set[int] | None = None,
+    ) -> int:
         """Copy mapped logical blocks from CPU to GPU staging buffer (synchronous).
 
         Before each attention layer runs, this method stages all needed
@@ -749,11 +786,12 @@ class PagedBlockMapper:
         Args:
             layer_name: Name of the attention layer (for CPU cache lookup).
             layer_idx: Index of the layer (for ring buffer selection).
+            skip_block_ids: Logical block IDs to skip loading from CPU.
 
         Returns:
             buffer_idx: The GPU buffer index used for this layer.
         """
-        buffer_idx = self.load_layer_async(layer_name, layer_idx)
+        buffer_idx = self.load_layer_async(layer_name, layer_idx, skip_block_ids)
         self.sync_load_layer(layer_idx)
         return buffer_idx
 

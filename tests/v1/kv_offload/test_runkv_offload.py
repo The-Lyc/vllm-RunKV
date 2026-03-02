@@ -378,6 +378,68 @@ class TestPagedBlockMapper:
         # Block 20 should be unchanged (not dirty)
         assert torch.allclose(cpu_caches["layer.0"][20], torch.ones(64) * 2)
 
+    def test_load_layer_async_skip_blocks_fallback_copy(self, setup_mapper):
+        """Fallback path should skip specified logical blocks."""
+        mapper, gpu_buffers, cpu_caches = setup_mapper
+        mapper.use_batch_copy = False
+
+        cpu_caches["layer.0"][10] = torch.ones(64)
+        cpu_caches["layer.0"][20] = torch.ones(64) * 2
+        mapper.mapping = {10: 0, 20: 1}
+
+        gpu_buffers[0][0].fill_(-7)
+        gpu_buffers[0][1].fill_(-7)
+
+        mapper.load_layer_async("layer.0", layer_idx=0, skip_block_ids={20})
+        mapper.sync_load_layer(0)
+
+        assert torch.allclose(gpu_buffers[0][0].cpu(), cpu_caches["layer.0"][10])
+        assert torch.allclose(gpu_buffers[0][1].cpu(), torch.full((64,), -7.0))
+
+    def test_load_layer_async_skip_blocks_batch_copy(self, setup_mapper):
+        """Batch-copy path should also skip specified logical blocks."""
+        mapper, gpu_buffers, cpu_caches = setup_mapper
+
+        # Force batch-copy path with a deterministic python mock.
+        mapper.use_batch_copy = True
+        max_indices = mapper.capacity
+        mapper._src_indices_pinned = torch.empty(
+            max_indices, dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        mapper._dst_indices_pinned = torch.empty(
+            max_indices, dtype=torch.int64, device="cpu", pin_memory=True
+        )
+
+        def _fake_batch_copy(dst, src, dst_indices, src_indices, blocks_dim):
+            for i in range(dst_indices.numel()):
+                d = int(dst_indices[i])
+                s = int(src_indices[i])
+                if blocks_dim == 0:
+                    dst[d].copy_(src[s], non_blocking=False)
+                else:
+                    dst.select(blocks_dim, d).copy_(
+                        src.select(blocks_dim, s), non_blocking=False
+                    )
+
+        mapper._batch_copy_fn = _fake_batch_copy
+
+        cpu_caches["layer.0"][10] = torch.ones(64)
+        cpu_caches["layer.0"][20] = torch.ones(64) * 2
+        mapper.mapping = {10: 0, 20: 1}
+        # Keep the fast-path indices coherent for no-skip path; skip path will
+        # overwrite filtered prefixes anyway.
+        mapper._src_indices_pinned[:2] = torch.tensor([10, 20], dtype=torch.int64)
+        mapper._dst_indices_pinned[:2] = torch.tensor([0, 1], dtype=torch.int64)
+
+        gpu_buffers[0][0].fill_(-9)
+        gpu_buffers[0][1].fill_(-9)
+
+        mapper.load_layer_async("layer.0", layer_idx=0, skip_block_ids={20})
+        mapper.sync_load_layer(0)
+
+        assert torch.allclose(gpu_buffers[0][0].cpu(), cpu_caches["layer.0"][10])
+        assert torch.allclose(gpu_buffers[0][1].cpu(), torch.full((64,), -9.0))
+
     def test_ring_buffer_selection(self, setup_mapper):
         """Test that layers use ring buffers correctly."""
         mapper, _, _ = setup_mapper

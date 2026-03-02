@@ -675,3 +675,24 @@ def load_layer_async(
 - 测试结果：
   - `pytest -q tests/v1/kv_offload/test_layer_recompute_manager.py`
   - `8 passed`
+
+### Step 5（已完成）：`PagedBlockMapper.load_layer_async()` 支持 skip
+
+- 完成时间：2026-03-02
+- 已修改：
+  - `vllm/v1/worker/gpu_model_runner.py`
+    - `PagedBlockMapper.load_layer_async(...)` 增加参数：
+      - `skip_block_ids: set[int] | None = None`
+    - `PagedBlockMapper.load_layer(...)` 同步支持 `skip_block_ids`
+    - fallback copy 路径：
+      - 遍历 `mapping` 时跳过 `skip_block_ids`
+    - batch copy 路径：
+      - 无 skip 时继续走预填索引快路径
+      - 有 skip 时构建过滤后的 `(src_indices, dst_indices)` 并调用 batch copy kernel
+- 已新增测试：
+  - `tests/v1/kv_offload/test_runkv_offload.py`
+    - `test_load_layer_async_skip_blocks_fallback_copy`
+    - `test_load_layer_async_skip_blocks_batch_copy`
+- 本地测试结果：
+  - `pytest -q tests/v1/kv_offload/test_runkv_offload.py -k skip_blocks`
+  - 当前环境无 CUDA，新增 2 个用例被 `skipif` 跳过（`2 skipped`）
