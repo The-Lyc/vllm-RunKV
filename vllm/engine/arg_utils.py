@@ -578,6 +578,18 @@ class EngineArgs:
     )
     tokens_only: bool = False
 
+    # Keep raw RunKV CLI arguments on EngineArgs so from_cli_args()
+    # preserves them for _build_kv_offload_config().
+    enable_runkv: bool = False
+    runkv_num_device_buffers: int = 3
+    runkv_max_staging_blocks: int | None = None
+    runkv_gpu_memory_fraction: float = 0.1
+    runkv_cpu_memory_gb: float | None = None
+    runkv_cpu_memory_fraction: float = 0.9
+    runkv_enable_layer_recompute: bool = False
+    runkv_layer_recompute_io_prefix_blocks: str = ""
+    runkv_layer_recompute_measure_overhead: bool = False
+
     # RunKV layer-wise KV cache offload configuration
     kv_offload_config: RunKVOffloadConfig | dict[str, Any] | None = None
 
@@ -991,6 +1003,25 @@ class EngineArgs:
             help="When --runkv-cpu-memory-gb is not set, cap the RunKV CPU KV "
             "cache backing store to (available_system_memory * fraction). "
             "Default: 0.9",
+        )
+        runkv_group.add_argument(
+            "--runkv-enable-layer-recompute",
+            action="store_true",
+            default=False,
+            help="Enable per-layer recompute for RunKV non-prefix KV blocks.",
+        )
+        runkv_group.add_argument(
+            "--runkv-layer-recompute-io-prefix-blocks",
+            type=str,
+            default="",
+            help="Per-layer IO prefix block counts for layer recompute. "
+            "Use a single value (for all layers) or a comma-separated list.",
+        )
+        runkv_group.add_argument(
+            "--runkv-layer-recompute-measure-overhead",
+            action="store_true",
+            default=False,
+            help="Enable extra timing metrics for layer recompute overhead.",
         )
 
         # Multimodal related configs
@@ -1825,29 +1856,71 @@ class EngineArgs:
         # If kv_offload_config is already provided as a dict or object, use it
         if self.kv_offload_config is not None:
             if isinstance(self.kv_offload_config, dict):
-                return RunKVOffloadConfig(**self.kv_offload_config)
-            return self.kv_offload_config
+                config = RunKVOffloadConfig(**self.kv_offload_config)
+            else:
+                config = self.kv_offload_config
+            if isinstance(config.layer_recompute_io_prefix_blocks, str):
+                config.layer_recompute_io_prefix_blocks = (
+                    self._parse_runkv_layer_recompute_io_prefix_blocks(
+                        config.layer_recompute_io_prefix_blocks
+                    )
+                )
+            return config
 
         # Build from individual CLI arguments
         # Check if --enable-runkv was passed
-        enable_runkv = getattr(self, "enable_runkv", False)
-        if not enable_runkv:
+        if not self.enable_runkv:
             return RunKVOffloadConfig(enabled=False)
 
         # Build config from CLI args
         cpu_memory_limit = None
-        runkv_cpu_memory_gb = getattr(self, "runkv_cpu_memory_gb", None)
-        if runkv_cpu_memory_gb is not None:
-            cpu_memory_limit = int(runkv_cpu_memory_gb * 1024**3)
+        if self.runkv_cpu_memory_gb is not None:
+            cpu_memory_limit = int(self.runkv_cpu_memory_gb * 1024**3)
 
         return RunKVOffloadConfig(
             enabled=True,
-            num_device_buffers=getattr(self, "runkv_num_device_buffers", 3),
-            max_staging_blocks=getattr(self, "runkv_max_staging_blocks", None),
-            gpu_memory_fraction=getattr(self, "runkv_gpu_memory_fraction", 0.1),
+            num_device_buffers=self.runkv_num_device_buffers,
+            max_staging_blocks=self.runkv_max_staging_blocks,
+            gpu_memory_fraction=self.runkv_gpu_memory_fraction,
             cpu_memory_limit=cpu_memory_limit,
-            cpu_memory_fraction=getattr(self, "runkv_cpu_memory_fraction", 0.9),
+            cpu_memory_fraction=self.runkv_cpu_memory_fraction,
+            enable_layer_recompute=self.runkv_enable_layer_recompute,
+            layer_recompute_io_prefix_blocks=(
+                self._parse_runkv_layer_recompute_io_prefix_blocks(
+                    self.runkv_layer_recompute_io_prefix_blocks
+                )
+            ),
+            layer_recompute_measure_overhead=(
+                self.runkv_layer_recompute_measure_overhead
+            ),
         )
+
+    @staticmethod
+    def _parse_runkv_layer_recompute_io_prefix_blocks(
+        raw_value: str | list[int] | None,
+    ) -> list[int]:
+        if raw_value is None:
+            return []
+        if isinstance(raw_value, list):
+            return [int(v) for v in raw_value]
+
+        stripped = raw_value.strip()
+        if stripped == "":
+            return []
+
+        pieces = [piece.strip() for piece in stripped.split(",")]
+        if any(piece == "" for piece in pieces):
+            raise ValueError(
+                "Invalid --runkv-layer-recompute-io-prefix-blocks: "
+                f"empty element in '{raw_value}'."
+            )
+        try:
+            return [int(piece) for piece in pieces]
+        except ValueError as e:
+            raise ValueError(
+                "Invalid --runkv-layer-recompute-io-prefix-blocks: "
+                f"expected comma-separated integers, got '{raw_value}'."
+            ) from e
 
     def _check_feature_supported(self, model_config: ModelConfig):
         """Raise an error if the feature is not supported."""

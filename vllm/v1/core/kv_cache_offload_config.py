@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -36,3 +36,13 @@ class RunKVOffloadConfig:
     # (available_system_memory * cpu_memory_fraction).
     # This is a safety knob to avoid consuming all host memory by default.
     cpu_memory_fraction: float = 0.7
+
+    # Enable layer-wise KV recompute + RunKV IO hybrid path.
+    enable_layer_recompute: bool = False
+
+    # Number of IO prefix blocks per layer. Empty list means disabled/unset.
+    # A single value is allowed and expanded to all layers by the runner.
+    layer_recompute_io_prefix_blocks: list[int] = field(default_factory=list)
+
+    # Emit additional recompute vs IO overlap timing metrics.
+    layer_recompute_measure_overhead: bool = False

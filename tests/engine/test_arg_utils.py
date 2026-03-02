@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
-from argparse import ArgumentError
+from argparse import ArgumentError, Namespace
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Annotated, Literal
@@ -525,3 +525,69 @@ def test_human_readable_model_len():
     for invalid in ["1a", "pwd", "10.24", "1.23M", "1.22T"]:
         with pytest.raises(ArgumentError):
             parser.parse_args(["--max-model-len", invalid])
+
+
+@pytest.mark.parametrize(
+    ("raw_prefix", "expected"),
+    [("8", [8]), ("8,16, 32", [8, 16, 32]), ("", [])],
+)
+def test_runkv_layer_recompute_prefix_blocks_parser(raw_prefix, expected):
+    engine_args = EngineArgs(
+        model="facebook/opt-125m",
+        enable_runkv=True,
+        runkv_layer_recompute_io_prefix_blocks=raw_prefix,
+    )
+    config = engine_args._build_kv_offload_config()
+    assert config.layer_recompute_io_prefix_blocks == expected
+
+
+def test_runkv_layer_recompute_cli_to_config():
+    engine_args = EngineArgs(
+        model="facebook/opt-125m",
+        enable_runkv=True,
+        runkv_enable_layer_recompute=True,
+        runkv_layer_recompute_io_prefix_blocks="4,12,24",
+        runkv_layer_recompute_measure_overhead=True,
+    )
+    config = engine_args._build_kv_offload_config()
+
+    assert config.enabled is True
+    assert config.enable_layer_recompute is True
+    assert config.layer_recompute_io_prefix_blocks == [4, 12, 24]
+    assert config.layer_recompute_measure_overhead is True
+
+
+def test_runkv_layer_recompute_prefix_blocks_parser_rejects_empty_segment():
+    engine_args = EngineArgs(
+        model="facebook/opt-125m",
+        enable_runkv=True,
+        runkv_layer_recompute_io_prefix_blocks="8,,16",
+    )
+    with pytest.raises(ValueError, match="empty element"):
+        engine_args._build_kv_offload_config()
+
+
+def test_runkv_fields_are_preserved_by_from_cli_args():
+    args = Namespace(
+        model="facebook/opt-125m",
+        enable_runkv=True,
+        runkv_num_device_buffers=4,
+        runkv_max_staging_blocks=128,
+        runkv_gpu_memory_fraction=0.2,
+        runkv_cpu_memory_gb=8.0,
+        runkv_cpu_memory_fraction=0.8,
+        runkv_enable_layer_recompute=True,
+        runkv_layer_recompute_io_prefix_blocks="6,12",
+        runkv_layer_recompute_measure_overhead=True,
+    )
+    engine_args = EngineArgs.from_cli_args(args)
+
+    assert engine_args.enable_runkv is True
+    assert engine_args.runkv_num_device_buffers == 4
+    assert engine_args.runkv_max_staging_blocks == 128
+    assert engine_args.runkv_gpu_memory_fraction == 0.2
+    assert engine_args.runkv_cpu_memory_gb == 8.0
+    assert engine_args.runkv_cpu_memory_fraction == 0.8
+    assert engine_args.runkv_enable_layer_recompute is True
+    assert engine_args.runkv_layer_recompute_io_prefix_blocks == "6,12"
+    assert engine_args.runkv_layer_recompute_measure_overhead is True
