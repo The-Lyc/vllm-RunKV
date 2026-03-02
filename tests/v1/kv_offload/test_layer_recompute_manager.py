@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -183,3 +184,81 @@ def test_normalize_io_prefix_blocks_rejects_negative_values() -> None:
 
     with pytest.raises(ValueError, match="must be >= 0"):
         runner._normalize_layer_recompute_io_prefix_blocks(3)
+
+
+def test_prepare_layer_recompute_step_metadata_caches_arrays_and_calls_manager():
+    class _DummyBlockTable:
+        def __init__(self, table: np.ndarray, block_size: int):
+            self._table = table
+            self.block_size = block_size
+            self.num_blocks_per_row = np.array(
+                [table.shape[1]] * table.shape[0], dtype=np.int32
+            )
+
+        def get_numpy_array(self) -> np.ndarray:
+            return self._table
+
+    logical_table = np.array([[10, 11, 12], [20, 21, 22]], dtype=np.int32)
+    bt = _DummyBlockTable(logical_table, block_size=16)
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.use_runkv = True
+    runner.layer_recompute_enabled = True
+    runner.layer_recompute_manager = Mock()
+    runner.input_batch = SimpleNamespace(
+        block_table=SimpleNamespace(block_tables=[bt]),
+        req_ids=["req-0", "req-1"],
+    )
+
+    # Keep positions contiguous within each request, matching _prepare_inputs()
+    # invariants (positions = num_computed_tokens + arange(num_sched)).
+    req_indices = np.array([0, 0, 1, 1], dtype=np.int32)
+    positions = np.array([16, 17, 32, 33], dtype=np.int32)
+    runner._prepare_layer_recompute_step_metadata(
+        req_indices=req_indices,
+        positions_np=positions,
+        num_reqs=2,
+    )
+
+    assert np.array_equal(runner._lr_req_indices_np, req_indices)
+    assert np.array_equal(runner._lr_positions_np, positions)
+    assert np.array_equal(runner._lr_logical_ids_np, np.array([11, 11, 22, 22]))
+    assert np.array_equal(runner._lr_block_offsets_np, np.array([0, 1, 0, 1]))
+    assert runner._lr_block_size == 16
+    assert runner._lr_num_reqs == 2
+
+    call_kwargs = runner.layer_recompute_manager.begin_step.call_args.kwargs
+    assert call_kwargs["req_ids"] == ["req-0", "req-1"]
+    assert np.array_equal(call_kwargs["logical_ids_np"], np.array([11, 11, 22, 22]))
+    assert np.array_equal(call_kwargs["block_offsets_np"], np.array([0, 1, 0, 1]))
+
+
+def test_prepare_layer_recompute_step_metadata_clears_cache_when_disabled():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.use_runkv = False
+    runner.layer_recompute_enabled = False
+    runner.layer_recompute_manager = Mock()
+    runner._lr_req_indices_np = np.array([1], dtype=np.int32)
+    runner._lr_positions_np = np.array([2], dtype=np.int32)
+    runner._lr_logical_ids_np = np.array([3], dtype=np.int32)
+    runner._lr_block_offsets_np = np.array([4], dtype=np.int32)
+    runner._lr_block_size = 16
+    runner._lr_num_reqs = 1
+    runner.input_batch = SimpleNamespace(
+        block_table=SimpleNamespace(block_tables=[]),
+        req_ids=[],
+    )
+
+    runner._prepare_layer_recompute_step_metadata(
+        req_indices=np.array([0], dtype=np.int32),
+        positions_np=np.array([0], dtype=np.int32),
+        num_reqs=0,
+    )
+
+    assert runner._lr_req_indices_np is None
+    assert runner._lr_positions_np is None
+    assert runner._lr_logical_ids_np is None
+    assert runner._lr_block_offsets_np is None
+    assert runner._lr_block_size == 0
+    assert runner._lr_num_reqs == 0
+    runner.layer_recompute_manager.begin_step.assert_not_called()

@@ -648,3 +648,30 @@ def load_layer_async(
 - 测试结果：
   - `pytest -q tests/v1/kv_offload/test_layer_recompute_manager.py`
   - `6 passed`
+
+### Step 4（已完成）：在 `_prepare_inputs()` 缓存 scheduled token 元数据并执行 owner/reset
+
+- 完成时间：2026-03-02
+- 已修改：
+  - `vllm/v1/worker/gpu_model_runner.py`
+    - 新增 step 缓存字段：
+      - `_lr_req_indices_np`
+      - `_lr_positions_np`
+      - `_lr_logical_ids_np`
+      - `_lr_block_offsets_np`
+      - `_lr_block_size`
+      - `_lr_num_reqs`
+    - 新增 `_prepare_layer_recompute_step_metadata(...)`：
+      - 在 recompute 启用时，向量化计算 `block_indices/block_offsets/logical_ids`
+      - 缓存上述 `_lr_*` 字段供 hooks 使用
+      - 调用 `layer_recompute_manager.begin_step(...)` 执行 owner/reset 元数据维护
+      - 当前强约束仅支持单 block table group（V1）
+      - 在 recompute 关闭时自动清空 `_lr_*` 缓存
+    - 在 `_prepare_inputs()` 中接入 `_prepare_layer_recompute_step_metadata(...)` 调用
+- 已新增测试：
+  - `tests/v1/kv_offload/test_layer_recompute_manager.py`
+    - `test_prepare_layer_recompute_step_metadata_caches_arrays_and_calls_manager`
+    - `test_prepare_layer_recompute_step_metadata_clears_cache_when_disabled`
+- 测试结果：
+  - `pytest -q tests/v1/kv_offload/test_layer_recompute_manager.py`
+  - `8 passed`

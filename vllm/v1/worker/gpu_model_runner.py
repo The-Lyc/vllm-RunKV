@@ -1031,6 +1031,13 @@ class GPUModelRunner(
         self._runkv_num_layers: int = 0
         self.layer_recompute_manager: LayerRecomputeManager | None = None
         self.layer_recompute_enabled: bool = False
+        # Current-step cached metadata for layer recompute hooks.
+        self._lr_req_indices_np: np.ndarray | None = None
+        self._lr_positions_np: np.ndarray | None = None
+        self._lr_logical_ids_np: np.ndarray | None = None
+        self._lr_block_offsets_np: np.ndarray | None = None
+        self._lr_block_size: int = 0
+        self._lr_num_reqs: int = 0
 
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
@@ -1995,6 +2002,12 @@ class GPUModelRunner(
             out=positions_np,
         )
 
+        self._prepare_layer_recompute_step_metadata(
+            req_indices=req_indices,
+            positions_np=positions_np,
+            num_reqs=num_reqs,
+        )
+
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -2189,6 +2202,59 @@ class GPUModelRunner(
         return (
             logits_indices,
             spec_decode_metadata,
+        )
+
+    def _prepare_layer_recompute_step_metadata(
+        self,
+        *,
+        req_indices: np.ndarray,
+        positions_np: np.ndarray,
+        num_reqs: int,
+    ) -> None:
+        """Prepare per-step logical-id metadata for layer recompute hooks."""
+        if (
+            not self.use_runkv
+            or not self.layer_recompute_enabled
+            or self.layer_recompute_manager is None
+        ):
+            self._lr_req_indices_np = None
+            self._lr_positions_np = None
+            self._lr_logical_ids_np = None
+            self._lr_block_offsets_np = None
+            self._lr_block_size = 0
+            self._lr_num_reqs = 0
+            return
+
+        block_tables = self.input_batch.block_table.block_tables
+        if len(block_tables) != 1:
+            raise ValueError(
+                "Layer recompute currently supports exactly one block table group; "
+                f"got {len(block_tables)}."
+            )
+
+        block_table = block_tables[0]
+        block_size = int(block_table.block_size)
+        logical_table_np = block_table.get_numpy_array()
+
+        block_indices = positions_np // block_size
+        block_offsets = positions_np % block_size
+        logical_ids = logical_table_np[req_indices, block_indices]
+
+        self._lr_req_indices_np = req_indices
+        self._lr_positions_np = positions_np
+        self._lr_logical_ids_np = logical_ids
+        self._lr_block_offsets_np = block_offsets
+        self._lr_block_size = block_size
+        self._lr_num_reqs = num_reqs
+
+        self.layer_recompute_manager.begin_step(
+            req_ids=self.input_batch.req_ids[:num_reqs],
+            req_indices_np=req_indices,
+            positions_np=positions_np,
+            logical_ids_np=logical_ids,
+            block_offsets_np=block_offsets,
+            logical_block_table_np=logical_table_np,
+            num_blocks_per_row=block_table.num_blocks_per_row,
         )
 
     def _prepare_paged_block_tables(
