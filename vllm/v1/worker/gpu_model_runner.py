@@ -159,6 +159,7 @@ from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunne
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
+from vllm.v1.worker.layer_recompute import LayerRecomputeManager
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
@@ -1028,6 +1029,8 @@ class GPUModelRunner(
         # Async pipeline state for RunKV
         self._runkv_layer_info: list[tuple[str, int, int]] = []
         self._runkv_num_layers: int = 0
+        self.layer_recompute_manager: LayerRecomputeManager | None = None
+        self.layer_recompute_enabled: bool = False
 
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
@@ -6620,6 +6623,98 @@ class GPUModelRunner(
                         stride=(hidden_size, 2 * hidden_size, *kv_cache.stride()[2:]),
                     )
 
+    def _normalize_layer_recompute_io_prefix_blocks(self, num_layers: int) -> list[int]:
+        """Validate and normalize layer-recompute IO prefix blocks."""
+        io_prefix_blocks = list(self.kv_offload_config.layer_recompute_io_prefix_blocks)
+        if not io_prefix_blocks:
+            raise ValueError(
+                "RunKV layer recompute is enabled but "
+                "layer_recompute_io_prefix_blocks is empty."
+            )
+
+        normalized = [int(v) for v in io_prefix_blocks]
+        if len(normalized) == 1:
+            normalized = normalized * num_layers
+        elif len(normalized) != num_layers:
+            raise ValueError(
+                "RunKV layer_recompute_io_prefix_blocks must be length 1 or "
+                f"match num_layers ({num_layers}); got {len(normalized)}."
+            )
+
+        if any(v < 0 for v in normalized):
+            raise ValueError(
+                "RunKV layer_recompute_io_prefix_blocks values must be >= 0."
+            )
+        return normalized
+
+    def _maybe_init_layer_recompute_manager(
+        self,
+        kv_cache_config: KVCacheConfig,
+        group_block_sizes: list[int],
+    ) -> None:
+        """Initialize the LayerRecomputeManager if layer recompute is enabled
+        and the configuration is valid. Otherwise, disable layer recompute
+        and clean up the manager if it exists.
+
+        TODO: The current implementation only supports a single KV cache group
+        and llama models, and the group block size must be specified. We will
+        relax these requirements in the future.
+        """
+        if not self.use_runkv or not self.kv_offload_config.enable_layer_recompute:
+            if self.layer_recompute_manager is not None:
+                self.layer_recompute_manager.remove_layernorm_hooks()
+            self.layer_recompute_manager = None
+            self.layer_recompute_enabled = False
+            return
+
+        if len(kv_cache_config.kv_cache_groups) != 1:
+            raise ValueError(
+                "RunKV layer recompute currently supports exactly one KV cache "
+                f"group; got {len(kv_cache_config.kv_cache_groups)}."
+            )
+
+        model_type = getattr(self.model_config.hf_config, "model_type", "")
+        if model_type != "llama":
+            raise ValueError(
+                "RunKV layer recompute currently supports only llama models; "
+                f"got model_type={model_type!r}."
+            )
+
+        if not group_block_sizes:
+            raise ValueError(
+                "RunKV layer recompute initialization requires a non-empty "
+                "group_block_sizes."
+            )
+
+        num_layers = len(self.model.model.layers)
+        normalized_io_prefix = self._normalize_layer_recompute_io_prefix_blocks(
+            num_layers
+        )
+        self.kv_offload_config.layer_recompute_io_prefix_blocks = normalized_io_prefix
+
+        if self.layer_recompute_manager is not None:
+            self.layer_recompute_manager.remove_layernorm_hooks()
+
+        hidden_size = getattr(self.model_config.hf_config, "hidden_size", None)
+        if hidden_size is None:
+            raise ValueError(
+                "Cannot initialize layer recompute manager: missing hidden_size in "
+                "model config."
+            )
+
+        self.layer_recompute_manager = LayerRecomputeManager(
+            device=self.device,
+            kv_offload_config=self.kv_offload_config,
+            kv_cache_config=kv_cache_config,
+            hidden_size=hidden_size,
+            block_size=group_block_sizes[0],
+            num_layers=num_layers,
+            model=self.model,
+            dtype=self.dtype,
+        )
+        self.layer_recompute_manager.register_layernorm_hooks(self)
+        self.layer_recompute_enabled = True
+
     def initialize_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
     ) -> dict[str, torch.Tensor]:
@@ -6758,6 +6853,7 @@ class GPUModelRunner(
                 for layer_name in kv_cache_group.layer_names:
                     layer_to_gid[layer_name] = gid
             self._register_runkv_hooks(layer_to_gid)
+            self._maybe_init_layer_recompute_manager(kv_cache_config, group_block_sizes)
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(

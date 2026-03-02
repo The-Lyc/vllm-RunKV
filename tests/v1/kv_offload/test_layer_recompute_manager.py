@@ -4,11 +4,13 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from torch import nn
 
 from vllm.v1.core.kv_cache_offload_config import RunKVOffloadConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.layer_recompute import LayerRecomputeManager
 
 
@@ -145,3 +147,39 @@ def test_compute_skip_block_ids_is_suffix_only_by_block_index() -> None:
     )
 
     assert skip == {12, 13}
+
+
+def test_normalize_io_prefix_blocks_broadcasts_single_value() -> None:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.kv_offload_config = RunKVOffloadConfig(
+        enabled=True,
+        enable_layer_recompute=True,
+        layer_recompute_io_prefix_blocks=[8],
+    )
+
+    normalized = runner._normalize_layer_recompute_io_prefix_blocks(4)
+    assert normalized == [8, 8, 8, 8]
+
+
+def test_normalize_io_prefix_blocks_rejects_length_mismatch() -> None:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.kv_offload_config = RunKVOffloadConfig(
+        enabled=True,
+        enable_layer_recompute=True,
+        layer_recompute_io_prefix_blocks=[4, 8],
+    )
+
+    with pytest.raises(ValueError, match="length 1 or match num_layers"):
+        runner._normalize_layer_recompute_io_prefix_blocks(3)
+
+
+def test_normalize_io_prefix_blocks_rejects_negative_values() -> None:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.kv_offload_config = RunKVOffloadConfig(
+        enabled=True,
+        enable_layer_recompute=True,
+        layer_recompute_io_prefix_blocks=[4, -1, 6],
+    )
+
+    with pytest.raises(ValueError, match="must be >= 0"):
+        runner._normalize_layer_recompute_io_prefix_blocks(3)
