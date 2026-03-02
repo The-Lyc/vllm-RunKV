@@ -1,0 +1,147 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from types import SimpleNamespace
+
+import numpy as np
+import torch
+from torch import nn
+
+from vllm.v1.core.kv_cache_offload_config import RunKVOffloadConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.worker.layer_recompute import LayerRecomputeManager
+
+
+class _DummyDecoderLayer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.input_layernorm = nn.Identity()
+        self.self_attn = nn.Identity()
+
+
+class _DummyLlamaModel(nn.Module):
+    def __init__(self, num_layers: int) -> None:
+        super().__init__()
+        self.model = SimpleNamespace(
+            layers=nn.ModuleList([_DummyDecoderLayer() for _ in range(num_layers)])
+        )
+
+
+def _make_manager(
+    *,
+    num_layers: int = 2,
+    num_blocks: int = 16,
+    block_size: int = 4,
+    hidden_size: int = 3,
+    io_prefix_blocks: list[int] | None = None,
+) -> LayerRecomputeManager:
+    io_prefix_blocks = io_prefix_blocks or [1] * num_layers
+    kv_offload_config = RunKVOffloadConfig(
+        enabled=True,
+        enable_layer_recompute=True,
+        layer_recompute_io_prefix_blocks=io_prefix_blocks,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[],
+    )
+    return LayerRecomputeManager(
+        device=torch.device("cpu"),
+        kv_offload_config=kv_offload_config,
+        kv_cache_config=kv_cache_config,
+        hidden_size=hidden_size,
+        block_size=block_size,
+        num_layers=num_layers,
+        model=_DummyLlamaModel(num_layers),
+        dtype=torch.float32,
+    )
+
+
+def test_begin_step_resets_owner_changed_blocks() -> None:
+    manager = _make_manager()
+
+    manager.logical_id_owner_req_id[3] = "req-old"
+    manager.cpu_block_positions[3, 0] = 123
+    manager.cpu_block_valid_lens[3] = 2
+    manager.cpu_block_positions[7, 0] = 77
+    manager.cpu_block_valid_lens[7] = 1
+
+    manager.begin_step(
+        req_ids=["req-new"],
+        req_indices_np=np.array([0], dtype=np.int32),
+        positions_np=np.array([0], dtype=np.int32),
+        logical_ids_np=np.array([3], dtype=np.int32),
+        block_offsets_np=np.array([0], dtype=np.int32),
+        logical_block_table_np=np.array([[3, 4, -1]], dtype=np.int32),
+        num_blocks_per_row=np.array([2], dtype=np.int32),
+    )
+
+    assert manager.logical_id_owner_req_id[3] == "req-new"
+    assert manager.logical_id_owner_req_id[4] == "req-new"
+    assert torch.all(manager.cpu_block_positions[3] == -1)
+    assert manager.cpu_block_valid_lens[3].item() == 0
+    assert torch.all(manager.cpu_block_positions[4] == -1)
+    assert manager.cpu_block_valid_lens[4].item() == 0
+
+    # Unrelated block should remain unchanged.
+    assert manager.cpu_block_positions[7, 0].item() == 77
+    assert manager.cpu_block_valid_lens[7].item() == 1
+
+
+def test_layernorm_hook_and_sync_store_suffix_tokens() -> None:
+    manager = _make_manager(io_prefix_blocks=[1, 1], block_size=4, hidden_size=3)
+    dummy_runner = SimpleNamespace()
+    manager.register_layernorm_hooks(dummy_runner)
+
+    manager.begin_step(
+        req_ids=["req-1"],
+        req_indices_np=np.array([0, 0, 0], dtype=np.int32),
+        positions_np=np.array([0, 4, 5], dtype=np.int32),
+        logical_ids_np=np.array([2, 2, 2], dtype=np.int32),
+        block_offsets_np=np.array([0, 0, 1], dtype=np.int32),
+        logical_block_table_np=np.array([[2, -1]], dtype=np.int32),
+        num_blocks_per_row=np.array([1], dtype=np.int32),
+    )
+
+    hs = torch.tensor(
+        [[1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [3.0, 3.0, 3.0]], dtype=torch.float32
+    )
+    _ = manager.model.model.layers[0].input_layernorm(hs)
+
+    manager.sync_hs_d2h()
+
+    stored = manager.cpu_attn_inputs_by_layer[0]
+    assert torch.allclose(stored[2, 0], torch.tensor([2.0, 2.0, 2.0]))
+    assert torch.allclose(stored[2, 1], torch.tensor([3.0, 3.0, 3.0]))
+    assert manager.cpu_block_positions[2, 0].item() == 4
+    assert manager.cpu_block_positions[2, 1].item() == 5
+    assert manager.cpu_block_valid_lens[2].item() == 2
+
+    manager.remove_layernorm_hooks()
+
+
+def test_compute_skip_block_ids_is_suffix_only_by_block_index() -> None:
+    manager = _make_manager(num_blocks=32, block_size=16)
+
+    # Request has 4 blocks in this step: block_idx 0,1 are IO prefix; 2,3 are suffix.
+    manager.begin_step(
+        req_ids=["req-1"],
+        req_indices_np=np.array([0], dtype=np.int32),
+        positions_np=np.array([63], dtype=np.int32),
+        logical_ids_np=np.array([13], dtype=np.int32),
+        block_offsets_np=np.array([15], dtype=np.int32),
+        logical_block_table_np=np.array([[10, 11, 12, 13]], dtype=np.int32),
+        num_blocks_per_row=np.array([4], dtype=np.int32),
+    )
+
+    mapper = SimpleNamespace(mapping={10: 0, 11: 1, 12: 2, 13: 3}, block_size=16)
+    skip = manager.compute_skip_block_ids_for_layer(
+        layer_idx=0,
+        gid=0,
+        mapper=mapper,
+        dirty_blocks={13},  # dirty should not affect skip decision.
+        io_prefix_blocks=[2],
+    )
+
+    assert skip == {12, 13}

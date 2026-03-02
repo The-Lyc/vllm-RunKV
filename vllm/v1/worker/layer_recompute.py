@@ -1,0 +1,393 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from __future__ import annotations
+
+import functools
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+import torch
+
+import vllm._custom_ops as custom_ops
+from vllm.attention.layer import Attention
+from vllm.forward_context import get_forward_context
+from vllm.v1.core.kv_cache_offload_config import RunKVOffloadConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu_model_runner import PagedBlockMapper
+
+
+@dataclass
+class _PendingLayerWrite:
+    hs_cpu: torch.Tensor
+    logical_ids: np.ndarray
+    offsets: np.ndarray
+    positions: np.ndarray
+
+
+class LayerRecomputeManager:
+    """Owns hidden-state snapshots and recompute helpers for RunKV hybrid IO."""
+
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        kv_offload_config: RunKVOffloadConfig,
+        kv_cache_config: KVCacheConfig,
+        hidden_size: int,
+        block_size: int,
+        num_layers: int,
+        model: torch.nn.Module,
+        dtype: torch.dtype,
+    ) -> None:
+        self.device = device
+        self.model = model
+        self.hidden_size = int(hidden_size)
+        self.block_size = int(block_size)
+        self.num_layers = int(num_layers)
+        self.num_cpu_blocks = int(kv_cache_config.num_blocks)
+
+        self.enable_layer_recompute = bool(kv_offload_config.enable_layer_recompute)
+        self.layer_recompute_io_prefix_blocks = list(
+            kv_offload_config.layer_recompute_io_prefix_blocks
+        )
+        self.layer_recompute_measure_overhead = bool(
+            kv_offload_config.layer_recompute_measure_overhead
+        )
+        self.pin_memory = self.device.type == "cuda"
+
+        self.cpu_attn_inputs_by_layer: list[torch.Tensor] = [
+            torch.empty(
+                self.num_cpu_blocks,
+                self.block_size,
+                self.hidden_size,
+                dtype=dtype,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
+            for _ in range(self.num_layers)
+        ]
+        self.cpu_block_positions = torch.full(
+            (self.num_cpu_blocks, self.block_size),
+            -1,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=self.pin_memory,
+        )
+        self.cpu_block_valid_lens = torch.zeros(
+            self.num_cpu_blocks,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=self.pin_memory,
+        )
+
+        self.logical_id_owner_req_id: dict[int, str] = {}
+
+        self._step_req_indices_np: np.ndarray | None = None
+        self._step_positions_np: np.ndarray | None = None
+        self._step_logical_ids_np: np.ndarray | None = None
+        self._step_block_offsets_np: np.ndarray | None = None
+        # logical block id -> block index within its owner request for current step.
+        self._step_logical_block_indices: dict[int, int] = {}
+
+        self._layernorm_hook_handles: list[Any] = []
+        self._pending_writes_by_layer: dict[int, list[_PendingLayerWrite]] = (
+            defaultdict(list)
+        )
+        self._hs_d2h_events_by_layer: dict[int, list[torch.cuda.Event]] = defaultdict(
+            list
+        )
+        self._hs_d2h_stream: torch.cuda.Stream | None = None
+        if self.device.type == "cuda":
+            self._hs_d2h_stream = torch.cuda.Stream(device=self.device)
+
+    def register_layernorm_hooks(self, gpu_model_runner: Any) -> None:
+        """Attach hooks to each Llama decoder layer input_layernorm."""
+        self.remove_layernorm_hooks()
+        decoder_layers = self.model.model.layers
+        for layer_idx, decoder_layer in enumerate(decoder_layers):
+            hook = functools.partial(
+                self._layernorm_hook,
+                layer_idx=layer_idx,
+                gpu_model_runner=gpu_model_runner,
+            )
+            handle = decoder_layer.input_layernorm.register_forward_hook(hook)
+            self._layernorm_hook_handles.append(handle)
+
+    def remove_layernorm_hooks(self) -> None:
+        for handle in self._layernorm_hook_handles:
+            handle.remove()
+        self._layernorm_hook_handles.clear()
+
+    def begin_step(
+        self,
+        *,
+        req_ids: list[str],
+        req_indices_np: np.ndarray,
+        positions_np: np.ndarray,
+        logical_ids_np: np.ndarray,
+        block_offsets_np: np.ndarray,
+        logical_block_table_np: np.ndarray,
+        num_blocks_per_row: np.ndarray,
+    ) -> None:
+        """Cache current-step token metadata and reset ownership-changed blocks."""
+        self._step_req_indices_np = req_indices_np
+        self._step_positions_np = positions_np
+        self._step_logical_ids_np = logical_ids_np
+        self._step_block_offsets_np = block_offsets_np
+        self._step_logical_block_indices.clear()
+
+        num_reqs = min(len(req_ids), logical_block_table_np.shape[0])
+        for row in range(num_reqs):
+            req_id = req_ids[row]
+            row_blocks = int(num_blocks_per_row[row])
+            for col in range(row_blocks):
+                logical_id = int(logical_block_table_np[row, col])
+                if logical_id < 0 or logical_id >= self.num_cpu_blocks:
+                    continue
+                self._step_logical_block_indices[logical_id] = col
+                prev_owner = self.logical_id_owner_req_id.get(logical_id)
+                if prev_owner != req_id:
+                    self.logical_id_owner_req_id[logical_id] = req_id
+                    self.cpu_block_positions[logical_id, :].fill_(-1)
+                    self.cpu_block_valid_lens[logical_id] = 0
+
+    def compute_skip_block_ids_for_layer(
+        self,
+        *,
+        layer_idx: int,
+        gid: int,
+        mapper: PagedBlockMapper,
+        dirty_blocks: set[int],
+        io_prefix_blocks: list[int],
+    ) -> set[int]:
+        del gid, dirty_blocks
+        prefix_blocks = 0
+        if layer_idx < len(io_prefix_blocks):
+            prefix_blocks = int(io_prefix_blocks[layer_idx])
+
+        skip_block_ids: set[int] = set()
+        for logical_id in mapper.mapping:
+            block_idx = self._step_logical_block_indices.get(logical_id)
+            if block_idx is None:
+                continue
+            if block_idx >= prefix_blocks:
+                skip_block_ids.add(logical_id)
+
+        return skip_block_ids
+
+    def recompute_kv_for_layer(
+        self,
+        *,
+        layer_idx: int,
+        layer_name: str,
+        gid: int,
+        mapper: PagedBlockMapper,
+        attn_module: Attention,
+        skip_block_ids: set[int],
+    ) -> None:
+        """Recompute K/V for skipped blocks and write them into staging cache."""
+        del layer_name, gid
+        if not skip_block_ids:
+            return
+        if self.device.type != "cuda":
+            return
+
+        llama_attn = self.model.model.layers[layer_idx].self_attn
+
+        hs_chunks: list[torch.Tensor] = []
+        pos_chunks: list[torch.Tensor] = []
+        slot_chunks: list[torch.Tensor] = []
+
+        for logical_id in sorted(skip_block_ids):
+            if logical_id < 0 or logical_id >= self.num_cpu_blocks:
+                continue
+            slot = mapper.mapping.get(logical_id)
+            if slot is None:
+                continue
+
+            valid_len = int(self.cpu_block_valid_lens[logical_id].item())
+            if valid_len <= 0:
+                continue
+            valid_len = min(valid_len, mapper.block_size)
+
+            positions = self.cpu_block_positions[logical_id, :valid_len]
+            if torch.any(positions < 0):
+                continue
+
+            hs_chunks.append(
+                self.cpu_attn_inputs_by_layer[layer_idx][logical_id, :valid_len, :]
+            )
+            pos_chunks.append(positions.to(torch.int64))
+            slot_chunks.append(
+                torch.arange(valid_len, dtype=torch.int64) + slot * mapper.block_size
+            )
+
+        if not hs_chunks:
+            return
+
+        hs_cat_cpu = torch.cat(hs_chunks, dim=0)
+        pos_cat_cpu = torch.cat(pos_chunks, dim=0)
+        slot_cat_cpu = torch.cat(slot_chunks, dim=0)
+
+        if self.pin_memory and not hs_cat_cpu.is_pinned():
+            hs_cat_cpu = hs_cat_cpu.pin_memory()
+        if self.pin_memory and not pos_cat_cpu.is_pinned():
+            pos_cat_cpu = pos_cat_cpu.pin_memory()
+        if self.pin_memory and not slot_cat_cpu.is_pinned():
+            slot_cat_cpu = slot_cat_cpu.pin_memory()
+
+        hs_gpu = hs_cat_cpu.to(self.device, non_blocking=True)
+        pos_gpu = pos_cat_cpu.to(self.device, non_blocking=True)
+        slot_gpu = slot_cat_cpu.to(self.device, non_blocking=True)
+
+        qkv, _ = llama_attn.qkv_proj(hs_gpu)
+        q, k, v = qkv.split(
+            [llama_attn.q_size, llama_attn.kv_size, llama_attn.kv_size], dim=-1
+        )
+        q, k = llama_attn.rotary_emb(pos_gpu, q, k)
+        del q
+
+        k = k.view(-1, llama_attn.num_kv_heads, llama_attn.head_dim)
+        v = v.view(-1, llama_attn.num_kv_heads, llama_attn.head_dim)
+
+        forward_context = get_forward_context()
+        kv_cache = attn_module.kv_cache[forward_context.virtual_engine]
+        key_cache, value_cache = kv_cache.unbind(0)
+
+        custom_ops.reshape_and_cache_flash(
+            k,
+            v,
+            key_cache,
+            value_cache,
+            slot_gpu,
+            attn_module.kv_cache_dtype,
+            attn_module._k_scale,
+            attn_module._v_scale,
+        )
+
+    def sync_hs_d2h(self) -> None:
+        """Synchronize pending D2H copies and materialize hidden-state snapshots."""
+        for events in self._hs_d2h_events_by_layer.values():
+            for event in events:
+                event.synchronize()
+
+        for layer_idx, pending_writes in self._pending_writes_by_layer.items():
+            for pending in pending_writes:
+                logical_ids_t = torch.from_numpy(
+                    pending.logical_ids.astype(np.int64, copy=False)
+                )
+                offsets_t = torch.from_numpy(
+                    pending.offsets.astype(np.int64, copy=False)
+                )
+                positions_t = torch.from_numpy(
+                    pending.positions.astype(np.int32, copy=False)
+                )
+
+                self.cpu_attn_inputs_by_layer[layer_idx][
+                    logical_ids_t, offsets_t, :
+                ] = pending.hs_cpu
+                self.cpu_block_positions[logical_ids_t, offsets_t] = positions_t
+
+                unique_ids, inverse = np.unique(
+                    pending.logical_ids, return_inverse=True
+                )
+                max_valid_lens = np.zeros(unique_ids.shape[0], dtype=np.int32)
+                np.maximum.at(
+                    max_valid_lens,
+                    inverse,
+                    pending.offsets.astype(np.int32, copy=False) + 1,
+                )
+                unique_ids_t = torch.from_numpy(unique_ids.astype(np.int64, copy=False))
+                max_valid_lens_t = torch.from_numpy(max_valid_lens)
+                self.cpu_block_valid_lens[unique_ids_t] = torch.maximum(
+                    self.cpu_block_valid_lens[unique_ids_t],
+                    max_valid_lens_t,
+                )
+
+        self._hs_d2h_events_by_layer.clear()
+        self._pending_writes_by_layer.clear()
+
+    def _layernorm_hook(
+        self,
+        module: torch.nn.Module,
+        inputs: tuple[Any, ...],
+        output: Any,
+        *,
+        layer_idx: int,
+        gpu_model_runner: Any,
+    ) -> None:
+        del module, inputs
+
+        positions_np, logical_ids_np, block_offsets_np = self._get_step_arrays(
+            gpu_model_runner
+        )
+        if positions_np is None or logical_ids_np is None or block_offsets_np is None:
+            return
+
+        hidden_states_normed = output if isinstance(output, torch.Tensor) else output[0]
+        if hidden_states_normed is None:
+            return
+
+        prefix_tokens = self._get_io_prefix_blocks(layer_idx) * self.block_size
+        mask = positions_np >= prefix_tokens
+        if not np.any(mask):
+            return
+
+        selected_indices = np.nonzero(mask)[0].astype(np.int64, copy=False)
+        logical_ids = logical_ids_np[selected_indices].astype(np.int64, copy=True)
+        offsets = block_offsets_np[selected_indices].astype(np.int64, copy=True)
+        positions = positions_np[selected_indices].astype(np.int32, copy=True)
+
+        token_indices = torch.from_numpy(selected_indices).to(
+            hidden_states_normed.device, dtype=torch.long
+        )
+        hs_gpu = hidden_states_normed.index_select(0, token_indices).contiguous()
+
+        hs_cpu: torch.Tensor
+        if self._hs_d2h_stream is not None and hs_gpu.is_cuda:
+            with torch.cuda.stream(self._hs_d2h_stream):
+                hs_cpu = hs_gpu.to("cpu", non_blocking=True)
+                event = torch.cuda.Event()
+                event.record(self._hs_d2h_stream)
+            self._hs_d2h_events_by_layer[layer_idx].append(event)
+        else:
+            hs_cpu = hs_gpu.to("cpu")
+
+        self._pending_writes_by_layer[layer_idx].append(
+            _PendingLayerWrite(
+                hs_cpu=hs_cpu,
+                logical_ids=logical_ids,
+                offsets=offsets,
+                positions=positions,
+            )
+        )
+
+    def _get_step_arrays(
+        self, gpu_model_runner: Any
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+        if (
+            self._step_positions_np is not None
+            and self._step_logical_ids_np is not None
+            and self._step_block_offsets_np is not None
+        ):
+            return (
+                self._step_positions_np,
+                self._step_logical_ids_np,
+                self._step_block_offsets_np,
+            )
+
+        return (
+            getattr(gpu_model_runner, "_lr_positions_np", None),
+            getattr(gpu_model_runner, "_lr_logical_ids_np", None),
+            getattr(gpu_model_runner, "_lr_block_offsets_np", None),
+        )
+
+    def _get_io_prefix_blocks(self, layer_idx: int) -> int:
+        if layer_idx >= len(self.layer_recompute_io_prefix_blocks):
+            return 0
+        return int(self.layer_recompute_io_prefix_blocks[layer_idx])
