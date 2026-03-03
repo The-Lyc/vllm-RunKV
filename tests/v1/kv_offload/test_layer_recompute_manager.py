@@ -375,3 +375,42 @@ def test_runkv_pre_hook_without_layer_recompute_keeps_original_behavior():
     runner.layer_recompute_manager.compute_skip_block_ids_for_layer.assert_not_called()
     runner.layer_recompute_manager.prefetch_recompute_inputs_for_layer.assert_not_called()
     runner.layer_recompute_manager.recompute_kv_for_layer.assert_not_called()
+
+
+def test_sync_runkv_step_end_state_syncs_offload_and_hs_when_enabled() -> None:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.use_runkv = True
+    runner.layer_recompute_enabled = True
+    runner._sync_all_runkv_offloads = Mock()
+    runner.layer_recompute_manager = Mock()
+
+    runner._sync_runkv_step_end_state()
+
+    runner._sync_all_runkv_offloads.assert_called_once_with()
+    runner.layer_recompute_manager.sync_hs_d2h.assert_called_once_with()
+
+
+def test_sync_runkv_step_end_state_skips_hs_sync_when_recompute_disabled() -> None:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.use_runkv = True
+    runner.layer_recompute_enabled = False
+    runner._sync_all_runkv_offloads = Mock()
+    runner.layer_recompute_manager = Mock()
+
+    runner._sync_runkv_step_end_state()
+
+    runner._sync_all_runkv_offloads.assert_called_once_with()
+    runner.layer_recompute_manager.sync_hs_d2h.assert_not_called()
+
+
+def test_sync_runkv_step_end_state_is_noop_when_runkv_disabled() -> None:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.use_runkv = False
+    runner.layer_recompute_enabled = True
+    runner._sync_all_runkv_offloads = Mock()
+    runner.layer_recompute_manager = Mock()
+
+    runner._sync_runkv_step_end_state()
+
+    runner._sync_all_runkv_offloads.assert_not_called()
+    runner.layer_recompute_manager.sync_hs_d2h.assert_not_called()

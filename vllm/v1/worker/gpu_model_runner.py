@@ -2563,6 +2563,18 @@ class GPUModelRunner(
         for mapper in self.paged_block_mappers:
             mapper.sync_all_offloads()
 
+    def _sync_runkv_step_end_state(self) -> None:
+        """Synchronize RunKV offloads and layer-recompute D2H snapshots."""
+        if not self.use_runkv:
+            return
+
+        # Ensure staged KV writes are fully visible on CPU.
+        self._sync_all_runkv_offloads()
+
+        # Ensure layer-recompute CPU hidden-state store is ready for next step.
+        if self.layer_recompute_enabled and self.layer_recompute_manager is not None:
+            self.layer_recompute_manager.sync_hs_d2h()
+
     def _build_attention_metadata(
         self,
         num_tokens: int,
@@ -4281,11 +4293,7 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
-            # Sync all pending async offloads after model forward completes.
-            # This ensures all dirty KV blocks are written back to CPU
-            # before the next step.
-            if self.use_runkv:
-                self._sync_all_runkv_offloads()
+            self._sync_runkv_step_end_state()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -5467,9 +5475,7 @@ class GPUModelRunner(
                     **model_kwargs,
                 )
 
-            # Sync all pending async offloads after model forward completes.
-            if self.use_runkv:
-                self._sync_all_runkv_offloads()
+            self._sync_runkv_step_end_state()
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
