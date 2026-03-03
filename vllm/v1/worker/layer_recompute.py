@@ -29,6 +29,14 @@ class _PendingLayerWrite:
     positions: np.ndarray
 
 
+@dataclass
+class _PrefetchedLayerInputs:
+    hs_gpu: torch.Tensor
+    pos_gpu: torch.Tensor
+    slot_gpu: torch.Tensor
+    ready_event: torch.cuda.Event | None
+
+
 class LayerRecomputeManager:
     """Owns hidden-state snapshots and recompute helpers for RunKV hybrid IO."""
 
@@ -101,9 +109,12 @@ class LayerRecomputeManager:
         self._hs_d2h_events_by_layer: dict[int, list[torch.cuda.Event]] = defaultdict(
             list
         )
+        self._prefetched_inputs_by_layer: dict[int, _PrefetchedLayerInputs] = {}
         self._hs_d2h_stream: torch.cuda.Stream | None = None
+        self._hs_h2d_stream: torch.cuda.Stream | None = None
         if self.device.type == "cuda":
             self._hs_d2h_stream = torch.cuda.Stream(device=self.device)
+            self._hs_h2d_stream = torch.cuda.Stream(device=self.device)
 
     def register_layernorm_hooks(self, gpu_model_runner: Any) -> None:
         """Attach hooks to each Llama decoder layer input_layernorm."""
@@ -135,6 +146,7 @@ class LayerRecomputeManager:
         num_blocks_per_row: np.ndarray,
     ) -> None:
         """Cache current-step token metadata and reset ownership-changed blocks."""
+        self._prefetched_inputs_by_layer.clear()
         self._step_req_indices_np = req_indices_np
         self._step_positions_np = positions_np
         self._step_logical_ids_np = logical_ids_np
@@ -180,6 +192,29 @@ class LayerRecomputeManager:
 
         return skip_block_ids
 
+    def prefetch_recompute_inputs_for_layer(
+        self,
+        *,
+        layer_idx: int,
+        layer_name: str,
+        gid: int,
+        mapper: PagedBlockMapper,
+        skip_block_ids: set[int],
+    ) -> None:
+        """Stage suffix hidden states/positions/slots to GPU for recompute."""
+        del layer_name, gid
+        if self.device.type != "cuda" or not skip_block_ids:
+            return
+        if layer_idx in self._prefetched_inputs_by_layer:
+            return
+        prefetched = self._build_prefetched_inputs(
+            layer_idx=layer_idx,
+            mapper=mapper,
+            skip_block_ids=skip_block_ids,
+        )
+        if prefetched is not None:
+            self._prefetched_inputs_by_layer[layer_idx] = prefetched
+
     def recompute_kv_for_layer(
         self,
         *,
@@ -197,8 +232,58 @@ class LayerRecomputeManager:
         if self.device.type != "cuda":
             return
 
+        prefetched = self._prefetched_inputs_by_layer.pop(layer_idx, None)
+        if prefetched is None:
+            prefetched = self._build_prefetched_inputs(
+                layer_idx=layer_idx,
+                mapper=mapper,
+                skip_block_ids=skip_block_ids,
+            )
+            if prefetched is None:
+                return
+        if prefetched.ready_event is not None:
+            torch.cuda.current_stream(device=self.device).wait_event(
+                prefetched.ready_event
+            )
+
+        hs_gpu = prefetched.hs_gpu
+        pos_gpu = prefetched.pos_gpu
+        slot_gpu = prefetched.slot_gpu
+
         llama_attn = self.model.model.layers[layer_idx].self_attn
 
+        qkv, _ = llama_attn.qkv_proj(hs_gpu)
+        q, k, v = qkv.split(
+            [llama_attn.q_size, llama_attn.kv_size, llama_attn.kv_size], dim=-1
+        )
+        q, k = llama_attn.rotary_emb(pos_gpu, q, k)
+        del q
+
+        k = k.view(-1, llama_attn.num_kv_heads, llama_attn.head_dim)
+        v = v.view(-1, llama_attn.num_kv_heads, llama_attn.head_dim)
+
+        forward_context = get_forward_context()
+        kv_cache = attn_module.kv_cache[forward_context.virtual_engine]
+        key_cache, value_cache = kv_cache.unbind(0)
+
+        custom_ops.reshape_and_cache_flash(
+            k,
+            v,
+            key_cache,
+            value_cache,
+            slot_gpu,
+            attn_module.kv_cache_dtype,
+            attn_module._k_scale,
+            attn_module._v_scale,
+        )
+
+    def _build_prefetched_inputs(
+        self,
+        *,
+        layer_idx: int,
+        mapper: PagedBlockMapper,
+        skip_block_ids: set[int],
+    ) -> _PrefetchedLayerInputs | None:
         hs_chunks: list[torch.Tensor] = []
         pos_chunks: list[torch.Tensor] = []
         slot_chunks: list[torch.Tensor] = []
@@ -228,7 +313,7 @@ class LayerRecomputeManager:
             )
 
         if not hs_chunks:
-            return
+            return None
 
         hs_cat_cpu = torch.cat(hs_chunks, dim=0)
         pos_cat_cpu = torch.cat(pos_chunks, dim=0)
@@ -241,33 +326,24 @@ class LayerRecomputeManager:
         if self.pin_memory and not slot_cat_cpu.is_pinned():
             slot_cat_cpu = slot_cat_cpu.pin_memory()
 
-        hs_gpu = hs_cat_cpu.to(self.device, non_blocking=True)
-        pos_gpu = pos_cat_cpu.to(self.device, non_blocking=True)
-        slot_gpu = slot_cat_cpu.to(self.device, non_blocking=True)
+        if self._hs_h2d_stream is not None:
+            with torch.cuda.stream(self._hs_h2d_stream):
+                hs_gpu = hs_cat_cpu.to(self.device, non_blocking=True)
+                pos_gpu = pos_cat_cpu.to(self.device, non_blocking=True)
+                slot_gpu = slot_cat_cpu.to(self.device, non_blocking=True)
+                ready_event = torch.cuda.Event()
+                ready_event.record(self._hs_h2d_stream)
+        else:
+            hs_gpu = hs_cat_cpu.to(self.device)
+            pos_gpu = pos_cat_cpu.to(self.device)
+            slot_gpu = slot_cat_cpu.to(self.device)
+            ready_event = None
 
-        qkv, _ = llama_attn.qkv_proj(hs_gpu)
-        q, k, v = qkv.split(
-            [llama_attn.q_size, llama_attn.kv_size, llama_attn.kv_size], dim=-1
-        )
-        q, k = llama_attn.rotary_emb(pos_gpu, q, k)
-        del q
-
-        k = k.view(-1, llama_attn.num_kv_heads, llama_attn.head_dim)
-        v = v.view(-1, llama_attn.num_kv_heads, llama_attn.head_dim)
-
-        forward_context = get_forward_context()
-        kv_cache = attn_module.kv_cache[forward_context.virtual_engine]
-        key_cache, value_cache = kv_cache.unbind(0)
-
-        custom_ops.reshape_and_cache_flash(
-            k,
-            v,
-            key_cache,
-            value_cache,
-            slot_gpu,
-            attn_module.kv_cache_dtype,
-            attn_module._k_scale,
-            attn_module._v_scale,
+        return _PrefetchedLayerInputs(
+            hs_gpu=hs_gpu,
+            pos_gpu=pos_gpu,
+            slot_gpu=slot_gpu,
+            ready_event=ready_event,
         )
 
     def sync_hs_d2h(self) -> None:

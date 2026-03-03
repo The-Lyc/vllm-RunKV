@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import numpy as np
 import pytest
@@ -262,3 +262,116 @@ def test_prepare_layer_recompute_step_metadata_clears_cache_when_disabled():
     assert runner._lr_block_size == 0
     assert runner._lr_num_reqs == 0
     runner.layer_recompute_manager.begin_step.assert_not_called()
+
+
+def test_runkv_pre_hook_layer_recompute_pipeline_order_and_skip_forwarding():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.layer_recompute_enabled = True
+    runner.kv_offload_config = RunKVOffloadConfig(
+        enabled=True,
+        enable_layer_recompute=True,
+        layer_recompute_io_prefix_blocks=[2, 2],
+    )
+    runner.paged_dirty_blocks = [{101}, {202}]
+
+    mapper0 = Mock()
+    mapper1 = Mock()
+    runner.paged_block_mappers = [mapper0, mapper1]
+    runner._get_next_layer_info = Mock(return_value=("layer.1", 1, 1))
+
+    events: list[str] = []
+    mapper0.load_layer_async.side_effect = lambda *args, **kwargs: events.append(
+        "load_current"
+    )
+    mapper0.sync_load_layer.side_effect = lambda *args, **kwargs: events.append(
+        "sync_current"
+    )
+    mapper1.load_layer_async.side_effect = lambda *args, **kwargs: events.append(
+        "prefetch_next"
+    )
+
+    manager = Mock()
+    skip_current = {10, 11}
+    skip_next = {20}
+    manager.compute_skip_block_ids_for_layer.side_effect = [skip_current, skip_next]
+    manager.prefetch_recompute_inputs_for_layer.side_effect = (
+        lambda *args, **kwargs: events.append(
+            "prefetch_hs_current" if kwargs["layer_idx"] == 0 else "prefetch_hs_next"
+        )
+    )
+    manager.recompute_kv_for_layer.side_effect = lambda *args, **kwargs: events.append(
+        "recompute_current"
+    )
+    runner.layer_recompute_manager = manager
+
+    runner._runkv_pre_hook(
+        module=nn.Identity(),
+        inputs=(),
+        layer_name="layer.0",
+        layer_idx=0,
+        gid=0,
+    )
+
+    assert events == [
+        "load_current",
+        "prefetch_hs_current",
+        "sync_current",
+        "prefetch_next",
+        "prefetch_hs_next",
+        "recompute_current",
+    ]
+    mapper0.load_layer_async.assert_called_once_with(
+        "layer.0", 0, skip_block_ids=skip_current
+    )
+    mapper1.load_layer_async.assert_called_once_with(
+        "layer.1", 1, skip_block_ids=skip_next
+    )
+    mapper0.sync_load_layer.assert_called_once_with(0)
+    assert manager.compute_skip_block_ids_for_layer.call_count == 2
+    manager.prefetch_recompute_inputs_for_layer.assert_has_calls(
+        [
+            call(
+                layer_idx=0,
+                layer_name="layer.0",
+                gid=0,
+                mapper=mapper0,
+                skip_block_ids=skip_current,
+            ),
+            call(
+                layer_idx=1,
+                layer_name="layer.1",
+                gid=1,
+                mapper=mapper1,
+                skip_block_ids=skip_next,
+            ),
+        ]
+    )
+    manager.recompute_kv_for_layer.assert_called_once()
+
+
+def test_runkv_pre_hook_without_layer_recompute_keeps_original_behavior():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.layer_recompute_enabled = False
+    runner.layer_recompute_manager = Mock()
+    runner.kv_offload_config = RunKVOffloadConfig(enabled=True)
+    runner.paged_dirty_blocks = [set(), set()]
+
+    mapper0 = Mock()
+    mapper1 = Mock()
+    runner.paged_block_mappers = [mapper0, mapper1]
+    runner._get_next_layer_info = Mock(return_value=("layer.1", 1, 1))
+
+    runner._runkv_pre_hook(
+        module=nn.Identity(),
+        inputs=(),
+        layer_name="layer.0",
+        layer_idx=0,
+        gid=0,
+    )
+
+    mapper0.load_layer_async.assert_called_once_with("layer.0", 0, skip_block_ids=None)
+    mapper0.sync_load_layer.assert_called_once_with(0)
+    mapper1.load_layer_async.assert_called_once_with("layer.1", 1, skip_block_ids=None)
+    runner.layer_recompute_manager.compute_skip_block_ids_for_layer.assert_not_called()
+    runner.layer_recompute_manager.prefetch_recompute_inputs_for_layer.assert_not_called()
+    runner.layer_recompute_manager.recompute_kv_for_layer.assert_not_called()

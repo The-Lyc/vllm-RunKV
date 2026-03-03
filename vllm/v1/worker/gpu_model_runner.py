@@ -2458,34 +2458,80 @@ class GPUModelRunner(
         layer_idx: int,
         gid: int,
     ) -> None:
-        """Pre-hook for async KV loading pipeline.
-
-        Timeline for layer N:
-        ----------------------
-        1. If N == 0: start async load of layer 0
-        2. Sync wait for layer N's load event (GPU-side wait, non-blocking to CPU)
-        3. Start async prefetch of layer N+1 (if exists)
-        4. Return -> attention compute starts on default stream
-
-        Since prefetch is dispatched to load_stream and compute runs on
-        default stream, they execute in parallel on GPU.
-        """
+        """Pre-hook for RunKV IO + layer-recompute pipeline."""
+        del inputs
         mapper = self.paged_block_mappers[gid]
+        manager = (
+            self.layer_recompute_manager
+            if self.layer_recompute_enabled and self.layer_recompute_manager is not None
+            else None
+        )
+        skip_block_ids: set[int] | None = None
+        if manager is not None:
+            skip_block_ids = manager.compute_skip_block_ids_for_layer(
+                layer_idx=layer_idx,
+                gid=gid,
+                mapper=mapper,
+                dirty_blocks=self.paged_dirty_blocks[gid],
+                io_prefix_blocks=self.kv_offload_config.layer_recompute_io_prefix_blocks,
+            )
 
         if layer_idx == 0:
             # First layer: start async load
-            mapper.load_layer_async(layer_name, layer_idx)
+            mapper.load_layer_async(
+                layer_name, layer_idx, skip_block_ids=skip_block_ids
+            )
+
+        # Prefetch recompute inputs (HS/pos/slots) for current layer.
+        if manager is not None and skip_block_ids:
+            manager.prefetch_recompute_inputs_for_layer(
+                layer_idx=layer_idx,
+                layer_name=layer_name,
+                gid=gid,
+                mapper=mapper,
+                skip_block_ids=skip_block_ids,
+            )
 
         # Wait for current layer's KV to be ready (GPU-side sync)
         # This makes default stream wait for load_stream's event
         mapper.sync_load_layer(layer_idx)
 
-        # Prefetch next layer's KV (dispatched to load_stream, runs parallel to compute)
+        # Prefetch next layer's KV + recompute inputs so it can overlap with this
+        # layer's recompute and forward.
         next_layer_info = self._get_next_layer_info(layer_idx)
         if next_layer_info is not None:
             next_layer_name, next_layer_idx, next_gid = next_layer_info
             next_mapper = self.paged_block_mappers[next_gid]
-            next_mapper.load_layer_async(next_layer_name, next_layer_idx)
+            skip_next: set[int] | None = None
+            if manager is not None:
+                skip_next = manager.compute_skip_block_ids_for_layer(
+                    layer_idx=next_layer_idx,
+                    gid=next_gid,
+                    mapper=next_mapper,
+                    dirty_blocks=self.paged_dirty_blocks[next_gid],
+                    io_prefix_blocks=self.kv_offload_config.layer_recompute_io_prefix_blocks,
+                )
+            next_mapper.load_layer_async(
+                next_layer_name, next_layer_idx, skip_block_ids=skip_next
+            )
+            if manager is not None and skip_next:
+                manager.prefetch_recompute_inputs_for_layer(
+                    layer_idx=next_layer_idx,
+                    layer_name=next_layer_name,
+                    gid=next_gid,
+                    mapper=next_mapper,
+                    skip_block_ids=skip_next,
+                )
+
+        if manager is not None and skip_block_ids:
+            manager.recompute_kv_for_layer(
+                layer_idx=layer_idx,
+                layer_name=layer_name,
+                gid=gid,
+                mapper=mapper,
+                attn_module=module,
+                skip_block_ids=skip_block_ids,
+            )
 
     def _runkv_post_hook(
         self,
