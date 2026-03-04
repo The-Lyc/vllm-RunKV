@@ -21,7 +21,7 @@ class RunKVOffloadConfig:
 
     # Fraction of available GPU memory to use for staging buffers (0.0-1.0)
     # Only used if max_staging_blocks is None.
-    gpu_memory_fraction: float = 0.1
+    gpu_memory_fraction: float = 0.9
 
     # whether turn on async prefetch
     enable_async_prefetch: bool = True
@@ -32,10 +32,13 @@ class RunKVOffloadConfig:
     # CPU memory limit for KV cache offload in bytes
     cpu_memory_limit: int | None = None
 
-    # If cpu_memory_limit is not set, cap CPU KV cache backing store to
+    # If cpu_memory_limit is not set, cap CPU backing store budget to
     # (available_system_memory * cpu_memory_fraction).
     # This is a safety knob to avoid consuming all host memory by default.
-    cpu_memory_fraction: float = 0.7
+    # When `enable_layer_recompute=True`, this budget is shared by:
+    # - CPU KV cache
+    # - CPU hidden-state snapshots for recompute
+    cpu_memory_fraction: float = 0.3
 
     # Enable layer-wise KV recompute + RunKV IO hybrid path.
     enable_layer_recompute: bool = False
