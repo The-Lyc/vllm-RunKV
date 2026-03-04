@@ -14,11 +14,14 @@ import torch
 import vllm._custom_ops as custom_ops
 from vllm.attention.layer import Attention
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_offload_config import RunKVOffloadConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import PagedBlockMapper
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -67,7 +70,8 @@ class LayerRecomputeManager:
             kv_offload_config.layer_recompute_measure_overhead
         )
         self.pin_memory = self.device.type == "cuda"
-
+        # Preallocate full CPU hidden-state store, one block-aligned slot per KV
+        # logical block, so KV and HS capacities always match exactly.
         self.cpu_attn_inputs_by_layer: list[torch.Tensor] = [
             torch.empty(
                 self.num_cpu_blocks,
@@ -91,6 +95,30 @@ class LayerRecomputeManager:
             dtype=torch.int32,
             device="cpu",
             pin_memory=self.pin_memory,
+        )
+        hs_bytes_per_elem = torch.tensor([], dtype=dtype).element_size()
+        hs_bytes_per_block = (
+            self.num_layers * self.block_size * self.hidden_size * hs_bytes_per_elem
+        )
+        hs_total_bytes = self.num_cpu_blocks * hs_bytes_per_block
+        meta_total_bytes = (
+            self.cpu_block_positions.numel() * self.cpu_block_positions.element_size()
+            + self.cpu_block_valid_lens.numel()
+            * self.cpu_block_valid_lens.element_size()
+        )
+        logger.info_once(
+            "RunKV layer recompute HS store: num_blocks=%d, total_size=%.2f GiB, "
+            "hs_bytes_per_block=%d, block_size_tokens=%d, hidden_size=%d, "
+            "num_layers=%d, dtype=%s, meta_size=%.2f MiB",
+            self.num_cpu_blocks,
+            hs_total_bytes / (1024**3),
+            hs_bytes_per_block,
+            self.block_size,
+            self.hidden_size,
+            self.num_layers,
+            str(dtype),
+            meta_total_bytes / (1024**2),
+            scope="global",
         )
 
         self.logical_id_owner_req_id: dict[int, str] = {}
@@ -116,17 +144,35 @@ class LayerRecomputeManager:
             self._hs_d2h_stream = torch.cuda.Stream(device=self.device)
             self._hs_h2d_stream = torch.cuda.Stream(device=self.device)
 
+        (
+            self._decoder_layers,
+            self._layernorm_module_name,
+            self._recompute_model_type,
+        ) = self._resolve_model_layers()
+        if len(self._decoder_layers) != self.num_layers:
+            logger.warning(
+                "LayerRecomputeManager initialized with num_layers=%d but model "
+                "contains %d decoder layers for recompute.",
+                self.num_layers,
+                len(self._decoder_layers),
+            )
+
     def register_layernorm_hooks(self, gpu_model_runner: Any) -> None:
-        """Attach hooks to each Llama decoder layer input_layernorm."""
+        """Attach hooks to the decoder layer norm before self-attention."""
         self.remove_layernorm_hooks()
-        decoder_layers = self.model.model.layers
-        for layer_idx, decoder_layer in enumerate(decoder_layers):
+        for layer_idx, decoder_layer in enumerate(self._decoder_layers):
+            layernorm_module = getattr(decoder_layer, self._layernorm_module_name, None)
+            if layernorm_module is None:
+                raise ValueError(
+                    "Layer recompute hook registration failed: decoder layer "
+                    f"{layer_idx} missing {self._layernorm_module_name!r}."
+                )
             hook = functools.partial(
                 self._layernorm_hook,
                 layer_idx=layer_idx,
                 gpu_model_runner=gpu_model_runner,
             )
-            handle = decoder_layer.input_layernorm.register_forward_hook(hook)
+            handle = layernorm_module.register_forward_hook(hook)
             self._layernorm_hook_handles.append(handle)
 
     def remove_layernorm_hooks(self) -> None:
@@ -250,17 +296,11 @@ class LayerRecomputeManager:
         pos_gpu = prefetched.pos_gpu
         slot_gpu = prefetched.slot_gpu
 
-        llama_attn = self.model.model.layers[layer_idx].self_attn
-
-        qkv, _ = llama_attn.qkv_proj(hs_gpu)
-        q, k, v = qkv.split(
-            [llama_attn.q_size, llama_attn.kv_size, llama_attn.kv_size], dim=-1
+        k, v = self._project_kv_for_recompute(
+            layer_idx=layer_idx,
+            hs_gpu=hs_gpu,
+            pos_gpu=pos_gpu,
         )
-        q, k = llama_attn.rotary_emb(pos_gpu, q, k)
-        del q
-
-        k = k.view(-1, llama_attn.num_kv_heads, llama_attn.head_dim)
-        v = v.view(-1, llama_attn.num_kv_heads, llama_attn.head_dim)
 
         forward_context = get_forward_context()
         kv_cache = attn_module.kv_cache[forward_context.virtual_engine]
@@ -287,6 +327,7 @@ class LayerRecomputeManager:
         hs_chunks: list[torch.Tensor] = []
         pos_chunks: list[torch.Tensor] = []
         slot_chunks: list[torch.Tensor] = []
+        layer_store = self.cpu_attn_inputs_by_layer[layer_idx]
 
         for logical_id in sorted(skip_block_ids):
             if logical_id < 0 or logical_id >= self.num_cpu_blocks:
@@ -294,6 +335,7 @@ class LayerRecomputeManager:
             slot = mapper.mapping.get(logical_id)
             if slot is None:
                 continue
+            block_hs = layer_store[logical_id]
 
             valid_len = int(self.cpu_block_valid_lens[logical_id].item())
             if valid_len <= 0:
@@ -304,9 +346,7 @@ class LayerRecomputeManager:
             if torch.any(positions < 0):
                 continue
 
-            hs_chunks.append(
-                self.cpu_attn_inputs_by_layer[layer_idx][logical_id, :valid_len, :]
-            )
+            hs_chunks.append(block_hs[:valid_len, :])
             pos_chunks.append(positions.to(torch.int64))
             slot_chunks.append(
                 torch.arange(valid_len, dtype=torch.int64) + slot * mapper.block_size
@@ -353,6 +393,7 @@ class LayerRecomputeManager:
                 event.synchronize()
 
         for layer_idx, pending_writes in self._pending_writes_by_layer.items():
+            layer_store = self.cpu_attn_inputs_by_layer[layer_idx]
             for pending in pending_writes:
                 logical_ids_t = torch.from_numpy(
                     pending.logical_ids.astype(np.int64, copy=False)
@@ -364,9 +405,8 @@ class LayerRecomputeManager:
                     pending.positions.astype(np.int32, copy=False)
                 )
 
-                self.cpu_attn_inputs_by_layer[layer_idx][
-                    logical_ids_t, offsets_t, :
-                ] = pending.hs_cpu
+                layer_store[logical_ids_t, offsets_t, :] = pending.hs_cpu
+
                 self.cpu_block_positions[logical_ids_t, offsets_t] = positions_t
 
                 unique_ids, inverse = np.unique(
@@ -409,15 +449,10 @@ class LayerRecomputeManager:
         if hidden_states_normed is None:
             return
 
-        prefix_tokens = self._get_io_prefix_blocks(layer_idx) * self.block_size
-        mask = positions_np >= prefix_tokens
-        if not np.any(mask):
-            return
-
-        selected_indices = np.nonzero(mask)[0].astype(np.int64, copy=False)
-        logical_ids = logical_ids_np[selected_indices].astype(np.int64, copy=True)
-        offsets = block_offsets_np[selected_indices].astype(np.int64, copy=True)
-        positions = positions_np[selected_indices].astype(np.int32, copy=True)
+        selected_indices = np.arange(positions_np.shape[0], dtype=np.int64)
+        logical_ids = logical_ids_np.astype(np.int64, copy=True)
+        offsets = block_offsets_np.astype(np.int64, copy=True)
+        positions = positions_np.astype(np.int32, copy=True)
 
         token_indices = torch.from_numpy(selected_indices).to(
             hidden_states_normed.device, dtype=torch.long
@@ -463,7 +498,51 @@ class LayerRecomputeManager:
             getattr(gpu_model_runner, "_lr_block_offsets_np", None),
         )
 
-    def _get_io_prefix_blocks(self, layer_idx: int) -> int:
-        if layer_idx >= len(self.layer_recompute_io_prefix_blocks):
-            return 0
-        return int(self.layer_recompute_io_prefix_blocks[layer_idx])
+    def _resolve_model_layers(self) -> tuple[list[Any], str, str]:
+        model_root = getattr(self.model, "model", None)
+        if model_root is None:
+            raise ValueError("Layer recompute currently expects model.model to exist.")
+
+        llama_layers = getattr(model_root, "layers", None)
+        if llama_layers is not None:
+            return list(llama_layers), "input_layernorm", "llama"
+
+        decoder = getattr(model_root, "decoder", None)
+        opt_layers = None if decoder is None else getattr(decoder, "layers", None)
+        if opt_layers is not None:
+            return list(opt_layers), "self_attn_layer_norm", "opt"
+
+        raise ValueError(
+            "Layer recompute currently supports llama/opt decoder layouts only."
+        )
+
+    def _project_kv_for_recompute(
+        self,
+        *,
+        layer_idx: int,
+        hs_gpu: torch.Tensor,
+        pos_gpu: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        attn_impl = self._decoder_layers[layer_idx].self_attn
+
+        if self._recompute_model_type == "llama":
+            qkv, _ = attn_impl.qkv_proj(hs_gpu)
+            q, k, v = qkv.split(
+                [attn_impl.q_size, attn_impl.kv_size, attn_impl.kv_size], dim=-1
+            )
+            q, k = attn_impl.rotary_emb(pos_gpu, q, k)
+            del q
+            k = k.view(-1, attn_impl.num_kv_heads, attn_impl.head_dim)
+            v = v.view(-1, attn_impl.num_kv_heads, attn_impl.head_dim)
+            return k, v
+
+        if self._recompute_model_type == "opt":
+            qkv, _ = attn_impl.qkv_proj(hs_gpu)
+            _, k, v = qkv.chunk(chunks=3, dim=-1)
+            k = k.view(-1, attn_impl.num_heads, attn_impl.head_dim)
+            v = v.view(-1, attn_impl.num_heads, attn_impl.head_dim)
+            return k, v
+
+        raise ValueError(
+            f"Unsupported recompute model type: {self._recompute_model_type!r}."
+        )

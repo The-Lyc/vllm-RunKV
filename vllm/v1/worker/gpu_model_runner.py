@@ -6813,8 +6813,8 @@ class GPUModelRunner(
         and clean up the manager if it exists.
 
         TODO: The current implementation only supports a single KV cache group
-        and llama models, and the group block size must be specified. We will
-        relax these requirements in the future.
+        and decoder-only llama/opt style models, and the group block size must
+        be specified. We will relax these requirements in the future.
         """
         if not self.use_runkv or not self.kv_offload_config.enable_layer_recompute:
             if self.layer_recompute_manager is not None:
@@ -6830,9 +6830,10 @@ class GPUModelRunner(
             )
 
         model_type = getattr(self.model_config.hf_config, "model_type", "")
-        if model_type != "llama":
+        supported_model_types = {"llama", "opt"}
+        if model_type not in supported_model_types:
             raise ValueError(
-                "RunKV layer recompute currently supports only llama models; "
+                "RunKV layer recompute currently supports only llama/opt models; "
                 f"got model_type={model_type!r}."
             )
 
@@ -6842,7 +6843,10 @@ class GPUModelRunner(
                 "group_block_sizes."
             )
 
-        num_layers = len(self.model.model.layers)
+        if model_type == "llama":
+            num_layers = len(self.model.model.layers)
+        else:
+            num_layers = len(self.model.model.decoder.layers)
         normalized_io_prefix = self._normalize_layer_recompute_io_prefix_blocks(
             num_layers
         )

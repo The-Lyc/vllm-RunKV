@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
@@ -1078,7 +1079,9 @@ def get_kv_cache_config_from_groups(
     Args:
         vllm_config: The global VllmConfig
         kv_cache_groups: The KV cache groups
-        available_memory: Memory available for KV cache in bytes
+        available_memory: Memory budget in bytes. When RunKV layer recompute
+            is enabled, this budget is shared by KV cache and CPU hidden-state
+            snapshots used by recompute.
     Returns:
         The generated KVCacheConfig
     """
@@ -1091,6 +1094,43 @@ def get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
         )
 
+    kv_offload_cfg = getattr(vllm_config, "kv_offload_config", None)
+    layer_recompute_enabled = bool(
+        kv_offload_cfg is not None
+        and getattr(kv_offload_cfg, "enabled", False)
+        and getattr(kv_offload_cfg, "enable_layer_recompute", False)
+    )
+    hs_bytes_per_block_total: int | None = None
+    if layer_recompute_enabled:
+        model_config = getattr(vllm_config, "model_config", None)
+        hidden_size = None
+        if model_config is not None:
+            get_hidden_size = getattr(model_config, "get_hidden_size", None)
+            if callable(get_hidden_size):
+                hidden_size = int(get_hidden_size())
+            else:
+                hidden_size = getattr(model_config, "hidden_size", None)
+        model_dtype = (
+            None if model_config is None else getattr(model_config, "dtype", None)
+        )
+        block_sizes = {group.kv_cache_spec.block_size for group in kv_cache_groups}
+        num_layers = sum(len(group.layer_names) for group in kv_cache_groups)
+
+        if hidden_size is None or model_dtype is None or len(block_sizes) != 1:
+            logger.warning(
+                "RunKV layer recompute is enabled but cannot include hidden-state "
+                "store in CPU budget (hidden_size=%s, dtype=%s, block_sizes=%s). "
+                "Falling back to KV-only sizing.",
+                hidden_size,
+                model_dtype,
+                sorted(block_sizes),
+            )
+        else:
+            block_size = int(next(iter(block_sizes)))
+            hs_bytes_per_block_total = (
+                num_layers * block_size * int(hidden_size) * get_dtype_size(model_dtype)
+            )
+
     # Determine how model runners should initialize the KV cache tensors.
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
@@ -1098,9 +1138,18 @@ def get_kv_cache_config_from_groups(
         # Special case: all layers have the same type of KV cache but with
         # different hidden size. Allocate different amount of memory for each
         # layer based on its hidden size.
-        num_blocks = (
-            available_memory // kv_cache_groups[0].kv_cache_spec.page_size_bytes
-        )
+        kv_bytes_per_block_total = kv_cache_groups[0].kv_cache_spec.page_size_bytes
+        total_bytes_per_block_total = kv_bytes_per_block_total
+        if hs_bytes_per_block_total is not None:
+            total_bytes_per_block_total += hs_bytes_per_block_total
+            logger.info_once(
+                "RunKV layer recompute memory sizing: total_budget=%d, "
+                "bytes_per_block=(kv:%d + hs:%d).",
+                int(available_memory),
+                kv_bytes_per_block_total,
+                hs_bytes_per_block_total,
+            )
+        num_blocks = int(available_memory // total_bytes_per_block_total)
         num_blocks = may_override_num_blocks(vllm_config, num_blocks)
         per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
         kv_cache_tensors = [
@@ -1125,9 +1174,25 @@ def get_kv_cache_config_from_groups(
             [group.kv_cache_spec for group in kv_cache_groups]
         )
         assert group_size > 0, "group_size must be greater than 0"
-        num_blocks = get_num_blocks(
-            vllm_config, group_size, available_memory, page_size
-        )
+        if hs_bytes_per_block_total is not None:
+            kv_bytes_per_block_total = page_size * group_size
+            total_bytes_per_block_total = (
+                kv_bytes_per_block_total + hs_bytes_per_block_total
+            )
+            logger.info_once(
+                "RunKV layer recompute memory sizing: total_budget=%d, "
+                "bytes_per_block=(kv:%d + hs:%d).",
+                int(available_memory),
+                kv_bytes_per_block_total,
+                hs_bytes_per_block_total,
+            )
+            num_blocks = int(available_memory // total_bytes_per_block_total)
+            num_blocks = max(num_blocks, 0)
+            num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+        else:
+            num_blocks = get_num_blocks(
+                vllm_config, group_size, available_memory, page_size
+            )
         kv_cache_tensors = []
         for i in range(group_size):
             shared_by = []
