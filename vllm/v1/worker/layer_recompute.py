@@ -17,6 +17,7 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_offload_config import RunKVOffloadConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.utils import record_function_or_nullcontext
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import PagedBlockMapper
@@ -249,17 +250,20 @@ class LayerRecomputeManager:
     ) -> None:
         """Stage suffix hidden states/positions/slots to GPU for recompute."""
         del layer_name, gid
-        if self.device.type != "cuda" or not skip_block_ids:
-            return
-        if layer_idx in self._prefetched_inputs_by_layer:
-            return
-        prefetched = self._build_prefetched_inputs(
-            layer_idx=layer_idx,
-            mapper=mapper,
-            skip_block_ids=skip_block_ids,
-        )
-        if prefetched is not None:
-            self._prefetched_inputs_by_layer[layer_idx] = prefetched
+        with record_function_or_nullcontext(
+            f"runkv_recompute:prefetch_inputs:L{layer_idx}"
+        ):
+            if self.device.type != "cuda" or not skip_block_ids:
+                return
+            if layer_idx in self._prefetched_inputs_by_layer:
+                return
+            prefetched = self._build_prefetched_inputs(
+                layer_idx=layer_idx,
+                mapper=mapper,
+                skip_block_ids=skip_block_ids,
+            )
+            if prefetched is not None:
+                self._prefetched_inputs_by_layer[layer_idx] = prefetched
 
     def recompute_kv_for_layer(
         self,
@@ -273,49 +277,58 @@ class LayerRecomputeManager:
     ) -> None:
         """Recompute K/V for skipped blocks and write them into staging cache."""
         del layer_name, gid
-        if not skip_block_ids:
-            return
-        if self.device.type != "cuda":
-            return
-
-        prefetched = self._prefetched_inputs_by_layer.pop(layer_idx, None)
-        if prefetched is None:
-            prefetched = self._build_prefetched_inputs(
-                layer_idx=layer_idx,
-                mapper=mapper,
-                skip_block_ids=skip_block_ids,
-            )
-            if prefetched is None:
+        with record_function_or_nullcontext(
+            f"runkv_recompute:recompute_kv:L{layer_idx}"
+        ):
+            if not skip_block_ids:
                 return
-        if prefetched.ready_event is not None:
-            torch.cuda.current_stream(device=self.device).wait_event(
-                prefetched.ready_event
-            )
+            if self.device.type != "cuda":
+                return
 
-        hs_gpu = prefetched.hs_gpu
-        pos_gpu = prefetched.pos_gpu
-        slot_gpu = prefetched.slot_gpu
+            prefetched = self._prefetched_inputs_by_layer.pop(layer_idx, None)
+            if prefetched is None:
+                prefetched = self._build_prefetched_inputs(
+                    layer_idx=layer_idx,
+                    mapper=mapper,
+                    skip_block_ids=skip_block_ids,
+                )
+                if prefetched is None:
+                    return
+            if prefetched.ready_event is not None:
+                torch.cuda.current_stream(device=self.device).wait_event(
+                    prefetched.ready_event
+                )
 
-        k, v = self._project_kv_for_recompute(
-            layer_idx=layer_idx,
-            hs_gpu=hs_gpu,
-            pos_gpu=pos_gpu,
-        )
+            hs_gpu = prefetched.hs_gpu
+            pos_gpu = prefetched.pos_gpu
+            slot_gpu = prefetched.slot_gpu
 
-        forward_context = get_forward_context()
-        kv_cache = attn_module.kv_cache[forward_context.virtual_engine]
-        key_cache, value_cache = kv_cache.unbind(0)
+            with record_function_or_nullcontext(
+                f"runkv_recompute:project_kv:L{layer_idx}"
+            ):
+                k, v = self._project_kv_for_recompute(
+                    layer_idx=layer_idx,
+                    hs_gpu=hs_gpu,
+                    pos_gpu=pos_gpu,
+                )
 
-        custom_ops.reshape_and_cache_flash(
-            k,
-            v,
-            key_cache,
-            value_cache,
-            slot_gpu,
-            attn_module.kv_cache_dtype,
-            attn_module._k_scale,
-            attn_module._v_scale,
-        )
+            forward_context = get_forward_context()
+            kv_cache = attn_module.kv_cache[forward_context.virtual_engine]
+            key_cache, value_cache = kv_cache.unbind(0)
+
+            with record_function_or_nullcontext(
+                f"runkv_recompute:cache_kv:L{layer_idx}"
+            ):
+                custom_ops.reshape_and_cache_flash(
+                    k,
+                    v,
+                    key_cache,
+                    value_cache,
+                    slot_gpu,
+                    attn_module.kv_cache_dtype,
+                    attn_module._k_scale,
+                    attn_module._v_scale,
+                )
 
     def _build_prefetched_inputs(
         self,
@@ -324,40 +337,44 @@ class LayerRecomputeManager:
         mapper: PagedBlockMapper,
         skip_block_ids: set[int],
     ) -> _PrefetchedLayerInputs | None:
-        hs_chunks: list[torch.Tensor] = []
-        pos_chunks: list[torch.Tensor] = []
-        slot_chunks: list[torch.Tensor] = []
-        layer_store = self.cpu_attn_inputs_by_layer[layer_idx]
+        with record_function_or_nullcontext(
+            f"runkv_recompute:prefetch_pack:L{layer_idx}"
+        ):
+            hs_chunks: list[torch.Tensor] = []
+            pos_chunks: list[torch.Tensor] = []
+            slot_chunks: list[torch.Tensor] = []
+            layer_store = self.cpu_attn_inputs_by_layer[layer_idx]
 
-        for logical_id in sorted(skip_block_ids):
-            if logical_id < 0 or logical_id >= self.num_cpu_blocks:
-                continue
-            slot = mapper.mapping.get(logical_id)
-            if slot is None:
-                continue
-            block_hs = layer_store[logical_id]
+            for logical_id in sorted(skip_block_ids):
+                if logical_id < 0 or logical_id >= self.num_cpu_blocks:
+                    continue
+                slot = mapper.mapping.get(logical_id)
+                if slot is None:
+                    continue
+                block_hs = layer_store[logical_id]
 
-            valid_len = int(self.cpu_block_valid_lens[logical_id].item())
-            if valid_len <= 0:
-                continue
-            valid_len = min(valid_len, mapper.block_size)
+                valid_len = int(self.cpu_block_valid_lens[logical_id].item())
+                if valid_len <= 0:
+                    continue
+                valid_len = min(valid_len, mapper.block_size)
 
-            positions = self.cpu_block_positions[logical_id, :valid_len]
-            if torch.any(positions < 0):
-                continue
+                positions = self.cpu_block_positions[logical_id, :valid_len]
+                if torch.any(positions < 0):
+                    continue
 
-            hs_chunks.append(block_hs[:valid_len, :])
-            pos_chunks.append(positions.to(torch.int64))
-            slot_chunks.append(
-                torch.arange(valid_len, dtype=torch.int64) + slot * mapper.block_size
-            )
+                hs_chunks.append(block_hs[:valid_len, :])
+                pos_chunks.append(positions.to(torch.int64))
+                slot_chunks.append(
+                    torch.arange(valid_len, dtype=torch.int64)
+                    + slot * mapper.block_size
+                )
 
-        if not hs_chunks:
-            return None
+            if not hs_chunks:
+                return None
 
-        hs_cat_cpu = torch.cat(hs_chunks, dim=0)
-        pos_cat_cpu = torch.cat(pos_chunks, dim=0)
-        slot_cat_cpu = torch.cat(slot_chunks, dim=0)
+            hs_cat_cpu = torch.cat(hs_chunks, dim=0)
+            pos_cat_cpu = torch.cat(pos_chunks, dim=0)
+            slot_cat_cpu = torch.cat(slot_chunks, dim=0)
 
         if self.pin_memory and not hs_cat_cpu.is_pinned():
             hs_cat_cpu = hs_cat_cpu.pin_memory()
@@ -366,18 +383,21 @@ class LayerRecomputeManager:
         if self.pin_memory and not slot_cat_cpu.is_pinned():
             slot_cat_cpu = slot_cat_cpu.pin_memory()
 
-        if self._hs_h2d_stream is not None:
-            with torch.cuda.stream(self._hs_h2d_stream):
-                hs_gpu = hs_cat_cpu.to(self.device, non_blocking=True)
-                pos_gpu = pos_cat_cpu.to(self.device, non_blocking=True)
-                slot_gpu = slot_cat_cpu.to(self.device, non_blocking=True)
-                ready_event = torch.cuda.Event()
-                ready_event.record(self._hs_h2d_stream)
-        else:
-            hs_gpu = hs_cat_cpu.to(self.device)
-            pos_gpu = pos_cat_cpu.to(self.device)
-            slot_gpu = slot_cat_cpu.to(self.device)
-            ready_event = None
+        with record_function_or_nullcontext(
+            f"runkv_recompute:hs_h2d_copy:L{layer_idx}"
+        ):
+            if self._hs_h2d_stream is not None:
+                with torch.cuda.stream(self._hs_h2d_stream):
+                    hs_gpu = hs_cat_cpu.to(self.device, non_blocking=True)
+                    pos_gpu = pos_cat_cpu.to(self.device, non_blocking=True)
+                    slot_gpu = slot_cat_cpu.to(self.device, non_blocking=True)
+                    ready_event = torch.cuda.Event()
+                    ready_event.record(self._hs_h2d_stream)
+            else:
+                hs_gpu = hs_cat_cpu.to(self.device)
+                pos_gpu = pos_cat_cpu.to(self.device)
+                slot_gpu = slot_cat_cpu.to(self.device)
+                ready_event = None
 
         return _PrefetchedLayerInputs(
             hs_gpu=hs_gpu,
@@ -388,45 +408,48 @@ class LayerRecomputeManager:
 
     def sync_hs_d2h(self) -> None:
         """Synchronize pending D2H copies and materialize hidden-state snapshots."""
-        for events in self._hs_d2h_events_by_layer.values():
-            for event in events:
-                event.synchronize()
+        with record_function_or_nullcontext("runkv_recompute:sync_hs_d2h"):
+            for events in self._hs_d2h_events_by_layer.values():
+                for event in events:
+                    event.synchronize()
 
-        for layer_idx, pending_writes in self._pending_writes_by_layer.items():
-            layer_store = self.cpu_attn_inputs_by_layer[layer_idx]
-            for pending in pending_writes:
-                logical_ids_t = torch.from_numpy(
-                    pending.logical_ids.astype(np.int64, copy=False)
-                )
-                offsets_t = torch.from_numpy(
-                    pending.offsets.astype(np.int64, copy=False)
-                )
-                positions_t = torch.from_numpy(
-                    pending.positions.astype(np.int32, copy=False)
-                )
+            for layer_idx, pending_writes in self._pending_writes_by_layer.items():
+                layer_store = self.cpu_attn_inputs_by_layer[layer_idx]
+                for pending in pending_writes:
+                    logical_ids_t = torch.from_numpy(
+                        pending.logical_ids.astype(np.int64, copy=False)
+                    )
+                    offsets_t = torch.from_numpy(
+                        pending.offsets.astype(np.int64, copy=False)
+                    )
+                    positions_t = torch.from_numpy(
+                        pending.positions.astype(np.int32, copy=False)
+                    )
 
-                layer_store[logical_ids_t, offsets_t, :] = pending.hs_cpu
+                    layer_store[logical_ids_t, offsets_t, :] = pending.hs_cpu
 
-                self.cpu_block_positions[logical_ids_t, offsets_t] = positions_t
+                    self.cpu_block_positions[logical_ids_t, offsets_t] = positions_t
 
-                unique_ids, inverse = np.unique(
-                    pending.logical_ids, return_inverse=True
-                )
-                max_valid_lens = np.zeros(unique_ids.shape[0], dtype=np.int32)
-                np.maximum.at(
-                    max_valid_lens,
-                    inverse,
-                    pending.offsets.astype(np.int32, copy=False) + 1,
-                )
-                unique_ids_t = torch.from_numpy(unique_ids.astype(np.int64, copy=False))
-                max_valid_lens_t = torch.from_numpy(max_valid_lens)
-                self.cpu_block_valid_lens[unique_ids_t] = torch.maximum(
-                    self.cpu_block_valid_lens[unique_ids_t],
-                    max_valid_lens_t,
-                )
+                    unique_ids, inverse = np.unique(
+                        pending.logical_ids, return_inverse=True
+                    )
+                    max_valid_lens = np.zeros(unique_ids.shape[0], dtype=np.int32)
+                    np.maximum.at(
+                        max_valid_lens,
+                        inverse,
+                        pending.offsets.astype(np.int32, copy=False) + 1,
+                    )
+                    unique_ids_t = torch.from_numpy(
+                        unique_ids.astype(np.int64, copy=False)
+                    )
+                    max_valid_lens_t = torch.from_numpy(max_valid_lens)
+                    self.cpu_block_valid_lens[unique_ids_t] = torch.maximum(
+                        self.cpu_block_valid_lens[unique_ids_t],
+                        max_valid_lens_t,
+                    )
 
-        self._hs_d2h_events_by_layer.clear()
-        self._pending_writes_by_layer.clear()
+            self._hs_d2h_events_by_layer.clear()
+            self._pending_writes_by_layer.clear()
 
     def _layernorm_hook(
         self,
@@ -454,20 +477,24 @@ class LayerRecomputeManager:
         offsets = block_offsets_np.astype(np.int64, copy=True)
         positions = positions_np.astype(np.int32, copy=True)
 
-        token_indices = torch.from_numpy(selected_indices).to(
-            hidden_states_normed.device, dtype=torch.long
-        )
-        hs_gpu = hidden_states_normed.index_select(0, token_indices).contiguous()
+        with record_function_or_nullcontext(f"runkv_recompute:capture_hs:L{layer_idx}"):
+            token_indices = torch.from_numpy(selected_indices).to(
+                hidden_states_normed.device, dtype=torch.long
+            )
+            hs_gpu = hidden_states_normed.index_select(0, token_indices).contiguous()
 
         hs_cpu: torch.Tensor
-        if self._hs_d2h_stream is not None and hs_gpu.is_cuda:
-            with torch.cuda.stream(self._hs_d2h_stream):
-                hs_cpu = hs_gpu.to("cpu", non_blocking=True)
-                event = torch.cuda.Event()
-                event.record(self._hs_d2h_stream)
-            self._hs_d2h_events_by_layer[layer_idx].append(event)
-        else:
-            hs_cpu = hs_gpu.to("cpu")
+        with record_function_or_nullcontext(
+            f"runkv_recompute:hs_d2h_copy:L{layer_idx}"
+        ):
+            if self._hs_d2h_stream is not None and hs_gpu.is_cuda:
+                with torch.cuda.stream(self._hs_d2h_stream):
+                    hs_cpu = hs_gpu.to("cpu", non_blocking=True)
+                    event = torch.cuda.Event()
+                    event.record(self._hs_d2h_stream)
+                self._hs_d2h_events_by_layer[layer_idx].append(event)
+            else:
+                hs_cpu = hs_gpu.to("cpu")
 
         self._pending_writes_by_layer[layer_idx].append(
             _PendingLayerWrite(

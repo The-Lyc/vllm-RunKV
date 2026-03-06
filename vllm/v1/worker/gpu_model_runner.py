@@ -162,6 +162,15 @@ from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.layer_recompute import LayerRecomputeManager
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.runkv_debug import (
+    DebugWriter,
+    StepRecord,
+    build_layer_kv_record_vanilla,
+    build_request_step_info_runkv,
+    build_request_step_info_vanilla,
+    runkv_debug_enabled,
+    runkv_debug_level,
+)
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
@@ -1105,6 +1114,34 @@ class GPUModelRunner(
         self._lr_block_offsets_np: np.ndarray | None = None
         self._lr_block_size: int = 0
         self._lr_num_reqs: int = 0
+
+        # ---- RunKV debug instrumentation ----
+        self._runkv_debug_enabled = runkv_debug_enabled()
+        self._runkv_debug_level = runkv_debug_level()
+        self._runkv_debug_writer: DebugWriter | None = None
+        self._runkv_debug_step_counter: int = 0
+        # Per-step state stashed by _prepare_inputs for hooks to consume
+        self._debug_step_record: StepRecord | None = None
+        self._debug_req_indices_np: np.ndarray | None = None
+        self._debug_positions_np: np.ndarray | None = None
+        self._debug_num_scheduled_tokens_np: np.ndarray | None = None
+        self._debug_num_reqs: int = 0
+        self._debug_total_tokens: int = 0
+        self._debug_vanilla_hooks: list[Any] = []
+
+        if self._runkv_debug_enabled:
+            tag = "runkv" if self.use_runkv else "vanilla"
+            if self.kv_offload_config and getattr(
+                self.kv_offload_config, "enable_layer_recompute", False
+            ):
+                tag = "recompute"
+            self._runkv_debug_writer = DebugWriter(tag)
+            logger.info(
+                "RunKV debug enabled (level=%d, tag=%s, output=%s)",
+                self._runkv_debug_level,
+                tag,
+                self._runkv_debug_writer.filepath,
+            )
 
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
@@ -2164,6 +2201,16 @@ class GPUModelRunner(
             self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
             self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
+        # ---- RunKV debug: stash step metadata & log index info ----
+        if self._runkv_debug_enabled:
+            self._debug_log_step_indices(
+                req_indices=req_indices,
+                positions_np=positions_np,
+                num_scheduled_tokens=num_scheduled_tokens,
+                num_reqs=num_reqs,
+                total_num_scheduled_tokens=total_num_scheduled_tokens,
+            )
+
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
         self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
@@ -2279,50 +2326,51 @@ class GPUModelRunner(
         num_reqs: int,
     ) -> None:
         """Prepare per-step logical-id metadata for layer recompute hooks."""
-        if (
-            not self.use_runkv
-            or not self.layer_recompute_enabled
-            or self.layer_recompute_manager is None
-        ):
-            self._lr_req_indices_np = None
-            self._lr_positions_np = None
-            self._lr_logical_ids_np = None
-            self._lr_block_offsets_np = None
-            self._lr_block_size = 0
-            self._lr_num_reqs = 0
-            return
+        with record_function_or_nullcontext("runkv_recompute:prepare_step_metadata"):
+            if (
+                not self.use_runkv
+                or not self.layer_recompute_enabled
+                or self.layer_recompute_manager is None
+            ):
+                self._lr_req_indices_np = None
+                self._lr_positions_np = None
+                self._lr_logical_ids_np = None
+                self._lr_block_offsets_np = None
+                self._lr_block_size = 0
+                self._lr_num_reqs = 0
+                return
 
-        block_tables = self.input_batch.block_table.block_tables
-        if len(block_tables) != 1:
-            raise ValueError(
-                "Layer recompute currently supports exactly one block table group; "
-                f"got {len(block_tables)}."
+            block_tables = self.input_batch.block_table.block_tables
+            if len(block_tables) != 1:
+                raise ValueError(
+                    "Layer recompute currently supports exactly one block table group; "
+                    f"got {len(block_tables)}."
+                )
+
+            block_table = block_tables[0]
+            block_size = int(block_table.block_size)
+            logical_table_np = block_table.get_numpy_array()
+
+            block_indices = positions_np // block_size
+            block_offsets = positions_np % block_size
+            logical_ids = logical_table_np[req_indices, block_indices]
+
+            self._lr_req_indices_np = req_indices
+            self._lr_positions_np = positions_np
+            self._lr_logical_ids_np = logical_ids
+            self._lr_block_offsets_np = block_offsets
+            self._lr_block_size = block_size
+            self._lr_num_reqs = num_reqs
+
+            self.layer_recompute_manager.begin_step(
+                req_ids=self.input_batch.req_ids[:num_reqs],
+                req_indices_np=req_indices,
+                positions_np=positions_np,
+                logical_ids_np=logical_ids,
+                block_offsets_np=block_offsets,
+                logical_block_table_np=logical_table_np,
+                num_blocks_per_row=block_table.num_blocks_per_row,
             )
-
-        block_table = block_tables[0]
-        block_size = int(block_table.block_size)
-        logical_table_np = block_table.get_numpy_array()
-
-        block_indices = positions_np // block_size
-        block_offsets = positions_np % block_size
-        logical_ids = logical_table_np[req_indices, block_indices]
-
-        self._lr_req_indices_np = req_indices
-        self._lr_positions_np = positions_np
-        self._lr_logical_ids_np = logical_ids
-        self._lr_block_offsets_np = block_offsets
-        self._lr_block_size = block_size
-        self._lr_num_reqs = num_reqs
-
-        self.layer_recompute_manager.begin_step(
-            req_ids=self.input_batch.req_ids[:num_reqs],
-            req_indices_np=req_indices,
-            positions_np=positions_np,
-            logical_ids_np=logical_ids,
-            block_offsets_np=block_offsets,
-            logical_block_table_np=logical_table_np,
-            num_blocks_per_row=block_table.num_blocks_per_row,
-        )
 
     def _prepare_paged_block_tables(
         self,
@@ -2380,6 +2428,209 @@ class GPUModelRunner(
             )
             self.paged_slot_mappings[gid][:total_num_scheduled_tokens] = slot_mapping
             self.paged_dirty_blocks[gid] = touched
+
+    # ------------------------------------------------------------------
+    # RunKV Debug Instrumentation
+    # ------------------------------------------------------------------
+
+    def _debug_log_step_indices(
+        self,
+        *,
+        req_indices: np.ndarray,
+        positions_np: np.ndarray,
+        num_scheduled_tokens: np.ndarray,
+        num_reqs: int,
+        total_num_scheduled_tokens: int,
+    ) -> None:
+        """Log per-step, per-request index info and stash metadata for hooks."""
+        if not self._runkv_debug_enabled or self._runkv_debug_writer is None:
+            return
+
+        import time as _time
+
+        step_id = self._runkv_debug_step_counter
+        self._runkv_debug_step_counter += 1
+
+        engine_tag = self._runkv_debug_writer.engine_tag
+
+        step_record = StepRecord(
+            step_id=step_id,
+            engine_tag=engine_tag,
+            timestamp=_time.time(),
+            num_reqs=num_reqs,
+            num_tokens=total_num_scheduled_tokens,
+        )
+
+        token_offset = 0
+        for req_row in range(num_reqs):
+            n_sched = int(num_scheduled_tokens[req_row])
+            req_id = self.input_batch.req_ids[req_row]
+            seq_len = int(self.input_batch.num_computed_tokens_cpu[req_row] + n_sched)
+
+            if self.use_runkv:
+                # RunKV path: use paged tables
+                gid = 0  # primary KV group
+                bt = self.input_batch.block_table.block_tables[gid]
+                logical_table_np = bt.get_numpy_array()
+                n_logical = int(bt.num_blocks_per_row[req_row])
+                block_size = int(bt.block_size)
+                mapper = self.paged_block_mappers[gid]
+
+                from dataclasses import asdict as _asdict
+
+                req_info = build_request_step_info_runkv(
+                    req_id=req_id,
+                    req_idx=req_row,
+                    seq_len=seq_len,
+                    num_scheduled=n_sched,
+                    logical_block_table_np=logical_table_np,
+                    num_logical_blocks=n_logical,
+                    paged_block_table=self.paged_block_tables[gid],
+                    paged_slot_mapping=self.paged_slot_mappings[gid],
+                    positions=positions_np,
+                    token_offset=token_offset,
+                    block_size=block_size,
+                    mapping=dict(mapper.mapping),
+                    dirty_blocks=self.paged_dirty_blocks[gid],
+                )
+            else:
+                # Vanilla path
+                bt = self.input_batch.block_table.block_tables[0]
+                block_table_np = bt.get_numpy_array()
+                n_blocks = int(bt.num_blocks_per_row[req_row])
+                block_size = int(bt.block_size)
+                slot_mapping_np = bt.slot_mapping.np
+
+                from dataclasses import asdict as _asdict
+
+                req_info = build_request_step_info_vanilla(
+                    req_id=req_id,
+                    req_idx=req_row,
+                    seq_len=seq_len,
+                    num_scheduled=n_sched,
+                    block_table_np=block_table_np,
+                    num_blocks=n_blocks,
+                    positions=positions_np,
+                    slot_mapping_np=slot_mapping_np,
+                    token_offset=token_offset,
+                    block_size=block_size,
+                )
+
+            from dataclasses import asdict as _asdict
+
+            step_record.requests.append(_asdict(req_info))
+            token_offset += n_sched
+
+        # Stash for hooks to use
+        self._debug_step_record = step_record
+        self._debug_req_indices_np = req_indices.copy()
+        self._debug_positions_np = positions_np.copy()
+        self._debug_num_scheduled_tokens_np = num_scheduled_tokens.copy()
+        self._debug_num_reqs = num_reqs
+        self._debug_total_tokens = total_num_scheduled_tokens
+
+    def _debug_vanilla_post_hook(
+        self,
+        module: nn.Module,
+        inputs: tuple[Any, ...],
+        output: Any,
+        layer_name: str,
+        layer_idx: int,
+    ) -> None:
+        """Vanilla debug hook: log per-token KV checksums after attention."""
+        if (
+            not self._runkv_debug_enabled
+            or self._debug_step_record is None
+            or self._debug_positions_np is None
+            or self._debug_num_scheduled_tokens_np is None
+        ):
+            return
+
+        # Determine blocks_dim for vanilla KV cache
+        # Vanilla KV cache shape: (2, num_blocks, block_size, nkv, head)
+        # blocks_dim = 1
+        kv_cache = (
+            self.kv_caches[layer_idx] if layer_idx < len(self.kv_caches) else None
+        )
+        if kv_cache is None:
+            return
+
+        blocks_dim = 1 if kv_cache.ndim >= 2 and kv_cache.shape[0] == 2 else 0
+        bt = self.input_batch.block_table.block_tables[0]
+        block_table_np = bt.get_numpy_array()
+        block_size = int(bt.block_size)
+        num_scheduled = self._debug_num_scheduled_tokens_np
+
+        from dataclasses import asdict as _asdict
+
+        token_offset = 0
+        for req_row in range(self._debug_num_reqs):
+            n_sched = int(num_scheduled[req_row])
+            req_id = self.input_batch.req_ids[req_row]
+            n_blocks = int(bt.num_blocks_per_row[req_row])
+
+            # Collect positions for this request's NEW tokens
+            positions = [
+                int(self._debug_positions_np[token_offset + t]) for t in range(n_sched)
+            ]
+
+            record = build_layer_kv_record_vanilla(
+                layer_name=layer_name,
+                layer_idx=layer_idx,
+                req_id=req_id,
+                kv_cache=kv_cache,
+                block_table_np=block_table_np,
+                req_idx=req_row,
+                positions=positions,
+                block_size=block_size,
+                num_blocks=n_blocks,
+                blocks_dim=blocks_dim,
+            )
+            self._debug_step_record.layer_kv_records.append(_asdict(record))
+            token_offset += n_sched
+
+    def _debug_register_vanilla_hooks(self) -> None:
+        """Register temporary vanilla debug hooks for the current step."""
+        if not self._runkv_debug_enabled or self.use_runkv:
+            return
+        # Remove any previous hooks
+        for h in self._debug_vanilla_hooks:
+            h.remove()
+        self._debug_vanilla_hooks.clear()
+
+        for layer_name, layer_idx in self.layer_name_to_idx.items():
+            # Find the attention module
+            attn_module = None
+            for name, mod in self.compilation_config.static_forward_context.items():
+                if name == layer_name and hasattr(mod, "kv_cache"):
+                    attn_module = mod
+                    break
+            if attn_module is None:
+                continue
+
+            hook = functools.partial(
+                self._debug_vanilla_post_hook,
+                layer_name=layer_name,
+                layer_idx=layer_idx,
+            )
+            handle = attn_module.register_forward_hook(hook)
+            self._debug_vanilla_hooks.append(handle)
+
+    def _debug_remove_vanilla_hooks(self) -> None:
+        """Remove temporary vanilla debug hooks."""
+        for h in self._debug_vanilla_hooks:
+            h.remove()
+        self._debug_vanilla_hooks.clear()
+
+    def _debug_flush_step_record(self) -> None:
+        """Write the current step's debug record to disk."""
+        if (
+            self._runkv_debug_enabled
+            and self._runkv_debug_writer is not None
+            and self._debug_step_record is not None
+        ):
+            self._runkv_debug_writer.write_step(self._debug_step_record)
+            self._debug_step_record = None
 
     def _flush_paged_blocks(self) -> None:
         """Write back staging buffers for blocks touched in the current step."""
@@ -2488,79 +2739,83 @@ class GPUModelRunner(
         gid: int,
     ) -> None:
         """Pre-hook for RunKV IO + layer-recompute pipeline."""
-        del inputs
-        mapper = self.paged_block_mappers[gid]
-        manager = (
-            self.layer_recompute_manager
-            if self.layer_recompute_enabled and self.layer_recompute_manager is not None
-            else None
-        )
-        skip_block_ids: set[int] | None = None
-        if manager is not None:
-            skip_block_ids = manager.compute_skip_block_ids_for_layer(
-                layer_idx=layer_idx,
-                gid=gid,
-                mapper=mapper,
-                dirty_blocks=self.paged_dirty_blocks[gid],
-                io_prefix_blocks=self.kv_offload_config.layer_recompute_io_prefix_blocks,
+        with record_function_or_nullcontext(
+            f"runkv_recompute:pre_hook:{layer_name}:L{layer_idx}"
+        ):
+            del inputs
+            mapper = self.paged_block_mappers[gid]
+            manager = (
+                self.layer_recompute_manager
+                if self.layer_recompute_enabled
+                and self.layer_recompute_manager is not None
+                else None
             )
-
-        if layer_idx == 0:
-            # First layer: start async load
-            mapper.load_layer_async(
-                layer_name, layer_idx, skip_block_ids=skip_block_ids
-            )
-
-        # Prefetch recompute inputs (HS/pos/slots) for current layer.
-        if manager is not None and skip_block_ids:
-            manager.prefetch_recompute_inputs_for_layer(
-                layer_idx=layer_idx,
-                layer_name=layer_name,
-                gid=gid,
-                mapper=mapper,
-                skip_block_ids=skip_block_ids,
-            )
-
-        # Wait for current layer's KV to be ready (GPU-side sync)
-        # This makes default stream wait for load_stream's event
-        mapper.sync_load_layer(layer_idx)
-
-        # Prefetch next layer's KV + recompute inputs so it can overlap with this
-        # layer's recompute and forward.
-        next_layer_info = self._get_next_layer_info(layer_idx)
-        if next_layer_info is not None:
-            next_layer_name, next_layer_idx, next_gid = next_layer_info
-            next_mapper = self.paged_block_mappers[next_gid]
-            skip_next: set[int] | None = None
+            skip_block_ids: set[int] | None = None
             if manager is not None:
-                skip_next = manager.compute_skip_block_ids_for_layer(
-                    layer_idx=next_layer_idx,
-                    gid=next_gid,
-                    mapper=next_mapper,
-                    dirty_blocks=self.paged_dirty_blocks[next_gid],
+                skip_block_ids = manager.compute_skip_block_ids_for_layer(
+                    layer_idx=layer_idx,
+                    gid=gid,
+                    mapper=mapper,
+                    dirty_blocks=self.paged_dirty_blocks[gid],
                     io_prefix_blocks=self.kv_offload_config.layer_recompute_io_prefix_blocks,
                 )
-            next_mapper.load_layer_async(
-                next_layer_name, next_layer_idx, skip_block_ids=skip_next
-            )
-            if manager is not None and skip_next:
-                manager.prefetch_recompute_inputs_for_layer(
-                    layer_idx=next_layer_idx,
-                    layer_name=next_layer_name,
-                    gid=next_gid,
-                    mapper=next_mapper,
-                    skip_block_ids=skip_next,
+
+            if layer_idx == 0:
+                # First layer: start async load
+                mapper.load_layer_async(
+                    layer_name, layer_idx, skip_block_ids=skip_block_ids
                 )
 
-        if manager is not None and skip_block_ids:
-            manager.recompute_kv_for_layer(
-                layer_idx=layer_idx,
-                layer_name=layer_name,
-                gid=gid,
-                mapper=mapper,
-                attn_module=module,
-                skip_block_ids=skip_block_ids,
-            )
+            # Prefetch recompute inputs (HS/pos/slots) for current layer.
+            if manager is not None and skip_block_ids:
+                manager.prefetch_recompute_inputs_for_layer(
+                    layer_idx=layer_idx,
+                    layer_name=layer_name,
+                    gid=gid,
+                    mapper=mapper,
+                    skip_block_ids=skip_block_ids,
+                )
+
+            # Wait for current layer's KV to be ready (GPU-side sync)
+            # This makes default stream wait for load_stream's event
+            mapper.sync_load_layer(layer_idx)
+
+            # Prefetch next layer's KV + recompute inputs so it can overlap with this
+            # layer's recompute and forward.
+            next_layer_info = self._get_next_layer_info(layer_idx)
+            if next_layer_info is not None:
+                next_layer_name, next_layer_idx, next_gid = next_layer_info
+                next_mapper = self.paged_block_mappers[next_gid]
+                skip_next: set[int] | None = None
+                if manager is not None:
+                    skip_next = manager.compute_skip_block_ids_for_layer(
+                        layer_idx=next_layer_idx,
+                        gid=next_gid,
+                        mapper=next_mapper,
+                        dirty_blocks=self.paged_dirty_blocks[next_gid],
+                        io_prefix_blocks=self.kv_offload_config.layer_recompute_io_prefix_blocks,
+                    )
+                next_mapper.load_layer_async(
+                    next_layer_name, next_layer_idx, skip_block_ids=skip_next
+                )
+                if manager is not None and skip_next:
+                    manager.prefetch_recompute_inputs_for_layer(
+                        layer_idx=next_layer_idx,
+                        layer_name=next_layer_name,
+                        gid=next_gid,
+                        mapper=next_mapper,
+                        skip_block_ids=skip_next,
+                    )
+
+            if manager is not None and skip_block_ids:
+                manager.recompute_kv_for_layer(
+                    layer_idx=layer_idx,
+                    layer_name=layer_name,
+                    gid=gid,
+                    mapper=mapper,
+                    attn_module=module,
+                    skip_block_ids=skip_block_ids,
+                )
 
     def _runkv_post_hook(
         self,
@@ -2579,9 +2834,26 @@ class GPUModelRunner(
         sync_all_offloads() must be called at the end of forward pass
         to ensure all data is written back before the next step.
         """
-        self.paged_block_mappers[gid].flush_layer_async(
-            layer_name, layer_idx, self.paged_dirty_blocks[gid]
-        )
+        with record_function_or_nullcontext(
+            f"runkv_recompute:post_hook:{layer_name}:L{layer_idx}"
+        ):
+            # ---- RunKV debug: log per-token KV checksums BEFORE D2H flush ----
+            if (
+                self._runkv_debug_enabled
+                and self._debug_step_record is not None
+                and self._debug_positions_np is not None
+                and self._debug_num_scheduled_tokens_np is not None
+            ):
+                self._debug_runkv_log_layer_kv(
+                    layer_name=layer_name,
+                    layer_idx=layer_idx,
+                    gid=gid,
+                    phase="after_attention",
+                )
+
+            self.paged_block_mappers[gid].flush_layer_async(
+                layer_name, layer_idx, self.paged_dirty_blocks[gid]
+            )
 
     def _sync_all_runkv_offloads(self) -> None:
         """Synchronize all pending async offloads.
@@ -2594,15 +2866,19 @@ class GPUModelRunner(
 
     def _sync_runkv_step_end_state(self) -> None:
         """Synchronize RunKV offloads and layer-recompute D2H snapshots."""
-        if not self.use_runkv:
-            return
+        with record_function_or_nullcontext("runkv_recompute:step_end_sync"):
+            if not self.use_runkv:
+                return
 
-        # Ensure staged KV writes are fully visible on CPU.
-        self._sync_all_runkv_offloads()
+            # Ensure staged KV writes are fully visible on CPU.
+            self._sync_all_runkv_offloads()
 
-        # Ensure layer-recompute CPU hidden-state store is ready for next step.
-        if self.layer_recompute_enabled and self.layer_recompute_manager is not None:
-            self.layer_recompute_manager.sync_hs_d2h()
+            # Ensure layer-recompute CPU hidden-state store is ready for next step.
+            if (
+                self.layer_recompute_enabled
+                and self.layer_recompute_manager is not None
+            ):
+                self.layer_recompute_manager.sync_hs_d2h()
 
     def _build_attention_metadata(
         self,
