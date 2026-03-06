@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
@@ -422,6 +423,17 @@ class PagedBlockMapper:
         # Track total number of layers (set during first step)
         self.num_layers: int = 0
 
+        # Debug guard: when enabled, block H2D reuse of a staging buffer until
+        # the previous layer (sharing the same ring slot) finishes D2H offload.
+        self._sync_buffer_reuse = (
+            os.environ.get("VLLM_RUNKV_SYNC_BUFFER_REUSE", "0") == "1"
+        )
+        if self._sync_buffer_reuse:
+            logger.warning(
+                "RunKV debug guard enabled: synchronizing ring-buffer reuse "
+                "(VLLM_RUNKV_SYNC_BUFFER_REUSE=1)."
+            )
+
         # UVA batch copy support
         # Try to load the batch copy kernel (built-in or standalone)
         batch_copy_fn = _get_runkv_batch_copy()
@@ -696,6 +708,23 @@ class PagedBlockMapper:
                 ),
                 torch.cuda.stream(self.load_stream),
             ):
+                if self._sync_buffer_reuse:
+                    # Layers that are `num_buffers` apart reuse the same ring slot.
+                    # If the previous user of this slot still has pending D2H,
+                    # wait before writing new H2D data into the same GPU buffer.
+                    prev_layer_idx = layer_idx - self.num_buffers
+                    prev_offload_event = (
+                        self.offload_events.get(prev_layer_idx)
+                        if prev_layer_idx >= 0
+                        else None
+                    )
+                    if prev_offload_event is not None:
+                        with record_function_or_nullcontext(
+                            "runkv:buffer_reuse_wait"
+                            f":L{layer_idx}:prevL{prev_layer_idx}"
+                        ):
+                            prev_offload_event.wait(self.load_stream)
+
                 if self.use_batch_copy:
                     copy_count = 0
                     if skip:
