@@ -52,6 +52,44 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+class _Ansi:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+
+
+def _should_use_color() -> bool:
+    force = os.environ.get("VLLM_RUNKV_COLOR")
+    if force == "0":
+        return False
+    if force == "1":
+        return True
+    return os.environ.get("NO_COLOR") is None
+
+
+_USE_COLOR = _should_use_color()
+
+
+def _c(text: str, *styles: str) -> str:
+    if not _USE_COLOR or not styles:
+        return text
+    return f"{''.join(styles)}{text}{_Ansi.RESET}"
+
+
+def _status_color(text: str) -> str:
+    if "MATCH" in text and "MISMATCH" not in text:
+        return _c(text, _Ansi.GREEN, _Ansi.BOLD)
+    if "MISMATCH" in text:
+        return _c(text, _Ansi.RED, _Ansi.BOLD)
+    return _c(text, _Ansi.YELLOW, _Ansi.BOLD)
+
+
 # ============================================================================
 # Profiling Utilities
 # ============================================================================
@@ -85,9 +123,9 @@ def cuda_profiler_start():
         import torch.cuda
 
         torch.cuda.cudart().cudaProfilerStart()
-        print("[PROFILE] CUDA profiler started")
+        print(_c("[PROFILE] CUDA profiler started", _Ansi.CYAN))
     except Exception as e:
-        print(f"[PROFILE] Could not start CUDA profiler: {e}")
+        print(_c(f"[PROFILE] Could not start CUDA profiler: {e}", _Ansi.RED))
 
 
 def cuda_profiler_stop():
@@ -96,9 +134,9 @@ def cuda_profiler_stop():
         import torch.cuda
 
         torch.cuda.cudart().cudaProfilerStop()
-        print("[PROFILE] CUDA profiler stopped")
+        print(_c("[PROFILE] CUDA profiler stopped", _Ansi.CYAN))
     except Exception as e:
-        print(f"[PROFILE] Could not stop CUDA profiler: {e}")
+        print(_c(f"[PROFILE] Could not stop CUDA profiler: {e}", _Ansi.RED))
 
 
 # Sample prompts with varying lengths for realistic testing
@@ -402,6 +440,15 @@ Based on these documents, please analyze:""",
 
 
 @dataclass
+class TokenTrace:
+    """Per-token decode trace for diagnosing KV cache issues."""
+
+    per_req_idx: int  # N-th token decoded for THIS request (0-based)
+    global_idx: int  # N-th token decoded across ALL requests (0-based)
+    token_id: int
+
+
+@dataclass
 class RequestResult:
     """Result of a single request."""
 
@@ -412,6 +459,8 @@ class RequestResult:
     latency_ms: float
     finished: bool
     error: str | None = None
+    token_ids: list[int] | None = None
+    token_traces: list[TokenTrace] | None = None
 
 
 @dataclass
@@ -437,14 +486,19 @@ def check_cuda() -> bool:
         import torch
 
         if not torch.cuda.is_available():
-            print("CUDA is not available. RunKV requires a CUDA-enabled GPU.")
+            print(
+                _c(
+                    "CUDA is not available. RunKV requires a CUDA-enabled GPU.",
+                    _Ansi.RED,
+                )
+            )
             return False
-        print(f"CUDA: {torch.cuda.get_device_name(0)}")
+        print(_c(f"CUDA: {torch.cuda.get_device_name(0)}", _Ansi.CYAN))
         total_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        print(f"GPU memory: {total_memory_gb:.1f} GB")
+        print(_c(f"GPU memory: {total_memory_gb:.1f} GB", _Ansi.CYAN))
         return True
     except ImportError:
-        print("PyTorch not installed")
+        print(_c("PyTorch not installed", _Ansi.RED))
         return False
 
 
@@ -519,13 +573,27 @@ def _assert_runkv_active(engine) -> None:
 
 
 def _shutdown_engine(engine) -> None:
-    """Gracefully shutdown the engine."""
+    """Gracefully shutdown the engine.
+
+    Proper sequence: shutdown engine core first, then delete the engine
+    reference so that gc.collect() in cleanup_dist_env_and_memory can
+    actually free GPU tensors.
+    """
     with contextlib.suppress(Exception):
         engine.engine_core.shutdown()
+    # Delete engine reference so GC can free GPU tensors
+    del engine
     with contextlib.suppress(Exception):
+        import gc
+
+        import torch
+
         from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
         cleanup_dist_env_and_memory(shutdown_ray=False)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def generate_test_requests(
@@ -609,6 +677,12 @@ def run_concurrent_requests(
         str, tuple[str, int]
     ] = {}  # request_id -> (prompt, max_tokens)
 
+    # Per-request accumulated state for DELTA mode
+    accumulated_text: dict[str, str] = {}
+    accumulated_token_ids: dict[str, list[int]] = {}
+    accumulated_traces: dict[str, list[TokenTrace]] = {}
+    global_decode_counter = 0  # monotonic counter across all requests
+
     # Add all requests to the engine
     overall_start = time.time()
 
@@ -617,16 +691,20 @@ def run_concurrent_requests(
             params = SamplingParams(
                 max_tokens=max_tokens,
                 temperature=0.0,
-                top_p=1.0,
-                output_kind=RequestOutputKind.FINAL_ONLY,
+                top_p=0.1,
+                top_k=1,
+                output_kind=RequestOutputKind.DELTA,
             )
             engine.add_request(request_id=request_id, prompt=prompt, params=params)
             pending_requests.add(request_id)
             start_times[request_id] = time.time()
             request_params[request_id] = (prompt, max_tokens)
+            accumulated_text[request_id] = ""
+            accumulated_token_ids[request_id] = []
+            accumulated_traces[request_id] = []
 
     if verbose:
-        print(f"Added {len(requests)} requests to engine")
+        print(_c(f"Added {len(requests)} requests to engine", _Ansi.BLUE))
 
     # Start profiling if enabled (after warmup/setup)
     if enable_profiling:
@@ -645,26 +723,48 @@ def run_concurrent_requests(
                     if req_id is None or req_id not in pending_requests:
                         continue
 
+                    # Accumulate delta tokens
+                    if out.outputs:
+                        delta_token_ids = list(out.outputs[0].token_ids)
+                        delta_text = out.outputs[0].text
+                        accumulated_text[req_id] += delta_text
+                        for tid in delta_token_ids:
+                            per_req_idx = len(accumulated_token_ids[req_id])
+                            accumulated_token_ids[req_id].append(tid)
+                            accumulated_traces[req_id].append(
+                                TokenTrace(
+                                    per_req_idx=per_req_idx,
+                                    global_idx=global_decode_counter,
+                                    token_id=tid,
+                                )
+                            )
+                            global_decode_counter += 1
+
                     if out.finished:
                         end_time = time.time()
                         latency_ms = (end_time - start_times[req_id]) * 1000
                         prompt, max_tokens = request_params[req_id]
 
-                        text = out.outputs[0].text if out.outputs else ""
-                        num_tokens = len(out.outputs[0].token_ids) if out.outputs else 0
-
                         results[req_id] = RequestResult(
                             request_id=req_id,
                             prompt=prompt,
-                            output_text=text,
-                            num_tokens=num_tokens,
+                            output_text=accumulated_text[req_id],
+                            num_tokens=len(accumulated_token_ids[req_id]),
                             latency_ms=latency_ms,
                             finished=True,
+                            token_ids=accumulated_token_ids[req_id],
+                            token_traces=accumulated_traces[req_id],
                         )
                         pending_requests.remove(req_id)
 
                         if verbose and len(results) % 10 == 0:
-                            print(f"Completed {len(results)}/{len(requests)} requests")
+                            print(
+                                _c(
+                                    f"Completed {len(results)}/{len(requests)} "
+                                    "requests",
+                                    _Ansi.BLUE,
+                                )
+                            )
 
                 step += 1
     finally:
@@ -735,59 +835,217 @@ def compute_stats(results: list[RequestResult], total_time: float) -> BenchmarkS
 def print_stats(stats: BenchmarkStats, label: str = "") -> None:
     """Print benchmark statistics."""
     prefix = f"[{label}] " if label else ""
-    print(f"\n{prefix}Benchmark Results:")
-    print("-" * 50)
-    print(f"Total requests:      {stats.total_requests}")
-    print(f"Completed requests:  {stats.completed_requests}")
-    print(f"Failed requests:     {stats.failed_requests}")
-    print(f"Total tokens:        {stats.total_tokens}")
-    print(f"Total time:          {stats.total_time_s:.2f}s")
-    print(f"Avg latency:         {stats.avg_latency_ms:.2f}ms")
-    print(f"P50 latency:         {stats.p50_latency_ms:.2f}ms")
-    print(f"P90 latency:         {stats.p90_latency_ms:.2f}ms")
-    print(f"P99 latency:         {stats.p99_latency_ms:.2f}ms")
-    print(f"Throughput (req/s):  {stats.throughput_req_per_s:.2f}")
-    print(f"Throughput (tok/s):  {stats.throughput_tok_per_s:.2f}")
-    print("-" * 50)
+    print(_c(f"\n{prefix}Benchmark Results:", _Ansi.BOLD, _Ansi.CYAN))
+    print(_c("-" * 50, _Ansi.DIM))
+    print(_c(f"Total requests:      {stats.total_requests}", _Ansi.BLUE))
+    print(_c(f"Completed requests:  {stats.completed_requests}", _Ansi.GREEN))
+    failed_line = f"Failed requests:     {stats.failed_requests}"
+    if stats.failed_requests > 0:
+        print(_c(failed_line, _Ansi.RED, _Ansi.BOLD))
+    else:
+        print(_c(failed_line, _Ansi.GREEN))
+    print(_c(f"Total tokens:        {stats.total_tokens}", _Ansi.BLUE))
+    print(_c(f"Total time:          {stats.total_time_s:.2f}s", _Ansi.BLUE))
+    print(_c(f"Avg latency:         {stats.avg_latency_ms:.2f}ms", _Ansi.BLUE))
+    print(_c(f"P50 latency:         {stats.p50_latency_ms:.2f}ms", _Ansi.BLUE))
+    print(_c(f"P90 latency:         {stats.p90_latency_ms:.2f}ms", _Ansi.BLUE))
+    print(_c(f"P99 latency:         {stats.p99_latency_ms:.2f}ms", _Ansi.BLUE))
+    print(_c(f"Throughput (req/s):  {stats.throughput_req_per_s:.2f}", _Ansi.MAGENTA))
+    print(_c(f"Throughput (tok/s):  {stats.throughput_tok_per_s:.2f}", _Ansi.MAGENTA))
+    print(_c("-" * 50, _Ansi.DIM))
 
 
-def compare_outputs(
-    runkv_results: list[RequestResult],
-    baseline_results: list[RequestResult],
-) -> tuple[int, int, list[str]]:
+def compare_outputs_multi(
+    result_sets: dict[str, list[RequestResult]],
+) -> None:
     """
-    Compare RunKV outputs with baseline outputs.
-
-    Returns:
-        (matching_count, mismatched_count, list of mismatch descriptions)
+    Compare outputs across multiple result sets (e.g. baseline, runkv, recompute).
+    Prints a per-request comparison for ALL requests with per-pair match status
+    and first-mismatch position for divergent pairs.
     """
-    baseline_map = {r.request_id: r for r in baseline_results}
+    if len(result_sets) < 2:
+        return
 
-    matching = 0
-    mismatched = 0
-    mismatches = []
+    labels = list(result_sets.keys())
+    # Build per-label maps
+    maps: dict[str, dict[str, RequestResult]] = {
+        label: {r.request_id: r for r in results}
+        for label, results in result_sets.items()
+    }
 
-    for runkv_result in runkv_results:
-        baseline_result = baseline_map.get(runkv_result.request_id)
-        if baseline_result is None:
-            continue
+    # Collect all request ids preserving first-seen order
+    all_ids: list[str] = []
+    seen: set[str] = set()
+    for results in result_sets.values():
+        for req_res in results:
+            if req_res.request_id not in seen:
+                all_ids.append(req_res.request_id)
+                seen.add(req_res.request_id)
+    all_ids.sort()
 
-        # Skip comparison if either failed
-        if not runkv_result.finished or not baseline_result.finished:
-            continue
+    # Compare pairwise
+    match_counts: dict[tuple[str, str], int] = {}
+    mismatch_counts: dict[tuple[str, str], int] = {}
+    for i, la in enumerate(labels):
+        for lb in labels[i + 1 :]:
+            match_counts[(la, lb)] = 0
+            mismatch_counts[(la, lb)] = 0
 
-        if runkv_result.output_text == baseline_result.output_text:
-            matching += 1
-        else:
-            mismatched += 1
-            mismatches.append(
-                f"Request {runkv_result.request_id}:\n"
-                f"  Prompt: {runkv_result.prompt[:50]}...\n"
-                f"  RunKV:    {runkv_result.output_text[:100]}...\n"
-                f"  Baseline: {baseline_result.output_text[:100]}..."
+    # Identify the baseline label (first entry) for per-pair annotations
+    baseline_label = labels[0]
+
+    print(_c("\n" + "=" * 80, _Ansi.DIM))
+    print(_c(f"Output Comparison ({' / '.join(labels)})", _Ansi.BOLD, _Ansi.CYAN))
+    print(_c("=" * 80, _Ansi.DIM))
+
+    for rid in all_ids:
+        outputs: dict[str, str] = {}
+        for label in labels:
+            maybe_res = maps[label].get(rid)
+            if maybe_res is None or not maybe_res.finished:
+                outputs[label] = "<not available>"
+            else:
+                outputs[label] = maybe_res.output_text
+
+        # Build per-pair match status (each non-baseline label vs baseline)
+        pair_statuses: dict[str, str] = {}  # label -> "MATCH" / "MISMATCH@token N"
+        pair_first_diff_token: dict[
+            str, int | None
+        ] = {}  # label -> first diff token idx
+        for label in labels[1:]:
+            base_r = maps[baseline_label].get(rid)
+            comp_r = maps[label].get(rid)
+            base_ids = base_r.token_ids if (base_r and base_r.token_ids) else []
+            comp_ids = comp_r.token_ids if (comp_r and comp_r.token_ids) else []
+            if base_ids == comp_ids:
+                pair_statuses[label] = "MATCH"
+                pair_first_diff_token[label] = None
+            else:
+                # Find first divergent token index
+                min_len = min(len(base_ids), len(comp_ids))
+                first_diff = min_len
+                for ti in range(min_len):
+                    if base_ids[ti] != comp_ids[ti]:
+                        first_diff = ti
+                        break
+                pair_first_diff_token[label] = first_diff
+                # Annotate with global decode index if traces available
+                comp_traces = comp_r.token_traces if comp_r else None
+                global_info = ""
+                if comp_traces and first_diff < len(comp_traces):
+                    g = comp_traces[first_diff].global_idx
+                    global_info = f", global#{g}"
+                pair_statuses[label] = f"MISMATCH@token {first_diff}{global_info}"
+
+        # Update pairwise counts (all pairs, not just vs baseline)
+        for i, la in enumerate(labels):
+            for lb in labels[i + 1 :]:
+                if outputs[la] == outputs[lb]:
+                    match_counts[(la, lb)] += 1
+                else:
+                    mismatch_counts[(la, lb)] += 1
+
+        # Get prompt from first available result
+        prompt = "<unknown>"
+        for label in labels:
+            maybe_res = maps[label].get(rid)
+            if maybe_res is not None:
+                prompt = maybe_res.prompt
+                break
+
+        # Build status line: e.g. "RunKV=MATCH | Recompute=MISMATCH@char 42"
+        status_parts = [f"{label}={pair_statuses[label]}" for label in labels[1:]]
+        all_match = all(s == "MATCH" for s in pair_statuses.values())
+        overall = "ALL MATCH" if all_match else " | ".join(status_parts)
+
+        print(f"\n[{_status_color(overall)}] {_c(rid, _Ansi.BOLD)}")
+        print(
+            _c(f"  Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}", _Ansi.DIM)
+        )
+
+        # Print baseline output
+        base_text = outputs[baseline_label]
+        print(
+            f"  {_c(f'{baseline_label:>12}', _Ansi.BOLD, _Ansi.CYAN)}: "
+            f"{base_text[:120]}{'...' if len(base_text) > 120 else ''}"
+        )
+
+        # Print each comparison label with match/mismatch annotation
+        for label in labels[1:]:
+            text = outputs[label]
+            tag = pair_statuses[label]
+            print(
+                f"  {_c(f'{label:>12}', _Ansi.BOLD, _Ansi.BLUE)}: "
+                f"{text[:120]}{'...' if len(text) > 120 else ''}"
+                f"  [{_status_color(tag)}]"
             )
 
-    return matching, mismatched, mismatches
+        # For mismatches, print token-level detail around the divergence point
+        for label in labels[1:]:
+            diff_idx = pair_first_diff_token.get(label)
+            if diff_idx is None:
+                continue  # MATCH
+
+            base_r = maps[baseline_label].get(rid)
+            comp_r = maps[label].get(rid)
+            base_ids = base_r.token_ids if (base_r and base_r.token_ids) else []
+            comp_ids = comp_r.token_ids if (comp_r and comp_r.token_ids) else []
+            comp_traces = comp_r.token_traces if comp_r else None
+
+            # Show a window of tokens around the divergence
+            ctx_before = 3
+            ctx_after = 5
+            start = max(0, diff_idx - ctx_before)
+            end = min(max(len(base_ids), len(comp_ids)), diff_idx + ctx_after + 1)
+
+            print(
+                _c(
+                    f"  --- Token detail ({baseline_label} vs {label})"
+                    f" around divergence at token {diff_idx} ---",
+                    _Ansi.YELLOW,
+                    _Ansi.BOLD,
+                )
+            )
+            print(
+                _c(
+                    f"  {'idx':>5} {'global':>7} | "
+                    f"{'baseline_tid':>13} {'compare_tid':>13} {'status':>10}",
+                    _Ansi.DIM,
+                )
+            )
+            for ti in range(start, end):
+                b_tid = base_ids[ti] if ti < len(base_ids) else "<eos>"
+                c_tid = comp_ids[ti] if ti < len(comp_ids) else "<eos>"
+
+                # Global decode index from the compare side
+                g_str = ""
+                if comp_traces and ti < len(comp_traces):
+                    g_str = str(comp_traces[ti].global_idx)
+
+                marker = " " if b_tid == c_tid else "<<"
+                arrow = " >>>>" if ti == diff_idx else ""
+                line = (
+                    f"  {ti:>5} {g_str:>7} | {str(b_tid):>13} {str(c_tid):>13}"
+                    f" {marker:>10}{arrow}"
+                )
+                if marker != " ":
+                    print(_c(line, _Ansi.RED))
+                else:
+                    print(line)
+
+    # Print summary
+    print(_c("\n" + "-" * 80, _Ansi.DIM))
+    print(_c("Pairwise Summary:", _Ansi.BOLD, _Ansi.CYAN))
+    for i, la in enumerate(labels):
+        for lb in labels[i + 1 :]:
+            m = match_counts[(la, lb)]
+            mm = mismatch_counts[(la, lb)]
+            line = f"  {la} vs {lb}: {m} match, {mm} mismatch"
+            if mm > 0:
+                print(_c(line, _Ansi.YELLOW))
+            else:
+                print(_c(line, _Ansi.GREEN))
+    print(_c("-" * 80, _Ansi.DIM))
 
 
 def run_benchmark(
@@ -816,16 +1074,19 @@ def run_benchmark(
                          (for nsys --capture-range=cudaProfilerApi)
         enable_layerwise_nvtx_tracing: If True, enable per-layer NVTX markers
     """
-    print(f"\n{'=' * 60}")
-    print(f"Running benchmark: {label or 'unnamed'}")
+    print(_c(f"\n{'=' * 60}", _Ansi.DIM))
+    print(_c(f"Running benchmark: {label or 'unnamed'}", _Ansi.BOLD, _Ansi.CYAN))
     if enable_profiling:
         print(
-            "[PROFILE] Profiling enabled - use nsys with"
-            " --capture-range=cudaProfilerApi"
+            _c(
+                "[PROFILE] Profiling enabled - use nsys with"
+                " --capture-range=cudaProfilerApi",
+                _Ansi.YELLOW,
+            )
         )
     if enable_layerwise_nvtx_tracing:
-        print("[PROFILE] Layer-wise NVTX tracing enabled")
-    print(f"{'=' * 60}")
+        print(_c("[PROFILE] Layer-wise NVTX tracing enabled", _Ansi.YELLOW))
+    print(_c(f"{'=' * 60}", _Ansi.DIM))
 
     with nvtx_range("build_engine", color="purple"):
         engine = _build_engine(
@@ -842,7 +1103,7 @@ def run_benchmark(
         # Verify RunKV is active if enabled
         if kv_offload_config.enabled:
             _assert_runkv_active(engine)
-            print("RunKV verification: PASSED")
+            print(_c("RunKV verification: PASSED", _Ansi.GREEN, _Ansi.BOLD))
 
         # Generate test requests
         requests = generate_test_requests(
@@ -853,10 +1114,10 @@ def run_benchmark(
             use_very_long_prompts=use_very_long_prompts,
             long_prompt_ratio=long_prompt_ratio,
         )
-        print(f"Generated {len(requests)} test requests")
+        print(_c(f"Generated {len(requests)} test requests", _Ansi.BLUE))
 
         # Run benchmark
-        print("Starting concurrent request processing...")
+        print(_c("Starting concurrent request processing...", _Ansi.BLUE))
         results, total_time = run_concurrent_requests(
             engine=engine,
             requests=requests,
@@ -880,8 +1141,8 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="~/hf_models/Qwen2.5-1.5B-Instruct",
-        help="HuggingFace model name (default: ~/hf_models/Qwen2.5-1.5B-Instruct)",
+        default="~/hf_models/opt-1.3b",
+        help="HuggingFace model name (default: ~/hf_models/opt-1.3b)",
     )
     parser.add_argument(
         "--num-requests",
@@ -910,13 +1171,13 @@ def main():
     parser.add_argument(
         "--cpu-memory-gb",
         type=float,
-        default=20.0,
+        default=30.0,
         help="CPU memory limit for RunKV in GB (default: 20.0)",
     )
     parser.add_argument(
         "--cpu-memory-fraction",
         type=float,
-        default=0.2,
+        default=0.3,
         help="CPU memory fraction for RunKV (default: 0.2)",
     )
     parser.add_argument(
@@ -1002,6 +1263,18 @@ def main():
         action="store_true",
         help="Enable per-layer NVTX markers for detailed profiling",
     )
+    parser.add_argument(
+        "--enable-layer-recompute",
+        action="store_true",
+        help="Run an additional benchmark with layer recompute enabled",
+    )
+    parser.add_argument(
+        "--layer-recompute-io-prefix-blocks",
+        type=int,
+        nargs="+",
+        default=[19900],
+        help="IO prefix blocks per layer for recompute (default: [19900])",
+    )
 
     args = parser.parse_args()
 
@@ -1010,9 +1283,9 @@ def main():
     if args.profile or args.enable_layerwise_nvtx_tracing:
         os.environ.setdefault("VLLM_NVTX_SCOPES_FOR_PROFILING", "1")
 
-    print("=" * 60, flush=True)
-    print("RunKV High-Concurrency E2E Test", flush=True)
-    print("=" * 60, flush=True)
+    print(_c("=" * 60, _Ansi.DIM), flush=True)
+    print(_c("RunKV High-Concurrency E2E Test", _Ansi.BOLD, _Ansi.CYAN), flush=True)
+    print(_c("=" * 60, _Ansi.DIM), flush=True)
 
     # Expand and validate model path
     args.model = os.path.expandvars(os.path.expanduser(args.model))
@@ -1024,9 +1297,12 @@ def main():
         model_path = Path(args.model)
         if model_path.is_dir() and not (model_path / "config.json").exists():
             print(
-                f"Model path looks local but missing config.json: {args.model}\n"
-                "Pass a valid local HF directory (must contain config.json), "
-                "or pass a HuggingFace repo id like 'namespace/repo_name'."
+                _c(
+                    f"Model path looks local but missing config.json: {args.model}\n"
+                    "Pass a valid local HF directory (must contain config.json), "
+                    "or pass a HuggingFace repo id like 'namespace/repo_name'.",
+                    _Ansi.RED,
+                )
             )
             sys.exit(1)
 
@@ -1045,24 +1321,30 @@ def main():
 
     # Stress test mode increases parameters
     if args.stress_test:
-        print("\n*** STRESS TEST MODE ***")
+        print(_c("\n*** STRESS TEST MODE ***", _Ansi.YELLOW, _Ansi.BOLD))
         args.num_requests = max(args.num_requests, 500)
         args.use_long_prompts = True
         args.use_very_long_prompts = True
         args.max_tokens = max(args.max_tokens, 512)
         args.long_prompt_ratio = 0.5
         print(
-            f"Adjusted: num_requests={args.num_requests}, max_tokens={args.max_tokens}"
+            _c(
+                f"Adjusted: num_requests={args.num_requests}, "
+                f"max_tokens={args.max_tokens}",
+                _Ansi.YELLOW,
+            )
         )
         print(
-            "          use_very_long_prompts=True, "
-            f"long_prompt_ratio={args.long_prompt_ratio}"
+            _c(
+                "          use_very_long_prompts=True, "
+                f"long_prompt_ratio={args.long_prompt_ratio}",
+                _Ansi.YELLOW,
+            )
         )
 
     # Run baseline if requested
     baseline_results: list[RequestResult] | None = None
     baseline_stats: BenchmarkStats | None = None
-    mismatched = 0
     if args.compare_baseline:
         baseline_config = RunKVOffloadConfig(enabled=False)
         baseline_results, baseline_stats = run_benchmark(
@@ -1089,8 +1371,8 @@ def main():
         enabled=True,
         num_device_buffers=args.num_device_buffers,
         gpu_memory_fraction=args.gpu_memory_fraction,
-        enable_async_prefetch=True,
-        enable_async_offload=True,
+        enable_async_prefetch=False,
+        enable_async_offload=False,
         cpu_memory_limit=cpu_limit_bytes,
         cpu_memory_fraction=args.cpu_memory_fraction,
         max_staging_blocks=(args.max_staging_blocks or None),
@@ -1117,93 +1399,168 @@ def main():
         enable_layerwise_nvtx_tracing=args.enable_layerwise_nvtx_tracing,
     )
 
-    # Compare results if baseline was run
+    # Run Recompute benchmark (if requested)
+    recompute_results: list[RequestResult] | None = None
+    recompute_stats: BenchmarkStats | None = None
+    if args.enable_layer_recompute:
+        recompute_config = RunKVOffloadConfig(
+            enabled=True,
+            num_device_buffers=args.num_device_buffers,
+            gpu_memory_fraction=args.gpu_memory_fraction,
+            enable_async_prefetch=True,
+            enable_async_offload=True,
+            cpu_memory_limit=cpu_limit_bytes,
+            cpu_memory_fraction=args.cpu_memory_fraction,
+            max_staging_blocks=(args.max_staging_blocks or None),
+            enable_layer_recompute=True,
+            layer_recompute_io_prefix_blocks=args.layer_recompute_io_prefix_blocks,
+        )
+        recompute_results, recompute_stats = run_benchmark(
+            model_name=args.model,
+            num_requests=args.num_requests,
+            min_tokens=args.min_tokens,
+            max_tokens=args.max_tokens,
+            max_model_len=args.max_model_len,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_steps=args.max_steps,
+            max_num_seqs=args.max_num_seqs,
+            use_long_prompts=args.use_long_prompts,
+            use_very_long_prompts=args.use_very_long_prompts,
+            long_prompt_ratio=args.long_prompt_ratio,
+            kv_offload_config=recompute_config,
+            label="RunKV + Layer Recompute",
+            verbose=args.verbose,
+            enable_profiling=args.profile,
+            enable_layerwise_nvtx_tracing=args.enable_layerwise_nvtx_tracing,
+        )
+
+    # Compare outputs across all available modes
+    result_sets: dict[str, list[RequestResult]] = {}
     if baseline_results is not None:
-        assert baseline_stats is not None
-        print("\n" + "=" * 60)
-        print("Output Comparison: RunKV vs Baseline")
-        print("=" * 60)
+        result_sets["Baseline"] = baseline_results
+    result_sets["RunKV"] = runkv_results
+    if recompute_results is not None:
+        result_sets["Recompute"] = recompute_results
 
-        matching, mismatched, mismatch_details = compare_outputs(
-            runkv_results, baseline_results
-        )
+    if len(result_sets) >= 2:
+        compare_outputs_multi(result_sets)
 
-        print(f"Matching outputs:   {matching}")
-        print(f"Mismatched outputs: {mismatched}")
+    def fmt_diff(
+        baseline_val: float, compare_val: float, higher_is_better: bool = True
+    ) -> str:
+        if baseline_val == 0:
+            return "N/A"
+        diff_pct = ((compare_val - baseline_val) / baseline_val) * 100
+        if not higher_is_better:
+            diff_pct = -diff_pct
+        sign = "+" if diff_pct >= 0 else ""
+        return f"{sign}{diff_pct:.1f}%"
 
-        if mismatched > 0:
-            print("\nFirst 5 mismatches:")
-            for detail in mismatch_details[:5]:
-                print(detail)
-                print()
-
-        # Performance comparison
-        print("\n" + "=" * 60)
-        print("Performance Comparison")
-        print("=" * 60)
-        print(f"{'Metric':<25} {'Baseline':>15} {'RunKV':>15} {'Diff':>15}")
-        print("-" * 70)
-
-        def fmt_diff(
-            baseline: float, runkv: float, higher_is_better: bool = True
-        ) -> str:
-            if baseline == 0:
-                return "N/A"
-            diff_pct = ((runkv - baseline) / baseline) * 100
-            if not higher_is_better:
-                diff_pct = -diff_pct
-            sign = "+" if diff_pct >= 0 else ""
-            return f"{sign}{diff_pct:.1f}%"
-
-        baseline_req_s = baseline_stats.throughput_req_per_s
-        runkv_req_s = runkv_stats.throughput_req_per_s
+    def _print_perf_comparison(
+        label_a: str,
+        stats_a: BenchmarkStats,
+        label_b: str,
+        stats_b: BenchmarkStats,
+    ) -> None:
+        print(_c(f"\n{'=' * 80}", _Ansi.DIM))
         print(
-            f"{'Throughput (req/s)':<25} "
-            f"{baseline_req_s:>15.2f} "
-            f"{runkv_req_s:>15.2f} "
-            f"{fmt_diff(baseline_req_s, runkv_req_s):>15}"
+            _c(
+                f"Performance Comparison: {label_a} vs {label_b}",
+                _Ansi.BOLD,
+                _Ansi.CYAN,
+            )
         )
-        baseline_tok_s = baseline_stats.throughput_tok_per_s
-        runkv_tok_s = runkv_stats.throughput_tok_per_s
+        print(_c(f"{'=' * 80}", _Ansi.DIM))
         print(
-            f"{'Throughput (tok/s)':<25} "
-            f"{baseline_tok_s:>15.2f} "
-            f"{runkv_tok_s:>15.2f} "
-            f"{fmt_diff(baseline_tok_s, runkv_tok_s):>15}"
+            _c(f"{'Metric':<25} {label_a:>15} {label_b:>15} {'Diff':>15}", _Ansi.BOLD)
         )
-        baseline_avg_ms = baseline_stats.avg_latency_ms
-        runkv_avg_ms = runkv_stats.avg_latency_ms
-        print(
-            f"{'Avg latency (ms)':<25} "
-            f"{baseline_avg_ms:>15.2f} "
-            f"{runkv_avg_ms:>15.2f} "
-            f"{fmt_diff(baseline_avg_ms, runkv_avg_ms, higher_is_better=False):>15}"
-        )
-        baseline_p99_ms = baseline_stats.p99_latency_ms
-        runkv_p99_ms = runkv_stats.p99_latency_ms
-        print(
-            f"{'P99 latency (ms)':<25} "
-            f"{baseline_p99_ms:>15.2f} "
-            f"{runkv_p99_ms:>15.2f} "
-            f"{fmt_diff(baseline_p99_ms, runkv_p99_ms, higher_is_better=False):>15}"
-        )
+        print(_c("-" * 70, _Ansi.DIM))
+        for metric, attr, hib in [
+            ("Throughput (req/s)", "throughput_req_per_s", True),
+            ("Throughput (tok/s)", "throughput_tok_per_s", True),
+            ("Avg latency (ms)", "avg_latency_ms", False),
+            ("P50 latency (ms)", "p50_latency_ms", False),
+            ("P90 latency (ms)", "p90_latency_ms", False),
+            ("P99 latency (ms)", "p99_latency_ms", False),
+        ]:
+            va = getattr(stats_a, attr)
+            vb = getattr(stats_b, attr)
+            diff = fmt_diff(va, vb, higher_is_better=hib)
+            if diff == "N/A":
+                diff_colored = _c(diff, _Ansi.DIM)
+            elif diff.startswith("-"):
+                diff_colored = _c(diff, _Ansi.RED)
+            else:
+                diff_colored = _c(diff, _Ansi.GREEN)
+            print(f"{metric:<25} {va:>15.2f} {vb:>15.2f} {diff_colored:>15}")
+
+    # ---------- Baseline vs RunKV comparison ----------
+    if baseline_results is not None and baseline_stats is not None:
+        _print_perf_comparison("Baseline", baseline_stats, "RunKV", runkv_stats)
+
+    # ---------- RunKV vs Recompute comparison ----------
+    if recompute_stats is not None:
+        _print_perf_comparison("RunKV", runkv_stats, "Recompute", recompute_stats)
+
+    # ---------- Baseline vs Recompute comparison ----------
+    if baseline_stats is not None and recompute_stats is not None:
+        _print_perf_comparison("Baseline", baseline_stats, "Recompute", recompute_stats)
 
     # Final summary
-    print("\n" + "=" * 60)
-    print("Test Summary")
-    print("=" * 60)
+    print(_c("\n" + "=" * 60, _Ansi.DIM))
+    print(_c("Test Summary", _Ansi.BOLD, _Ansi.CYAN))
+    print(_c("=" * 60, _Ansi.DIM))
 
-    success = runkv_stats.failed_requests == 0
-    if success:
-        print(f"✓ All {runkv_stats.completed_requests} requests completed successfully")
-    else:
-        print(f"✗ {runkv_stats.failed_requests} requests failed")
+    success = True
 
-    if baseline_results is not None and mismatched > 0:
+    # RunKV summary
+    if runkv_stats.failed_requests == 0:
         print(
-            f"⚠ {mismatched} output mismatches detected (may be expected with sampling)"
+            _c(
+                f"✓ RunKV: All {runkv_stats.completed_requests} requests completed",
+                _Ansi.GREEN,
+                _Ansi.BOLD,
+            )
+        )
+    else:
+        print(
+            _c(
+                f"✗ RunKV: {runkv_stats.failed_requests} requests failed",
+                _Ansi.RED,
+                _Ansi.BOLD,
+            )
         )
         success = False
+
+    # Recompute summary
+    if recompute_stats is not None:
+        if recompute_stats.failed_requests == 0:
+            print(
+                _c(
+                    f"✓ Recompute: All {recompute_stats.completed_requests}"
+                    " requests completed",
+                    _Ansi.GREEN,
+                    _Ansi.BOLD,
+                )
+            )
+        else:
+            print(
+                _c(
+                    f"✗ Recompute: {recompute_stats.failed_requests} requests failed",
+                    _Ansi.RED,
+                    _Ansi.BOLD,
+                )
+            )
+            success = False
+
+    if baseline_results is not None:
+        print(
+            _c(
+                "⚠ Check output comparison above for mismatches"
+                " (may be expected with sampling)",
+                _Ansi.YELLOW,
+            )
+        )
 
     sys.exit(0 if success else 1)
 
