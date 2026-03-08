@@ -433,23 +433,69 @@ Step 1 单元测试运行方式：
 
 **目标**：在 model runner 初始化时，对新模式做 phase-1 约束检查。
 
+**实现状态**：已完成
+
 **改动文件**：
 - `vllm/v1/worker/gpu_model_runner.py`
   - 在 RunKV 初始化路径中（现有 `_init_runkv_*` 系列方法附近），新增校验逻辑
   - 校验项：
-    1. 模型必须是 OPT（检查 `model.__class__.__name__` 包含 "OPT"）
+    1. 模型必须是 OPT
     2. 必须是 pre-LN（`config.do_layer_norm_before == True`）
-    3. 只能单机单卡运行（TP / PP / DCP 全部为 1 或关闭）
+    3. 只能单机单卡运行（TP / PP / DP / DCP 全部为 1 或关闭）
     4. 只有单 KV cache group（`len(self.kv_cache_config.kv_cache_groups) == 1`）
     5. cudagraph 模式为 NONE
     6. cascade attention、ubatching 全部关闭
   - 不满足任一条件 → `raise ValueError` 带明确错误信息
 
+**实际改动**：
+- 已在 `vllm/v1/worker/gpu_model_runner.py` 中新增 `_validate_prev_layer_output_dynamic_mode(...)`
+- 该校验函数会在 `_maybe_init_layer_recompute_manager(...)` 中被调用
+- 已校验以下条件：
+  - `hf_config.model_type == "opt"`
+  - `hf_config.do_layer_norm_before is True`
+  - `tensor_parallel_size == pipeline_parallel_size == data_parallel_size == decode_context_parallel_size == 1`
+  - `len(kv_cache_config.kv_cache_groups) == 1`
+  - `compilation_config.cudagraph_mode == CUDAGraphMode.NONE`
+  - `cascade_attn_enabled == False`
+  - `parallel_config.use_ubatching == False`
+- 由于 Step 3+ 的执行路径还没接入，当前在通过前置校验后会继续 `fail-fast`：
+  - `layer_recompute_mode="prev_layer_output_dynamic"` 目前会显式抛出 `NotImplementedError`
+  - 这样可以避免用户选择新模式后悄悄落回旧的 `io_hidden_states` 路径
+- 已补单元测试：
+  - `tests/v1/kv_offload/test_layer_recompute_manager.py`
+  - 覆盖支持路径、各类拒绝路径，以及当前阶段的 fail-fast 行为
+
+**如何使用**：
+
+当前阶段，`prev_layer_output_dynamic` 的使用语义是：
+- 不满足 phase-1 约束时，初始化阶段直接报 `ValueError`
+- 满足所有 phase-1 约束时，初始化阶段报 `NotImplementedError`
+- `io_hidden_states` 旧模式不受影响
+
+可以用下面的命令验证前置校验已经接通：
+
+```bash
+vllm serve MODEL_PATH \
+  --enable-runkv \
+  --runkv-enable-layer-recompute \
+  --runkv-layer-recompute-mode prev_layer_output_dynamic
+```
+
+在当前 step 下，这条命令的预期结果不是成功运行，而是：
+- unsupported 配置 → 明确的 `ValueError`
+- supported 配置 → 明确的 `NotImplementedError`
+
+Step 2 单元测试运行方式：
+
+```bash
+./.venv/bin/python -m pytest -q tests/v1/kv_offload/test_layer_recompute_manager.py -k 'prev_layer_output_dynamic or dynamic_mode_fails_fast_until_execution_path_is_implemented'
+```
+
 **验证方式**：
 - 传 `prev_layer_output_dynamic` + 非 OPT 模型 → 报错且消息明确
 - 传 `prev_layer_output_dynamic` + cudagraph 打开 → 报错
-- 传 `prev_layer_output_dynamic` + TP / PP 打开 → 报错
-- 传 `prev_layer_output_dynamic` + OPT pre-LN + eager → 通过校验
+- 传 `prev_layer_output_dynamic` + TP / PP / DP / DCP 打开 → 报错
+- 传 `prev_layer_output_dynamic` + OPT pre-LN + eager + 其他前提都满足 → 当前阶段 `NotImplementedError`
 
 **依赖**：Step 1
 

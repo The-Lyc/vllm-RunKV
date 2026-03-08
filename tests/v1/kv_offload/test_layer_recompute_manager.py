@@ -9,6 +9,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.config import CUDAGraphMode
 from vllm.v1.core.kv_cache_offload_config import RunKVOffloadConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -184,6 +185,133 @@ def test_normalize_io_prefix_blocks_rejects_negative_values() -> None:
 
     with pytest.raises(ValueError, match="must be >= 0"):
         runner._normalize_layer_recompute_io_prefix_blocks(3)
+
+
+def _make_dynamic_mode_runner(
+    *,
+    model_type: str = "opt",
+    do_layer_norm_before: bool = True,
+    tp: int = 1,
+    pp: int = 1,
+    dp: int = 1,
+    dcp: int = 1,
+    cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    cascade_attn_enabled: bool = False,
+    use_ubatching: bool = False,
+) -> GPUModelRunner:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.use_runkv = True
+    runner.layer_recompute_enabled = False
+    runner.layer_recompute_manager = None
+    runner.kv_offload_config = RunKVOffloadConfig(
+        enabled=True,
+        enable_layer_recompute=True,
+        layer_recompute_io_prefix_blocks=[4],
+        layer_recompute_mode="prev_layer_output_dynamic",
+    )
+    runner.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            model_type=model_type,
+            do_layer_norm_before=do_layer_norm_before,
+        )
+    )
+    runner.parallel_config = SimpleNamespace(
+        tensor_parallel_size=tp,
+        pipeline_parallel_size=pp,
+        data_parallel_size=dp,
+        decode_context_parallel_size=dcp,
+        use_ubatching=use_ubatching,
+    )
+    runner.compilation_config = SimpleNamespace(cudagraph_mode=cudagraph_mode)
+    runner.cascade_attn_enabled = cascade_attn_enabled
+    return runner
+
+
+def test_validate_prev_layer_output_dynamic_mode_accepts_phase1_config() -> None:
+    runner = _make_dynamic_mode_runner()
+
+    runner._validate_prev_layer_output_dynamic_mode(
+        SimpleNamespace(kv_cache_groups=[object()])
+    )
+
+
+def test_validate_prev_layer_output_dynamic_mode_rejects_non_opt() -> None:
+    runner = _make_dynamic_mode_runner(model_type="llama")
+
+    with pytest.raises(ValueError, match="supports only OPT models"):
+        runner._validate_prev_layer_output_dynamic_mode(
+            SimpleNamespace(kv_cache_groups=[object()])
+        )
+
+
+def test_validate_prev_layer_output_dynamic_mode_rejects_post_ln_opt() -> None:
+    runner = _make_dynamic_mode_runner(do_layer_norm_before=False)
+
+    with pytest.raises(ValueError, match="supports only pre-LN OPT models"):
+        runner._validate_prev_layer_output_dynamic_mode(
+            SimpleNamespace(kv_cache_groups=[object()])
+        )
+
+
+@pytest.mark.parametrize(
+    ("tp", "pp", "dp", "dcp"),
+    [(2, 1, 1, 1), (1, 2, 1, 1), (1, 1, 2, 1), (1, 1, 1, 2)],
+)
+def test_validate_prev_layer_output_dynamic_mode_rejects_parallelism(
+    tp: int, pp: int, dp: int, dcp: int
+) -> None:
+    runner = _make_dynamic_mode_runner(tp=tp, pp=pp, dp=dp, dcp=dcp)
+
+    with pytest.raises(ValueError, match="requires single-device execution"):
+        runner._validate_prev_layer_output_dynamic_mode(
+            SimpleNamespace(kv_cache_groups=[object()])
+        )
+
+
+def test_validate_prev_layer_output_dynamic_mode_rejects_multi_kv_group() -> None:
+    runner = _make_dynamic_mode_runner()
+
+    with pytest.raises(ValueError, match="supports exactly one KV cache group"):
+        runner._validate_prev_layer_output_dynamic_mode(
+            SimpleNamespace(kv_cache_groups=[object(), object()])
+        )
+
+
+def test_validate_prev_layer_output_dynamic_mode_rejects_cudagraph() -> None:
+    runner = _make_dynamic_mode_runner(cudagraph_mode=CUDAGraphMode.PIECEWISE)
+
+    with pytest.raises(ValueError, match="requires cudagraph_mode=NONE"):
+        runner._validate_prev_layer_output_dynamic_mode(
+            SimpleNamespace(kv_cache_groups=[object()])
+        )
+
+
+def test_validate_prev_layer_output_dynamic_mode_rejects_cascade_attention() -> None:
+    runner = _make_dynamic_mode_runner(cascade_attn_enabled=True)
+
+    with pytest.raises(ValueError, match="requires cascade attention to be disabled"):
+        runner._validate_prev_layer_output_dynamic_mode(
+            SimpleNamespace(kv_cache_groups=[object()])
+        )
+
+
+def test_validate_prev_layer_output_dynamic_mode_rejects_ubatching() -> None:
+    runner = _make_dynamic_mode_runner(use_ubatching=True)
+
+    with pytest.raises(ValueError, match="requires ubatching to be disabled"):
+        runner._validate_prev_layer_output_dynamic_mode(
+            SimpleNamespace(kv_cache_groups=[object()])
+        )
+
+
+def test_dynamic_mode_fails_fast_until_execution_path_is_implemented() -> None:
+    runner = _make_dynamic_mode_runner()
+
+    with pytest.raises(NotImplementedError, match="not implemented yet"):
+        runner._maybe_init_layer_recompute_manager(
+            SimpleNamespace(kv_cache_groups=[object()]),
+            group_block_sizes=[16],
+        )
 
 
 def test_prepare_layer_recompute_step_metadata_caches_arrays_and_calls_manager():

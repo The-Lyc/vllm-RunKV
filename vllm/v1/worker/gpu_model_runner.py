@@ -7108,6 +7108,73 @@ class GPUModelRunner(
             )
         return normalized
 
+    def _validate_prev_layer_output_dynamic_mode(
+        self,
+        kv_cache_config: KVCacheConfig,
+    ) -> None:
+        """Validate phase-1 prerequisites for prev-layer-output dynamic replay."""
+        mode = getattr(
+            self.kv_offload_config, "layer_recompute_mode", "io_hidden_states"
+        )
+        if mode != "prev_layer_output_dynamic":
+            return
+
+        hf_config = self.model_config.hf_config
+        model_type = getattr(hf_config, "model_type", "")
+        if model_type != "opt":
+            raise ValueError(
+                "RunKV layer_recompute_mode='prev_layer_output_dynamic' "
+                f"currently supports only OPT models; got model_type={model_type!r}."
+            )
+
+        if not bool(getattr(hf_config, "do_layer_norm_before", False)):
+            raise ValueError(
+                "RunKV layer_recompute_mode='prev_layer_output_dynamic' "
+                "currently supports only pre-LN OPT models "
+                "(hf_config.do_layer_norm_before must be True)."
+            )
+
+        parallel_config = self.parallel_config
+        if any(
+            int(getattr(parallel_config, field_name, 1)) != 1
+            for field_name in (
+                "tensor_parallel_size",
+                "pipeline_parallel_size",
+                "data_parallel_size",
+                "decode_context_parallel_size",
+            )
+        ):
+            raise ValueError(
+                "RunKV layer_recompute_mode='prev_layer_output_dynamic' "
+                "requires single-device execution "
+                "(TP/PP/DP/DCP sizes must all be 1)."
+            )
+
+        if len(kv_cache_config.kv_cache_groups) != 1:
+            raise ValueError(
+                "RunKV layer_recompute_mode='prev_layer_output_dynamic' "
+                "currently supports exactly one KV cache group; "
+                f"got {len(kv_cache_config.kv_cache_groups)}."
+            )
+
+        if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            raise ValueError(
+                "RunKV layer_recompute_mode='prev_layer_output_dynamic' "
+                "requires cudagraph_mode=NONE."
+            )
+
+        if self.cascade_attn_enabled:
+            raise ValueError(
+                "RunKV layer_recompute_mode='prev_layer_output_dynamic' "
+                "requires cascade attention to be disabled."
+            )
+
+        if self.parallel_config.use_ubatching:
+            raise ValueError(
+                "RunKV layer_recompute_mode='prev_layer_output_dynamic' "
+                "requires ubatching to be disabled."
+            )
+
     def _maybe_init_layer_recompute_manager(
         self,
         kv_cache_config: KVCacheConfig,
@@ -7127,6 +7194,14 @@ class GPUModelRunner(
             self.layer_recompute_manager = None
             self.layer_recompute_enabled = False
             return
+
+        self._validate_prev_layer_output_dynamic_mode(kv_cache_config)
+        if self.kv_offload_config.layer_recompute_mode == "prev_layer_output_dynamic":
+            raise NotImplementedError(
+                "RunKV layer_recompute_mode='prev_layer_output_dynamic' "
+                "passed prerequisite validation, but the execution path is "
+                "not implemented yet."
+            )
 
         if len(kv_cache_config.kv_cache_groups) != 1:
             raise ValueError(
