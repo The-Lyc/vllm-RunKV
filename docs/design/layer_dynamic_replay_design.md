@@ -592,6 +592,8 @@ Step 3 验证命令：
 
 **目标**：定义决策模块接口，提供 phase-1 默认实现。replay plan 的**决策逻辑**由独立模块负责，本 step 只定义接口和测试用的 stub。
 
+**实现状态**：已完成
+
 **额外约束**：
 - provider 可以先产生 token 级的 `desired_replay_start_token`
 - 但在返回最终 `LayerReplayPlan` 之前，必须向下对齐到 block 边界，得到有效的 `kv_replay_start_per_req`
@@ -632,27 +634,30 @@ Step 3 验证命令：
     ```python
     class RandomReplayPlanProvider:
         """每层随机生成 desired_replay_start_token，再对齐到 block。"""
-        def __init__(self, num_layers: int, max_tokens: int, seed: int = 42):
-            rng = np.random.default_rng(seed)
-            self._random_start_tokens = [
-                rng.integers(0, max_tokens + 1)
-                for _ in range(num_layers)
-            ]
+        def __init__(
+            self,
+            num_layers: int,
+            max_tokens: int | None = None,
+            max_blocks: int | None = None,
+            seed: int = 42,
+        ):
+            ...
         
         def get_layer_plan(self, layer_idx, ...):
-            # 使用 self._random_start_tokens[layer_idx]，并向下对齐到 block 边界
+            # 使用缓存的 token 级随机起点，并向下对齐到 block 边界
             ...
     ```
   - `compute_layer_replay_plan_for_layer()` 核心函数（被两个 provider 共用）：
     ```python
     def compute_layer_replay_plan_for_layer(
+        *,
         layer_idx: int,
-        io_prefix_blocks_for_layer: int,
+        desired_replay_start_tokens: int | np.ndarray,
         computed_lens: np.ndarray,
         scheduled_lens: np.ndarray,
         logical_block_tables: np.ndarray,
         block_size: int,
-        mapper_mapping: dict[int, int],
+        mapper_mapping: Mapping[int, int],
         prev_layer_plan: LayerReplayPlan | None,
     ) -> LayerReplayPlan:
     ```
@@ -666,7 +671,65 @@ Step 3 验证命令：
       7. 记录 `cpu_fill_positions` / `cpu_fill_logical_ids` / `cpu_fill_block_offsets`
       8. 记录 `gpu_reuse_slice_per_req`
 
-**验证方式**：（见 Step 9 单元测试，使用 RandomReplayPlanProvider 生成随机 plan 验证算法）
+**实际改动**：
+- 已扩展 `vllm/v1/worker/opt_dynamic_replay.py`
+  - 为 `ReplayPlanProvider` 增加 `@runtime_checkable`，便于单元测试中直接做 Protocol 兼容性检查
+  - 新增 `compute_layer_replay_plan_for_layer()`
+    - 支持 token 级 `desired_replay_start_tokens`
+    - 在构造 `LayerReplayPlan` 前先按 request clip 到 `computed_len`，再向下对齐到 block 边界
+    - 计算 `prev_gpu_start_per_req`、`cpu_fill_*`、`gpu_reuse_slice_per_req`
+    - 生成 `query_start_loc`、`slot_mapping`、`combined_replay_indices`、`combined_scheduled_indices`
+  - 新增 `StaticReplayPlanProvider`
+    - 输入固定 `io_prefix_blocks`
+    - 对超出列表长度的 layer 继续沿用现有 recompute 的语义：默认 `io_prefix_blocks=0`
+  - 新增 `RandomReplayPlanProvider`
+    - 用固定 seed 生成 token 级随机 replay 起点
+    - 对外支持 `max_tokens`，也兼容 `max_blocks` 形式的上界
+- 已新增单元测试文件 `tests/v1/kv_offload/test_opt_dynamic_replay_plan.py`
+  - 覆盖 block 对齐
+  - 覆盖当前层比上一层更短 / 更长时的 CPU fill 与 GPU reuse 划分
+  - 覆盖 `slot_mapping`、`query_start_loc`、pack / unpack 索引
+  - 覆盖静态 / 随机 provider 的 Protocol 兼容性与确定性
+
+**如何使用**：
+- 直接构造静态 provider：
+  ```python
+  from vllm.v1.worker.opt_dynamic_replay import StaticReplayPlanProvider
+  
+  provider = StaticReplayPlanProvider(io_prefix_blocks=[2, 4, 4, 8])
+  ```
+- 直接构造随机 provider（仅测试用）：
+  ```python
+  from vllm.v1.worker.opt_dynamic_replay import RandomReplayPlanProvider
+  
+  provider = RandomReplayPlanProvider(num_layers=8, max_tokens=128, seed=42)
+  ```
+- 单独调用 plan 计算函数：
+  ```python
+  from vllm.v1.worker.opt_dynamic_replay import (
+      compute_layer_replay_plan_for_layer,
+  )
+  
+  plan = compute_layer_replay_plan_for_layer(
+      layer_idx=0,
+      desired_replay_start_tokens=19,  # token 级输入
+      computed_lens=computed_lens,
+      scheduled_lens=scheduled_lens,
+      logical_block_tables=logical_block_tables,
+      block_size=16,
+      mapper_mapping=mapper_mapping,
+      prev_layer_plan=None,
+  )
+  # plan.kv_replay_start_per_req 会先被 block-align
+  ```
+
+**验证方式**：
+
+Step 4 验证命令：
+
+```bash
+./.venv/bin/python -m pytest -q tests/v1/kv_offload/test_opt_dynamic_replay_plan.py
+```
 
 **依赖**：Step 3
 
