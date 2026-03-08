@@ -23,6 +23,7 @@ from vllm.engine.arg_utils import (
     parse_type,
 )
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.v1.core.kv_cache_offload_config import RunKVOffloadConfig
 
 
 @pytest.mark.parametrize(
@@ -548,6 +549,7 @@ def test_runkv_layer_recompute_cli_to_config():
         runkv_enable_layer_recompute=True,
         runkv_layer_recompute_io_prefix_blocks="4,12,24",
         runkv_layer_recompute_measure_overhead=True,
+        runkv_layer_recompute_mode="prev_layer_output_dynamic",
     )
     config = engine_args._build_kv_offload_config()
 
@@ -555,6 +557,91 @@ def test_runkv_layer_recompute_cli_to_config():
     assert config.enable_layer_recompute is True
     assert config.layer_recompute_io_prefix_blocks == [4, 12, 24]
     assert config.layer_recompute_measure_overhead is True
+    assert config.layer_recompute_mode == "prev_layer_output_dynamic"
+
+
+def test_runkv_layer_recompute_mode_parser_rejects_invalid_value():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser(exit_on_error=False))
+    with pytest.raises(ArgumentError, match="invalid choice"):
+        parser.parse_args(["--runkv-layer-recompute-mode", "bad-mode"])
+
+
+def test_runkv_layer_recompute_mode_defaults_to_io_hidden_states():
+    engine_args = EngineArgs(
+        model="/home/lyc/hf_models/opt-1.3b",
+        enable_runkv=True,
+    )
+    config = engine_args._build_kv_offload_config()
+    assert config.layer_recompute_mode == "io_hidden_states"
+
+
+def test_runkv_layer_recompute_mode_cli_round_trip():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--model",
+            "/home/lyc/hf_models/opt-1.3b",
+            "--enable-runkv",
+            "--runkv-enable-layer-recompute",
+            "--runkv-layer-recompute-mode",
+            "prev_layer_output_dynamic",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args)
+    config = engine_args._build_kv_offload_config()
+
+    assert engine_args.runkv_layer_recompute_mode == "prev_layer_output_dynamic"
+    assert config.layer_recompute_mode == "prev_layer_output_dynamic"
+
+
+def test_runkv_layer_recompute_mode_validation_rejects_invalid_value():
+    engine_args = EngineArgs(
+        model="/home/lyc/hf_models/opt-1.3b",
+        enable_runkv=True,
+        runkv_layer_recompute_mode="bad-mode",
+    )
+    with pytest.raises(ValueError, match="Invalid --runkv-layer-recompute-mode"):
+        engine_args._build_kv_offload_config()
+
+
+def test_runkv_layer_recompute_mode_from_kv_offload_config_dict():
+    engine_args = EngineArgs(
+        model="/home/lyc/hf_models/opt-1.3b",
+        kv_offload_config={
+            "enabled": True,
+            "enable_layer_recompute": True,
+            "layer_recompute_mode": "prev_layer_output_dynamic",
+        },
+    )
+    config = engine_args._build_kv_offload_config()
+    assert config.layer_recompute_mode == "prev_layer_output_dynamic"
+
+
+def test_runkv_layer_recompute_mode_from_kv_offload_config_object():
+    config_obj = RunKVOffloadConfig(
+        enabled=True,
+        enable_layer_recompute=True,
+        layer_recompute_mode="prev_layer_output_dynamic",
+    )
+    engine_args = EngineArgs(
+        model="/home/lyc/hf_models/opt-1.3b",
+        kv_offload_config=config_obj,
+    )
+    config = engine_args._build_kv_offload_config()
+    assert config.layer_recompute_mode == "prev_layer_output_dynamic"
+
+
+def test_runkv_layer_recompute_mode_from_kv_offload_config_dict_rejects_invalid():
+    engine_args = EngineArgs(
+        model="/home/lyc/hf_models/opt-1.3b",
+        kv_offload_config={
+            "enabled": True,
+            "enable_layer_recompute": True,
+            "layer_recompute_mode": "bad-mode",
+        },
+    )
+    with pytest.raises(ValueError, match="Invalid --runkv-layer-recompute-mode"):
+        engine_args._build_kv_offload_config()
 
 
 def test_runkv_layer_recompute_prefix_blocks_parser_rejects_empty_segment():
@@ -579,6 +666,7 @@ def test_runkv_fields_are_preserved_by_from_cli_args():
         runkv_enable_layer_recompute=True,
         runkv_layer_recompute_io_prefix_blocks="6,12",
         runkv_layer_recompute_measure_overhead=True,
+        runkv_layer_recompute_mode="prev_layer_output_dynamic",
     )
     engine_args = EngineArgs.from_cli_args(args)
 
@@ -591,3 +679,4 @@ def test_runkv_fields_are_preserved_by_from_cli_args():
     assert engine_args.runkv_enable_layer_recompute is True
     assert engine_args.runkv_layer_recompute_io_prefix_blocks == "6,12"
     assert engine_args.runkv_layer_recompute_measure_overhead is True
+    assert engine_args.runkv_layer_recompute_mode == "prev_layer_output_dynamic"

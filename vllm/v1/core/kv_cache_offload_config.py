@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass, field
+from typing import Literal
 
 
 @dataclass
@@ -49,3 +50,8 @@ class RunKVOffloadConfig:
 
     # Emit additional recompute vs IO overlap timing metrics.
     layer_recompute_measure_overhead: bool = False
+
+    # Replay input source mode for layer recompute.
+    layer_recompute_mode: Literal["io_hidden_states", "prev_layer_output_dynamic"] = (
+        "io_hidden_states"
+    )

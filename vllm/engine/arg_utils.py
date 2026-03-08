@@ -589,6 +589,9 @@ class EngineArgs:
     runkv_enable_layer_recompute: bool = False
     runkv_layer_recompute_io_prefix_blocks: str = ""
     runkv_layer_recompute_measure_overhead: bool = False
+    runkv_layer_recompute_mode: Literal[
+        "io_hidden_states", "prev_layer_output_dynamic"
+    ] = "io_hidden_states"
 
     # RunKV layer-wise KV cache offload configuration
     kv_offload_config: RunKVOffloadConfig | dict[str, Any] | None = None
@@ -1022,6 +1025,14 @@ class EngineArgs:
             action="store_true",
             default=False,
             help="Enable extra timing metrics for layer recompute overhead.",
+        )
+        runkv_group.add_argument(
+            "--runkv-layer-recompute-mode",
+            type=str,
+            choices=["io_hidden_states", "prev_layer_output_dynamic"],
+            default="io_hidden_states",
+            help="Replay input source mode for RunKV layer recompute. "
+            "Default: io_hidden_states",
         )
 
         # Multimodal related configs
@@ -1865,6 +1876,9 @@ class EngineArgs:
                         config.layer_recompute_io_prefix_blocks
                     )
                 )
+            config.layer_recompute_mode = self._validate_runkv_layer_recompute_mode(
+                config.layer_recompute_mode
+            )
             return config
 
         # Build from individual CLI arguments
@@ -1892,6 +1906,9 @@ class EngineArgs:
             ),
             layer_recompute_measure_overhead=(
                 self.runkv_layer_recompute_measure_overhead
+            ),
+            layer_recompute_mode=self._validate_runkv_layer_recompute_mode(
+                self.runkv_layer_recompute_mode
             ),
         )
 
@@ -1921,6 +1938,18 @@ class EngineArgs:
                 "Invalid --runkv-layer-recompute-io-prefix-blocks: "
                 f"expected comma-separated integers, got '{raw_value}'."
             ) from e
+
+    @staticmethod
+    def _validate_runkv_layer_recompute_mode(
+        raw_value: str,
+    ) -> Literal["io_hidden_states", "prev_layer_output_dynamic"]:
+        allowed = ("io_hidden_states", "prev_layer_output_dynamic")
+        if raw_value not in allowed:
+            raise ValueError(
+                "Invalid --runkv-layer-recompute-mode: "
+                f"expected one of {allowed}, got '{raw_value}'."
+            )
+        return cast(Literal["io_hidden_states", "prev_layer_output_dynamic"], raw_value)
 
     def _check_feature_supported(self, model_config: ModelConfig):
         """Raise an error if the feature is not supported."""

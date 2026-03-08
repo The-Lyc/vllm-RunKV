@@ -479,6 +479,7 @@ class TestRunKVOffloadConfig:
         assert config.gpu_memory_fraction == 0.1
         assert config.enable_async_prefetch is True
         assert config.enable_async_offload is True
+        assert config.layer_recompute_mode == "io_hidden_states"
 
     def test_custom_config(self):
         """Test custom configuration."""
@@ -490,6 +491,7 @@ class TestRunKVOffloadConfig:
             max_staging_blocks=256,
             gpu_memory_fraction=0.2,
             enable_async_prefetch=False,
+            layer_recompute_mode="prev_layer_output_dynamic",
         )
 
         assert config.enabled is True
@@ -497,6 +499,7 @@ class TestRunKVOffloadConfig:
         assert config.max_staging_blocks == 256
         assert config.gpu_memory_fraction == 0.2
         assert config.enable_async_prefetch is False
+        assert config.layer_recompute_mode == "prev_layer_output_dynamic"
 
 
 class TestRunKVMemorySizing:
