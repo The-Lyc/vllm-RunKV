@@ -418,5 +418,13 @@ class OPTDynamicReplayRuntime:
     def set_layer_metadata(self, layer_idx: int, metadata: dict[str, Any]) -> None:
         self._per_layer_attn_metadata[layer_idx] = metadata
 
+    def get_layer_metadata(self, layer_idx: int) -> dict[str, Any]:
+        metadata = self._per_layer_attn_metadata[layer_idx]
+        assert metadata is not None
+        return metadata
+
     def current_layer_plan(self, layer_idx: int) -> LayerReplayPlan | None:
         return self._layer_plans[layer_idx]
+
+    def current_layer_metadata(self, layer_idx: int) -> dict[str, Any] | None:
+        return self._per_layer_attn_metadata[layer_idx]

@@ -162,6 +162,7 @@ from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.layer_recompute import LayerRecomputeManager
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.opt_dynamic_replay import LayerReplayPlan
 from vllm.v1.worker.runkv_debug import (
     DebugWriter,
     StepRecord,
@@ -3132,6 +3133,79 @@ class GPUModelRunner(
             )
 
         return attn_metadata, spec_decode_common_attn_metadata
+
+    def _build_layer_attn_metadata(
+        self,
+        layer_idx: int,
+        plan: LayerReplayPlan,
+        prev_plan: LayerReplayPlan | None,
+        prev_metadata: AttnMetadataDict | None,
+        base_seq_lens: torch.Tensor,
+        base_max_seq_len: int,
+        block_table_tensor: torch.Tensor,
+        num_reqs: int,
+    ) -> AttnMetadataDict:
+        if (
+            prev_metadata is not None
+            and prev_plan is not None
+            and plan.num_actual_tokens == prev_plan.num_actual_tokens
+            and plan.max_query_len == prev_plan.max_query_len
+            and torch.equal(plan.query_start_loc, prev_plan.query_start_loc)
+            and torch.equal(plan.slot_mapping, prev_plan.slot_mapping)
+        ):
+            return prev_metadata
+
+        if base_seq_lens.ndim != 1:
+            raise ValueError(
+                f"base_seq_lens must be 1D, got shape={tuple(base_seq_lens.shape)}."
+            )
+        if base_seq_lens.shape[0] < num_reqs:
+            raise ValueError(
+                f"base_seq_lens has length {base_seq_lens.shape[0]} but num_reqs is "
+                f"{num_reqs}."
+            )
+
+        query_start_loc_cpu = plan.query_start_loc[: num_reqs + 1]
+        if query_start_loc_cpu.device.type != "cpu":
+            query_start_loc_cpu = query_start_loc_cpu.cpu()
+        seq_lens_cpu = base_seq_lens[:num_reqs]
+        if seq_lens_cpu.device.type != "cpu":
+            seq_lens_cpu = seq_lens_cpu.cpu()
+
+        common_attn_metadata = CommonAttentionMetadata(
+            query_start_loc=query_start_loc_cpu.to(self.device, non_blocking=True),
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens=seq_lens_cpu.to(self.device, non_blocking=True),
+            _seq_lens_cpu=seq_lens_cpu,
+            _num_computed_tokens_cpu=seq_lens_cpu
+            - (query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]),
+            num_reqs=num_reqs,
+            num_actual_tokens=plan.num_actual_tokens,
+            max_query_len=plan.max_query_len,
+            max_seq_len=base_max_seq_len,
+            block_table_tensor=block_table_tensor[:num_reqs].to(
+                self.device, non_blocking=True
+            ),
+            slot_mapping=plan.slot_mapping.to(self.device, non_blocking=True),
+            causal=True,
+        )
+
+        attn_metadata: AttnMetadataDict = {}
+        for attn_group in self.attn_groups[0]:
+            builder = attn_group.get_metadata_builder()
+            attn_metadata_i = builder.build(
+                common_prefix_len=0,
+                common_attn_metadata=common_attn_metadata,
+            )
+            for layer_name in attn_group.layer_names:
+                attn_metadata[layer_name] = attn_metadata_i
+
+        if not attn_metadata:
+            raise ValueError(
+                f"No attention metadata was built for layer_idx={layer_idx}."
+            )
+
+        return attn_metadata
 
     def _compute_cascade_attn_prefix_lens(
         self,

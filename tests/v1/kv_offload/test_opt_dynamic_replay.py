@@ -88,7 +88,9 @@ def test_opt_dynamic_replay_runtime_stores_layer_plan_and_metadata() -> None:
     runtime.set_layer_metadata(1, metadata)
 
     assert runtime.get_layer_plan(1) is plan
+    assert runtime.get_layer_metadata(1) is metadata
     assert runtime.current_layer_plan(0) is None
+    assert runtime.current_layer_metadata(0) is None
     assert runtime._per_layer_attn_metadata[1] is metadata
 
 

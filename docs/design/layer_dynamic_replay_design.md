@@ -99,6 +99,9 @@
 metadata 构造方式：
 
 - 复用现有 attention builder，但对每层单独构造 `CommonAttentionMetadata`
+- metadata 不是在 step 开始前遍历所有层一次性构造出来的
+- 原因是 replay plan 由实时负载驱动的 provider 在运行时逐层产生，layer `i+1` 的有效 plan 只有在 layer `i` 的 pre-hook 中调用 `provider.get_layer_plan(i+1, ...)` 后才能确定
+- 因此 layer `i+1` 的 metadata 也必须在同一个 pre-hook 中立刻构造出来，并在发起 layer `i+1` 的 IO prefix KV / CPU hidden-state H2D 之前写入 runtime
 - `seq_lens`、`max_seq_len`、`block_table_tensor` 在各层共享
 - 每层变化的只有：
   - `query_start_loc`
@@ -163,16 +166,17 @@ step 开始前：
 - IO prefix blocks 的 KV 加载和 replay hidden states 的 H2D 都在 pre-hook 中流水线式完成
 - 新方案移除 pre-hook 中的 `recompute_kv_for_layer()` 调用（replay suffix 的 KV 改由主干 forward 的 `reshape_and_cache` 产出）
 - 新 pre-hook 执行流程（layer i 的 pre-hook）：
-  1. `mapper.sync_load_layer(i)` — 等待 layer i 的 IO prefix KV 加载完成（由上一层 pre-hook 发起的异步加载）
-  2. 等待 layer i 的 replay hidden states H2D 完成（如果有 cpu_fill）
-  3. 调用 `provider.get_layer_plan(i+1, ...)` — 获取 layer i+1 的 replay 计划
-  4. `compute_skip_block_ids_for_layer(i+1)` — 根据 layer i+1 的 plan 计算 suffix blocks
-  5. `mapper.load_layer_async(i+1, skip_block_ids)` — 异步启动 layer i+1 的 IO prefix KV 加载
-  6. `load_cpu_fill_h2d(i+1, plan)` — 异步启动 layer i+1 的 replay hidden states H2D（如果 layer i+1 有 cpu_fill）
-  7. 构造 layer i+1 的 attention metadata（或复用上一层的，如果 replay 窗口相同）
+  1. 调用 `provider.get_layer_plan(i+1, ...)` — 获取 layer i+1 的 replay 计划
+  2. 构造 layer i+1 的 attention metadata（或复用上一层的，如果 replay 窗口相同）
+  3. `mapper.sync_load_layer(i)` — 等待 layer i 的 IO prefix KV 加载完成（由上一层 pre-hook 发起的异步加载）
+  4. 等待 layer i 的 replay hidden states H2D 完成（如果有 cpu_fill）
+  5. `compute_skip_block_ids_for_layer(i+1)` — 根据 layer i+1 的 plan 计算 suffix blocks
+  6. `mapper.load_layer_async(i+1, skip_block_ids)` — 异步启动 layer i+1 的 IO prefix KV 加载
+  7. `load_cpu_fill_h2d(i+1, plan)` — 异步启动 layer i+1 的 replay hidden states H2D（如果 layer i+1 有 cpu_fill）
 - 特殊处理：
-  - Step 开始前（layer 0 进入 forward 之前）：获取 layer 0 的 plan，启动 layer 0 的 IO prefix 加载和 H2D
+  - Step 开始前（layer 0 进入 forward 之前）：获取 layer 0 的 plan，构造 layer 0 的 metadata，然后启动 layer 0 的 IO prefix 加载和 H2D
   - 最后一层 pre-hook：只做 sync，不再预取下一层
+- 这样 `get_plan(i+1)` 和 `build_meta(i+1)` 这两个纯控制面操作，就可以与 layer i 数据尚未完全到达的等待阶段并行，减少 pre-hook 的纯等待时间
 - 移除的旧逻辑：
   - `prefetch_recompute_inputs_for_layer()` — 不再在 pre-hook 中做旧模式的 H2D 拷贝
   - `recompute_kv_for_layer()` — 不再在 pre-hook 中做 QKV projection
@@ -248,22 +252,22 @@ phase-1 提供两个默认实现：
 replay plan 的获取不是在 step 开始前一次性全部计算完成，而是 **流水线式逐层获取**：
 
 1. Step 开始前：调用 `provider.get_layer_plan(0, ...)` 获取 layer 0 的 plan
-   - 根据 layer 0 的 plan，构造 layer 0 的 attention metadata
-   - 如果 layer 0 有 cpu_fill，启动 layer 0 的 hidden states H2D
+   - 立即根据 layer 0 的 plan，构造 layer 0 的 attention metadata
+   - 然后再启动 layer 0 的 IO prefix KV 加载和 hidden states H2D（如果 layer 0 有 cpu_fill）
 2. Layer 0 的 pre-hook 中：
-   - 等待 layer 0 的 IO prefix KV 加载完成
    - 调用 `provider.get_layer_plan(1, ...)` 获取 layer 1 的 plan
-   - 根据 layer 1 的 plan：
+   - 立即构造 layer 1 的 attention metadata
+   - 然后再等待 layer 0 的 IO prefix KV 加载和 hidden states H2D 完成
+   - 然后再根据 layer 1 的 plan：
      - 异步启动 layer 1 的 IO prefix KV 加载（`mapper.load_layer_async`）
      - 如果 layer 1 有 cpu_fill，异步启动 layer 1 的 hidden states H2D（`load_cpu_fill_h2d`）
-     - 构造 layer 1 的 attention metadata
 3. Layer i 的 pre-hook 中（通用模式）：
-   - 等待 layer i 的 IO prefix KV 加载完成（`mapper.sync_load_layer(i)`）
-   - 等待 layer i 的 hidden states H2D 完成（如果有）
    - 调用 `provider.get_layer_plan(i+1, ...)` 获取 layer i+1 的 plan
+   - 立即构造 layer i+1 的 attention metadata
+   - 然后再等待 layer i 的 IO prefix KV 加载完成（`mapper.sync_load_layer(i)`）
+   - 等待 layer i 的 hidden states H2D 完成（如果有）
    - 异步启动 layer i+1 的 IO prefix KV 加载
    - 异步启动 layer i+1 的 hidden states H2D（如果 layer i+1 有 cpu_fill）
-   - 构造 layer i+1 的 attention metadata
 4. 最后一层的 pre-hook：
    - 只等待自己的数据加载完成，不再预取
 
@@ -737,23 +741,28 @@ Step 4 验证命令：
 
 #### Step 5: per-layer attention metadata 构造
 
-**目标**：为每层构造独立的 `CommonAttentionMetadata` 并 build 成 backend-specific metadata。
+**目标**：基于单层 `LayerReplayPlan` 即时构造该层独立的 `CommonAttentionMetadata`，并在 pre-hook 中逐层写入 runtime。
+
+**实现状态**：已完成
 
 **改动文件**：
 - `vllm/v1/worker/gpu_model_runner.py`
-  - 新增方法 `_build_per_layer_attn_metadata()`：
+  - 新增方法 `_build_layer_attn_metadata()`：
     ```python
-    def _build_per_layer_attn_metadata(
+    def _build_layer_attn_metadata(
         self,
-        layer_plans: list[LayerReplayPlan],
+        layer_idx: int,
+        plan: LayerReplayPlan,
+        prev_plan: LayerReplayPlan | None,
+        prev_metadata: dict[str, AttentionMetadata] | None,
         base_seq_lens: torch.Tensor,
         base_max_seq_len: int,
         block_table_tensor: torch.Tensor,
         num_reqs: int,
-    ) -> list[dict[str, AttentionMetadata]]:
+    ) -> dict[str, AttentionMetadata]:
     ```
   - 实现逻辑：
-    1. 遍历每层 plan
+    1. 接收当前刚生成的单层 plan，而不是遍历所有层的 plan
     2. 构造该层的 `CommonAttentionMetadata`：
        - `query_start_loc` = plan.query_start_loc
        - `num_actual_tokens` = plan.num_actual_tokens
@@ -763,11 +772,63 @@ Step 4 验证命令：
     3. 检查是否与上一层 metadata 参数相同：
        - 相同 → 直接复用上一层 metadata dict
        - 不同 → 调用 `builder.build()` 生成新 metadata
-    4. 返回 `list[dict[str, metadata]]`，索引 = layer_idx
+    4. 该方法在 layer `i` 的 pre-hook 中调用，用来准备 layer `i+1` 的 metadata
+    5. metadata 一经生成，立即写入 runtime；随后同一个 pre-hook 才发起 layer `i+1` 的 KV/HS 传输
+- `vllm/v1/worker/opt_dynamic_replay.py`
+  - `OPTDynamicReplayRuntime` 新增：
+    - `get_layer_metadata(layer_idx)`
+    - `current_layer_metadata(layer_idx)`
+- `tests/v1/kv_offload/test_opt_dynamic_replay_metadata.py`（新文件）
+  - 覆盖 `_build_layer_attn_metadata()` 的单元测试
+
+**实际改动**：
+- 已在 `vllm/v1/worker/gpu_model_runner.py` 中实现 `_build_layer_attn_metadata()`
+  - 输入为单层 `plan`，而不是完整的 plan 列表
+  - 根据 `plan.query_start_loc / plan.slot_mapping / plan.num_actual_tokens / plan.max_query_len` 构造单层 `CommonAttentionMetadata`
+  - 将 `base_seq_lens` 和 `block_table_tensor` 作为共享基底传入
+  - 遍历 `self.attn_groups[0]`，调用对应 builder 的 `build(common_prefix_len=0, ...)`
+  - 若当前 plan 与上一层 plan 的 `query_start_loc / slot_mapping / num_actual_tokens / max_query_len` 完全一致，则直接复用上一层 metadata 对象，不重复 build
+- 已在 `vllm/v1/worker/opt_dynamic_replay.py` 中补 runtime metadata 读接口
+  - `get_layer_metadata()`：强断言读取
+  - `current_layer_metadata()`：可空读取
+- 已新增 Step 5 单元测试：
+  - metadata 复用
+  - metadata 重建
+  - `CommonAttentionMetadata` 字段正确性
+  - 基于真实 plan 的 replay 窗口变化测试
+  - 基于真实 plan 的 `cpu_fill / gpu_reuse` 比例变化测试
+  - 非法 `base_seq_lens` 形状报错
+  - runtime metadata getter 行为
+
+**如何使用**：
+- 在新模式下，拿到 layer `i+1` 的 `LayerReplayPlan` 后，直接调用：
+  ```python
+  metadata = self._build_layer_attn_metadata(
+      layer_idx=i + 1,
+      plan=next_plan,
+      prev_plan=runtime.current_layer_plan(i),
+      prev_metadata=runtime.current_layer_metadata(i),
+      base_seq_lens=base_seq_lens,
+      base_max_seq_len=base_max_seq_len,
+      block_table_tensor=block_table_tensor,
+      num_reqs=num_reqs,
+  )
+  runtime.set_layer_metadata(i + 1, metadata)
+  ```
+- 如果 layer `i+1` 与 layer `i` 的 replay 窗口没有变化，这个 helper 会直接返回上一层的 metadata 对象。
 
 **验证方式**：
-- 构造两层plan，第二层与第一层replay窗口相同 → 验证复用同一metadata对象
-- 构造两层plan，第二层replay窗口不同 → 验证生成不同metadata
+- 构造 layer `i` 和 layer `i+1` 的两份 plan，第二层与第一层 replay 窗口相同 → 验证复用同一 metadata 对象
+- 构造两份 replay 窗口不同的 plan → 验证生成不同 metadata
+- 构造两份 replay 窗口相同但 `cpu_fill / gpu_reuse` 比例不同的真实 plan → 验证仍复用同一 metadata 对象
+- 验证 `_build_layer_attn_metadata()` 不依赖“完整的 per-layer plan 列表”，只依赖当前 layer 的 plan 和上一层 metadata
+
+Step 5 验证命令：
+
+```bash
+./.venv/bin/python -m pytest -q tests/v1/kv_offload/test_opt_dynamic_replay_metadata.py
+./.venv/bin/python -m pytest -q tests/v1/kv_offload/test_opt_dynamic_replay.py tests/v1/kv_offload/test_opt_dynamic_replay_plan.py
+```
 
 **依赖**：Step 4
 
@@ -911,52 +972,59 @@ Step 4 验证命令：
     - 初始化时根据 config 选择 `StaticReplayPlanProvider`（默认）或将来的自定义 provider
   - 在 `_execute_model_step()` 或等价方法中，新模式下：
     1. 调用 `provider.get_layer_plan(0, ...)` 获取 layer 0 的 plan
-    2. 启动 layer 0 的 IO prefix KV 异步加载
-    3. 启动 layer 0 的 replay hidden states H2D（如果有 cpu_fill）
-    4. 构造 layer 0 的 attention metadata
+    2. 构造 layer 0 的 attention metadata
+    3. 启动 layer 0 的 IO prefix KV 异步加载
+    4. 启动 layer 0 的 replay hidden states H2D（如果有 cpu_fill）
     5. 构造 `OPTDynamicReplayRuntime`（初始只含 layer 0 的 plan/metadata）并赋值到 `ForwardContext`
   - 重写 `_runkv_pre_hook()` 的新模式分支：
     ```python
     if self.kv_offload_config.layer_recompute_mode == "prev_layer_output_dynamic":
         runtime = get_forward_context().layer_recompute_runtime
         
-        # 1. 等待当前层(i)的数据就绪
-        mapper.sync_load_layer(layer_idx)                    # IO prefix KV
-        manager.sync_cpu_fill_h2d(layer_idx)                 # replay HS（如果有）
-        
-        # 2. 获取下一层(i+1)的 replay plan
-        if layer_idx + 1 < num_layers:
-            next_plan = self.replay_plan_provider.get_layer_plan(
-                layer_idx=layer_idx + 1,
-                ...,
-                prev_layer_plan=runtime.current_layer_plan(layer_idx),
-            )
-            runtime.set_layer_plan(layer_idx + 1, next_plan)
-            
-            # 3. 异步启动下一层(i+1)的数据预取
-            next_skip_blocks = manager.compute_skip_block_ids_for_layer(
-                layer_idx + 1, next_plan)
-            mapper.load_layer_async(
-                next_layer_name, layer_idx + 1,
-                skip_block_ids=next_skip_blocks)
-            
-            if next_plan.cpu_fill_token_count > 0:
-                manager.load_cpu_fill_h2d_async(
+            # 1. 先获取下一层(i+1)的 replay plan
+            if layer_idx + 1 < num_layers:
+                next_plan = self.replay_plan_provider.get_layer_plan(
+                    layer_idx=layer_idx + 1,
+                    ...,
+                    prev_layer_plan=runtime.current_layer_plan(layer_idx),
+                )
+                runtime.set_layer_plan(layer_idx + 1, next_plan)
+
+                # 2. 立即构造下一层(i+1)的 attention metadata
+                next_metadata = self._build_layer_attn_metadata(
+                    layer_idx=layer_idx + 1,
+                    plan=next_plan,
+                    prev_plan=runtime.current_layer_plan(layer_idx),
+                    prev_metadata=runtime._per_layer_attn_metadata[layer_idx],
+                    base_seq_lens=base_seq_lens,
+                    ...,
+                )
+                runtime.set_layer_metadata(layer_idx + 1, next_metadata)
+
+            # 3. 再等待当前层(i)的数据就绪
+            mapper.sync_load_layer(layer_idx)                    # IO prefix KV
+            manager.sync_cpu_fill_h2d(layer_idx)                 # replay HS（如果有）
+
+            # 4. 然后异步启动下一层(i+1)的数据预取
+            if layer_idx + 1 < num_layers:
+                next_skip_blocks = manager.compute_skip_block_ids_for_layer(
                     layer_idx + 1, next_plan)
-            
-            # 4. 构造下一层(i+1)的 attention metadata
-            next_metadata = self._build_layer_attn_metadata(
-                next_plan, base_seq_lens, ...)
-            runtime.set_layer_metadata(layer_idx + 1, next_metadata)
+                mapper.load_layer_async(
+                    next_layer_name, layer_idx + 1,
+                    skip_block_ids=next_skip_blocks)
+                
+                if next_plan.cpu_fill_token_count > 0:
+                    manager.load_cpu_fill_h2d_async(
+                        layer_idx + 1, next_plan)
         
         return  # 不做 recompute_kv_for_layer
     ```
 
 **流水线重叠效果**：
 ```
-Layer i pre-hook:  sync(i) → get_plan(i+1) → async_load(i+1) → build_meta(i+1)
+Layer i pre-hook:  get_plan(i+1) → build_meta(i+1) → sync(i) → async_load(i+1)
 Layer i forward:   [GPU compute layer i]  ← 与 layer i+1 的 IO/H2D 并行
-Layer i+1 pre-hook: sync(i+1) → get_plan(i+2) → async_load(i+2) → ...
+Layer i+1 pre-hook: get_plan(i+2) → build_meta(i+2) → sync(i+1) → async_load(i+2) → ...
 ```
 
 **验证方式**：
