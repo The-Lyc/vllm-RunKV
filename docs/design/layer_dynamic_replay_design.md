@@ -505,6 +505,8 @@ Step 2 单元测试运行方式：
 
 **目标**：定义核心数据结构，不含任何构造逻辑。
 
+**实现状态**：已完成
+
 **改动文件**：
 - `vllm/v1/worker/opt_dynamic_replay.py`（新文件）
   - 定义 `LayerReplayPlan` dataclass：
@@ -557,9 +559,30 @@ Step 2 单元测试运行方式：
 - `vllm/forward_context.py`
   - `ForwardContext` 新增可选字段：`layer_recompute_runtime: OPTDynamicReplayRuntime | None = None`
 
+**实际改动**：
+- 已新增 `vllm/v1/worker/opt_dynamic_replay.py`
+  - 定义了 `LayerReplayPlan`
+  - 定义了最小可用的 `ReplayPlanProvider` Protocol，供 runtime 类型标注和后续 Step 4 provider 实现复用
+  - 定义了 `OPTDynamicReplayRuntime`
+    - 初始化时按 `num_layers` 分配 `_layer_plans` / `_per_layer_attn_metadata`
+    - 提供 `get_layer_plan()` / `set_layer_plan()` / `set_layer_metadata()` / `current_layer_plan()`
+- 已扩展 `vllm/forward_context.py`
+  - `ForwardContext` 新增 `layer_recompute_runtime` 字段
+  - `create_forward_context()` 新增同名可选参数，默认不影响现有调用方
+- 已补单元测试：
+  - `tests/v1/kv_offload/test_opt_dynamic_replay.py`
+  - 覆盖 runtime 初始化、plan/metadata 写入读取、未设置 layer 的断言，以及 `ForwardContext` 挂载 runtime
+
 **验证方式**：
 - 导入不报错
 - dataclass 可正常实例化
+
+Step 3 验证命令：
+
+```bash
+./.venv/bin/python -c "from vllm.v1.worker.opt_dynamic_replay import LayerReplayPlan, OPTDynamicReplayRuntime, ReplayPlanProvider"
+./.venv/bin/pytest -q tests/v1/kv_offload/test_opt_dynamic_replay.py
+```
 
 **依赖**：无（可与 Step 1/2 并行）
 
