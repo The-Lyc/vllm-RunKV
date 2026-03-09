@@ -400,6 +400,9 @@ class OPTDynamicReplayRuntime:
     num_layers: int
     cpu_hs_store: torch.Tensor
     replay_plan_provider: ReplayPlanProvider
+    layer_recompute_manager: Any | None = None
+    scheduled_req_indices: np.ndarray | None = None
+    scheduled_positions: np.ndarray | None = None
     _layer_plans: list[LayerReplayPlan | None] = field(init=False)
     _per_layer_attn_metadata: list[dict[str, Any] | None] = field(init=False)
 
@@ -428,3 +431,68 @@ class OPTDynamicReplayRuntime:
 
     def current_layer_metadata(self, layer_idx: int) -> dict[str, Any] | None:
         return self._per_layer_attn_metadata[layer_idx]
+
+    def set_capture_token_metadata(
+        self,
+        *,
+        req_indices: np.ndarray,
+        positions: np.ndarray,
+    ) -> None:
+        req_indices_np = np.asarray(req_indices, dtype=np.int64)
+        positions_np = np.asarray(positions, dtype=np.int64)
+        if req_indices_np.ndim != 1 or positions_np.ndim != 1:
+            raise ValueError("req_indices and positions must both be 1D arrays.")
+        if req_indices_np.shape != positions_np.shape:
+            raise ValueError(
+                "req_indices and positions must have the same shape, got "
+                f"{req_indices_np.shape} and {positions_np.shape}."
+            )
+        self.scheduled_req_indices = req_indices_np
+        self.scheduled_positions = positions_np
+
+    def load_cpu_fill(self, layer_idx: int, plan: LayerReplayPlan) -> torch.Tensor:
+        manager = self.layer_recompute_manager
+        if manager is None:
+            raise AssertionError("Dynamic replay runtime requires a layer manager.")
+
+        prefetched = manager.sync_cpu_fill_h2d(layer_idx)
+        if prefetched is not None:
+            return prefetched
+
+        return manager.load_cpu_fill_h2d(
+            layer_idx=layer_idx,
+            cpu_fill_positions=plan.cpu_fill_positions,
+            cpu_fill_logical_ids=plan.cpu_fill_logical_ids,
+            cpu_fill_block_offsets=plan.cpu_fill_block_offsets,
+        )
+
+    def capture_scheduled_layer_input(
+        self,
+        *,
+        target_layer_idx: int,
+        hidden_states: torch.Tensor,
+    ) -> None:
+        if target_layer_idx >= self.num_layers:
+            return
+
+        manager = self.layer_recompute_manager
+        if manager is None:
+            raise AssertionError("Dynamic replay runtime requires a layer manager.")
+        if self.scheduled_req_indices is None or self.scheduled_positions is None:
+            raise AssertionError(
+                "Dynamic replay runtime requires scheduled req_indices and "
+                "positions before capture."
+            )
+        if hidden_states.shape[0] != self.scheduled_req_indices.shape[0]:
+            raise ValueError(
+                "scheduled hidden_states row count must match scheduled token "
+                f"metadata, got {hidden_states.shape[0]} and "
+                f"{self.scheduled_req_indices.shape[0]}."
+            )
+
+        manager.capture_layer_input_d2h(
+            layer_idx=target_layer_idx,
+            hidden_states=hidden_states,
+            req_indices=self.scheduled_req_indices,
+            positions=self.scheduled_positions,
+        )

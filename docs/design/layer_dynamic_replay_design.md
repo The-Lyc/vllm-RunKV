@@ -949,83 +949,78 @@ Step 6 验证命令：
 
 **目标**：在 `OPTDecoder.forward` 中增加动态 replay 路径。这是最核心的 step。
 
+**实现状态**：已完成（model/runtime 侧；runner 集成仍在 Step 8）
+
 **改动文件**：
 - `vllm/model_executor/models/opt.py`
-  - `OPTDecoder.forward` 修改：
-    ```python
-    def forward(self, ...):
-        # ... existing embed + pos + project_in ...
-        
-        runtime = get_forward_context().layer_recompute_runtime
-        if runtime is not None:
-            return self._forward_dynamic_replay(hidden_states, runtime)
-        
-        # ... existing layer loop (unchanged) ...
-    ```
-  - 新增 `OPTDecoder._forward_dynamic_replay()`：
-    ```python
-    def _forward_dynamic_replay(self, hidden_states, runtime):
-        scheduled_hs = hidden_states  # [scheduled_tokens, hidden_size]
-        replay_hs = None              # 上一层的 replay 输出（layer 0 无）
-        
-        for layer_idx, layer in enumerate(self.layers[start:end]):
-            # plan 和 metadata 由 pre-hook 逐层填充到 runtime 中
-            # layer 0 的 plan 在 step 开始前已准备好
-            # layer i>0 的 plan 在 layer i-1 的 pre-hook 中准备好
-            plan = runtime.get_layer_plan(layer_idx)
-            
-            if plan.replay_token_count == 0:
-                # 该层无 replay，直接走原 layer forward
-                # 设置该层 attn_metadata 到 forward context
-                _set_layer_attn_metadata(runtime, layer_idx)
-                scheduled_hs = layer(scheduled_hs)
-                # 捕获 scheduled_hs → CPU store for next layer
-                runtime.capture_layer_output(layer_idx, scheduled_hs)
-                replay_hs = None
-                continue
-            
-            # 1. 构造当前层 replay 输入
-            cpu_fill_hs = None
-            if plan.cpu_fill_token_count > 0:
-                cpu_fill_hs = runtime.load_cpu_fill(layer_idx, plan)
-            
-            gpu_reuse_hs = None
-            if plan.gpu_reuse_token_count > 0 and replay_hs is not None:
-                gpu_reuse_hs = _slice_gpu_reuse(replay_hs, plan)
-            
-            current_replay_input = _concat_replay_input(cpu_fill_hs, gpu_reuse_hs)
-            
-            # 2. Pack: replay + scheduled → combined
-            combined_hs = torch.empty(
-                plan.num_actual_tokens, hidden_size, ...)
-            combined_hs[plan.combined_replay_indices] = current_replay_input
-            combined_hs[plan.combined_scheduled_indices] = scheduled_hs
-            
-            # 3. 设置该层 attn_metadata，执行 layer forward
-            _set_layer_attn_metadata(runtime, layer_idx)
-            combined_out = layer(combined_hs)
-            
-            # 4. Unpack: combined → replay + scheduled
-            replay_hs = combined_out[plan.combined_replay_indices]
-            scheduled_hs = combined_out[plan.combined_scheduled_indices]
-            
-            # 5. 捕获 scheduled → CPU store
-            runtime.capture_layer_output(layer_idx, scheduled_hs)
-        
-        # final_layer_norm + project_out（只对 scheduled_hs）
-        if self.final_layer_norm is not None:
-            scheduled_hs = self.final_layer_norm(scheduled_hs)
-        if self.project_out is not None:
-            scheduled_hs = self.project_out(scheduled_hs)
-        return scheduled_hs
-    ```
+- `vllm/v1/worker/opt_dynamic_replay.py`
+- `tests/v1/kv_offload/test_opt_dynamic_replay_forward.py`
+- `tests/v1/kv_offload/test_opt_dynamic_replay.py`
+
+**实际改动**：
+- 已在 `OPTDecoder.forward()` 中接入 dynamic replay 分支：
+  - 当 `get_forward_context().layer_recompute_runtime is not None` 时，改走 `_forward_dynamic_replay(hidden_states)`
+  - 否则保持原有 OPT forward 路径不变
+- 已新增 `OPTDecoder._forward_dynamic_replay()`：
+  - 维护两条运行时数据流：
+    - `scheduled_hidden_states`
+    - `replay_hidden_states`
+  - layer 0 开始前，先把当前 step 的 scheduled token 输入 capture 到 `store[0]`
+  - 每层根据 `runtime.get_layer_plan(layer_idx)`：
+    - 若 `plan.replay_token_count == 0`，直接对 `scheduled_hidden_states` 跑原 layer forward
+    - 否则先从 runtime 取 `cpu_fill_hs`，再与上一层 `replay_hidden_states` 按 request 交错组装成当前层 replay 输入
+    - 再按 `combined_replay_indices / combined_scheduled_indices` pack 成 `combined_hidden_states`
+    - 单次 layer forward 后，再 unpack 回 `replay_hidden_states / scheduled_hidden_states`
+  - 每层结束后，只 capture `scheduled_hidden_states` 到下一层的 CPU store；replay 输出只在 GPU 上层间传递
+  - decoder 末尾只对 `scheduled_hidden_states` 执行 `final_layer_norm / project_out`
+- 已新增 `OPTDecoder._with_runtime_attn_metadata()`：
+  - 在单层 forward 期间临时把 `ForwardContext.attn_metadata` 替换成该层 runtime metadata
+  - layer 返回后恢复原始 metadata，避免污染外层 context
+- 已新增 `OPTDecoder._assemble_replay_hidden_states()`：
+  - 不是简单 `torch.cat([cpu_fill_hs, gpu_reuse_hs], dim=0)`
+  - 而是按每个 request 的 replay 顺序，把：
+    - `cpu_fill` 前缀
+    - `gpu_reuse` 后缀
+    交错拼回当前层真实的 replay token 顺序
+- 已在 `OPTDynamicReplayRuntime` 中补充 model 侧 helper：
+  - `set_capture_token_metadata(req_indices, positions)`
+  - `load_cpu_fill(layer_idx, plan)`
+  - `capture_scheduled_layer_input(target_layer_idx, hidden_states)`
+  - 其中 `load_cpu_fill()` 会优先消费 Step 8 以后可能提前启动的 async H2D；若没有 pending load，则退化到同步 `load_cpu_fill_h2d()`
 
 **关键实现细节**：
-- `_set_layer_attn_metadata()`：临时替换 `ForwardContext.attn_metadata` 为当前层的 metadata dict
-- `_slice_gpu_reuse()`：对每个 req，从 `replay_hs` 中按 `gpu_reuse_slice_per_req` 切片并拼接
-- `_concat_replay_input()`：`torch.cat([cpu_fill_hs, gpu_reuse_hs], dim=0)` 或处理其中一个为 None 的情况
+- 当前层 replay 输入的组装顺序必须按 request 交错，不能直接把“全局 cpu_fill 段”和“全局 gpu_reuse 段”简单拼接
+- `capture_scheduled_layer_input()` 的设计意图已经固定为：
+  - 只持久化 scheduled tokens 到 CPU store
+  - 不负责传递 replay hidden states
+- 当前 step 的 replay hidden states 只在 GPU 上通过 `replay_hidden_states` 变量层间传递
+- Phase 1 仍然要求 `PP=1`；`_forward_dynamic_replay()` 中显式拒绝 pipeline parallel
 
-**验证方式**：（见 Step 10 集成测试）
+**如何使用**：
+- 这一步完成后，model 侧已经支持：
+  - 在 `ForwardContext.layer_recompute_runtime` 已就绪的前提下，`OPTDecoder.forward()` 自动切到 dynamic replay 路径
+- runtime 需要至少包含：
+  - 每层 `LayerReplayPlan`
+  - 每层 `attn_metadata`
+  - `layer_recompute_manager`
+  - scheduled token 的 `req_indices / positions`
+- 目前这些对象还没有由 `gpu_model_runner` 自动注入；那部分留到 Step 8
+
+**验证方式**：
+- `tests/v1/kv_offload/test_opt_dynamic_replay_forward.py`
+  - 验证 `cpu_fill + gpu_reuse` 会按 request 正确交错，而不是简单全局拼接
+  - 验证每层只 capture scheduled tokens
+  - 验证 per-layer metadata 会临时替换并在 layer 结束后恢复
+  - 验证 `replay_token_count == 0` 时会走 scheduled-only 路径
+- `tests/v1/kv_offload/test_opt_dynamic_replay.py`
+  - 继续覆盖 runtime 基本行为
+
+Step 7 验证命令：
+
+```bash
+python -m py_compile vllm/model_executor/models/opt.py vllm/v1/worker/opt_dynamic_replay.py tests/v1/kv_offload/test_opt_dynamic_replay_forward.py
+./.venv/bin/python -m pytest -q tests/v1/kv_offload/test_opt_dynamic_replay_forward.py tests/v1/kv_offload/test_opt_dynamic_replay.py
+```
 
 **依赖**：Step 4, 5, 6
 

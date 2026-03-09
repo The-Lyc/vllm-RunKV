@@ -21,8 +21,10 @@
 """Inference-only OPT model compatible with HuggingFace weights."""
 
 from collections.abc import Iterable
+from contextlib import contextmanager
 from itertools import islice
 
+import numpy as np
 import torch
 from torch import nn
 from transformers import OPTConfig
@@ -31,6 +33,7 @@ from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -265,6 +268,174 @@ class OPTDecoder(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    @contextmanager
+    def _with_runtime_attn_metadata(
+        self,
+        *,
+        layer_idx: int,
+    ):
+        forward_context = get_forward_context()
+        prev_attn_metadata = forward_context.attn_metadata
+        runtime = forward_context.layer_recompute_runtime
+        assert runtime is not None
+        forward_context.attn_metadata = runtime.get_layer_metadata(layer_idx)
+        try:
+            yield
+        finally:
+            forward_context.attn_metadata = prev_attn_metadata
+
+    def _assemble_replay_hidden_states(
+        self,
+        *,
+        plan,
+        cpu_fill_hidden_states: torch.Tensor | None,
+        prev_layer_replay_hidden_states: torch.Tensor | None,
+    ) -> torch.Tensor:
+        hidden_size = self.config.hidden_size
+        dtype = None
+        device = None
+        if cpu_fill_hidden_states is not None:
+            dtype = cpu_fill_hidden_states.dtype
+            device = cpu_fill_hidden_states.device
+        elif prev_layer_replay_hidden_states is not None:
+            dtype = prev_layer_replay_hidden_states.dtype
+            device = prev_layer_replay_hidden_states.device
+        else:
+            raise AssertionError("Replay assembly requires at least one input.")
+
+        cpu_fill_cursor = 0
+        replay_segments: list[torch.Tensor] = []
+        cpu_fill_lens_per_req = (
+            np.minimum(plan.prev_gpu_start_per_req, plan.computed_lens_per_req)
+            - plan.kv_replay_start_per_req
+        ).clip(min=0)
+
+        for req_idx, (gpu_start, gpu_end) in enumerate(plan.gpu_reuse_slice_per_req):
+            req_segments: list[torch.Tensor] = []
+
+            cpu_fill_len = int(cpu_fill_lens_per_req[req_idx])
+            if cpu_fill_len > 0:
+                assert cpu_fill_hidden_states is not None
+                req_segments.append(
+                    cpu_fill_hidden_states[
+                        cpu_fill_cursor : cpu_fill_cursor + cpu_fill_len
+                    ]
+                )
+                cpu_fill_cursor += cpu_fill_len
+
+            gpu_reuse_len = int(gpu_end - gpu_start)
+            if gpu_reuse_len > 0:
+                if prev_layer_replay_hidden_states is None:
+                    raise AssertionError(
+                        "gpu_reuse requires previous layer replay hidden states."
+                    )
+                req_segments.append(prev_layer_replay_hidden_states[gpu_start:gpu_end])
+
+            if req_segments:
+                replay_segments.append(torch.cat(req_segments, dim=0))
+
+        if (
+            cpu_fill_hidden_states is not None
+            and cpu_fill_cursor != cpu_fill_hidden_states.shape[0]
+        ):
+            raise AssertionError(
+                "Replay assembly did not consume all cpu_fill hidden states."
+            )
+
+        if replay_segments:
+            replay_hidden_states = torch.cat(replay_segments, dim=0)
+        else:
+            replay_hidden_states = torch.empty(
+                (0, hidden_size),
+                dtype=dtype,
+                device=device,
+            )
+
+        if replay_hidden_states.shape[0] != plan.replay_token_count:
+            raise AssertionError(
+                f"Expected {plan.replay_token_count} replay tokens but assembled "
+                f"{replay_hidden_states.shape[0]}."
+            )
+        return replay_hidden_states
+
+    def _forward_dynamic_replay(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | IntermediateTensors:
+        if not (get_pp_group().is_first_rank and get_pp_group().is_last_rank):
+            raise NotImplementedError(
+                "Dynamic replay currently requires pipeline parallel size 1."
+            )
+
+        forward_context = get_forward_context()
+        runtime = forward_context.layer_recompute_runtime
+        assert runtime is not None
+
+        scheduled_hidden_states = hidden_states
+        replay_hidden_states: torch.Tensor | None = None
+        runtime.capture_scheduled_layer_input(
+            target_layer_idx=self.start_layer,
+            hidden_states=scheduled_hidden_states,
+        )
+
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
+            plan = runtime.get_layer_plan(layer_idx)
+
+            if plan.replay_token_count == 0:
+                with self._with_runtime_attn_metadata(layer_idx=layer_idx):
+                    scheduled_hidden_states = layer(scheduled_hidden_states)
+                replay_hidden_states = None
+            else:
+                cpu_fill_hidden_states = None
+                if plan.cpu_fill_token_count > 0:
+                    cpu_fill_hidden_states = runtime.load_cpu_fill(layer_idx, plan)
+
+                replay_hidden_states = self._assemble_replay_hidden_states(
+                    plan=plan,
+                    cpu_fill_hidden_states=cpu_fill_hidden_states,
+                    prev_layer_replay_hidden_states=replay_hidden_states,
+                )
+
+                replay_indices = plan.combined_replay_indices.to(
+                    scheduled_hidden_states.device, dtype=torch.long
+                )
+                scheduled_indices = plan.combined_scheduled_indices.to(
+                    scheduled_hidden_states.device, dtype=torch.long
+                )
+                combined_hidden_states = torch.empty(
+                    (plan.num_actual_tokens, scheduled_hidden_states.shape[-1]),
+                    dtype=scheduled_hidden_states.dtype,
+                    device=scheduled_hidden_states.device,
+                )
+                combined_hidden_states[replay_indices] = replay_hidden_states
+                combined_hidden_states[scheduled_indices] = scheduled_hidden_states
+
+                with self._with_runtime_attn_metadata(layer_idx=layer_idx):
+                    combined_hidden_states = layer(combined_hidden_states)
+
+                replay_hidden_states = combined_hidden_states.index_select(
+                    0, replay_indices
+                )
+                scheduled_hidden_states = combined_hidden_states.index_select(
+                    0, scheduled_indices
+                )
+
+            runtime.capture_scheduled_layer_input(
+                target_layer_idx=layer_idx + 1,
+                hidden_states=scheduled_hidden_states,
+            )
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors({"hidden_states": scheduled_hidden_states})
+        if self.final_layer_norm is not None:
+            scheduled_hidden_states = self.final_layer_norm(scheduled_hidden_states)
+        if self.project_out is not None:
+            scheduled_hidden_states, _ = self.project_out(scheduled_hidden_states)
+        return scheduled_hidden_states
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -282,6 +453,10 @@ class OPTDecoder(nn.Module):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
+
+        runtime = get_forward_context().layer_recompute_runtime
+        if runtime is not None:
+            return self._forward_dynamic_replay(hidden_states)
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states = layer(hidden_states)
