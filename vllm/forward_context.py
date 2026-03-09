@@ -283,6 +283,7 @@ def set_forward_context(
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     batch_descriptor: BatchDescriptor | None = None,
     ubatch_slices: UBatchSlices | None = None,
+    layer_recompute_runtime: OPTDynamicReplayRuntime | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -340,6 +341,7 @@ def set_forward_context(
         batch_descriptor,
         ubatch_slices,
         additional_kwargs,
+        layer_recompute_runtime,
     )
 
     try:

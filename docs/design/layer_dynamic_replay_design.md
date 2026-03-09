@@ -462,18 +462,20 @@ Step 1 单元测试运行方式：
   - `compilation_config.cudagraph_mode == CUDAGraphMode.NONE`
   - `cascade_attn_enabled == False`
   - `parallel_config.use_ubatching == False`
-- 由于 Step 3+ 的执行路径还没接入，当前在通过前置校验后会继续 `fail-fast`：
-  - `layer_recompute_mode="prev_layer_output_dynamic"` 目前会显式抛出 `NotImplementedError`
-  - 这样可以避免用户选择新模式后悄悄落回旧的 `io_hidden_states` 路径
+- 从 Step 8 开始，通过前置校验后会继续初始化：
+  - `LayerRecomputeManager`
+  - `StaticReplayPlanProvider`
+  - 动态 replay 所需的 step 级缓存元数据
+  - 不再 `fail-fast`，也不会 silent fallback 到旧路径
 - 已补单元测试：
   - `tests/v1/kv_offload/test_layer_recompute_manager.py`
-  - 覆盖支持路径、各类拒绝路径，以及当前阶段的 fail-fast 行为
+  - 覆盖支持路径、各类拒绝路径，以及初始化成功路径
 
 **如何使用**：
 
 当前阶段，`prev_layer_output_dynamic` 的使用语义是：
 - 不满足 phase-1 约束时，初始化阶段直接报 `ValueError`
-- 满足所有 phase-1 约束时，初始化阶段报 `NotImplementedError`
+- 满足所有 phase-1 约束时，继续进入 Step 8 接通后的动态 replay 执行路径
 - `io_hidden_states` 旧模式不受影响
 
 可以用下面的命令验证前置校验已经接通：
@@ -485,21 +487,21 @@ vllm serve MODEL_PATH \
   --runkv-layer-recompute-mode prev_layer_output_dynamic
 ```
 
-在当前 step 下，这条命令的预期结果不是成功运行，而是：
+在当前代码状态下，这条命令的预期结果是：
 - unsupported 配置 → 明确的 `ValueError`
-- supported 配置 → 明确的 `NotImplementedError`
+- supported 配置 → 通过初始化并进入动态 replay 路径
 
 Step 2 单元测试运行方式：
 
 ```bash
-./.venv/bin/python -m pytest -q tests/v1/kv_offload/test_layer_recompute_manager.py -k 'prev_layer_output_dynamic or dynamic_mode_fails_fast_until_execution_path_is_implemented'
+./.venv/bin/python -m pytest -q tests/v1/kv_offload/test_layer_recompute_manager.py -k 'validate_prev_layer_output_dynamic_mode or dynamic_mode_initializes_manager_and_plan_provider'
 ```
 
 **验证方式**：
 - 传 `prev_layer_output_dynamic` + 非 OPT 模型 → 报错且消息明确
 - 传 `prev_layer_output_dynamic` + cudagraph 打开 → 报错
 - 传 `prev_layer_output_dynamic` + TP / PP / DP / DCP 打开 → 报错
-- 传 `prev_layer_output_dynamic` + OPT pre-LN + eager + 其他前提都满足 → 当前阶段 `NotImplementedError`
+- 传 `prev_layer_output_dynamic` + OPT pre-LN + eager + 其他前提都满足 → 初始化成功并进入 Step 8 路径
 
 **依赖**：Step 1
 
@@ -949,7 +951,7 @@ Step 6 验证命令：
 
 **目标**：在 `OPTDecoder.forward` 中增加动态 replay 路径。这是最核心的 step。
 
-**实现状态**：已完成（model/runtime 侧；runner 集成仍在 Step 8）
+**实现状态**：已完成（model/runtime 侧；已由 Step 8 接入 runner）
 
 **改动文件**：
 - `vllm/model_executor/models/opt.py`
@@ -1004,7 +1006,7 @@ Step 6 验证命令：
   - 每层 `attn_metadata`
   - `layer_recompute_manager`
   - scheduled token 的 `req_indices / positions`
-- 目前这些对象还没有由 `gpu_model_runner` 自动注入；那部分留到 Step 8
+- 这些对象现在已由 Step 8 的 `gpu_model_runner` 自动注入
 
 **验证方式**：
 - `tests/v1/kv_offload/test_opt_dynamic_replay_forward.py`
@@ -1030,59 +1032,43 @@ python -m py_compile vllm/model_executor/models/opt.py vllm/v1/worker/opt_dynami
 
 **目标**：在 `gpu_model_runner` 的 step 执行流中，实现流水线式的 per-layer plan 获取、异步预取和 runtime 注入。
 
+**实现状态**：已完成
+
 **改动文件**：
 - `vllm/v1/worker/gpu_model_runner.py`
-  - 新增成员 `replay_plan_provider: ReplayPlanProvider`
-    - 初始化时根据 config 选择 `StaticReplayPlanProvider`（默认）或将来的自定义 provider
-  - 在 `_execute_model_step()` 或等价方法中，新模式下：
-    1. 调用 `provider.get_layer_plan(0, ...)` 获取 layer 0 的 plan
-    2. 构造 layer 0 的 attention metadata
-    3. 启动 layer 0 的 IO prefix KV 异步加载
-    4. 启动 layer 0 的 replay hidden states H2D（如果有 cpu_fill）
-    5. 构造 `OPTDynamicReplayRuntime`（初始只含 layer 0 的 plan/metadata）并赋值到 `ForwardContext`
-  - 重写 `_runkv_pre_hook()` 的新模式分支：
-    ```python
-    if self.kv_offload_config.layer_recompute_mode == "prev_layer_output_dynamic":
-        runtime = get_forward_context().layer_recompute_runtime
-        
-            # 1. 先获取下一层(i+1)的 replay plan
-            if layer_idx + 1 < num_layers:
-                next_plan = self.replay_plan_provider.get_layer_plan(
-                    layer_idx=layer_idx + 1,
-                    ...,
-                    prev_layer_plan=runtime.current_layer_plan(layer_idx),
-                )
-                runtime.set_layer_plan(layer_idx + 1, next_plan)
+- `vllm/forward_context.py`
+- `tests/v1/kv_offload/test_layer_recompute_manager.py`
 
-                # 2. 立即构造下一层(i+1)的 attention metadata
-                next_metadata = self._build_layer_attn_metadata(
-                    layer_idx=layer_idx + 1,
-                    plan=next_plan,
-                    prev_plan=runtime.current_layer_plan(layer_idx),
-                    prev_metadata=runtime._per_layer_attn_metadata[layer_idx],
-                    base_seq_lens=base_seq_lens,
-                    ...,
-                )
-                runtime.set_layer_metadata(layer_idx + 1, next_metadata)
-
-            # 3. 再等待当前层(i)的数据就绪
-            mapper.sync_load_layer(layer_idx)                    # IO prefix KV
-            manager.sync_cpu_fill_h2d(layer_idx)                 # replay HS（如果有）
-
-            # 4. 然后异步启动下一层(i+1)的数据预取
-            if layer_idx + 1 < num_layers:
-                next_skip_blocks = manager.compute_skip_block_ids_for_layer(
-                    layer_idx + 1, next_plan)
-                mapper.load_layer_async(
-                    next_layer_name, layer_idx + 1,
-                    skip_block_ids=next_skip_blocks)
-                
-                if next_plan.cpu_fill_token_count > 0:
-                    manager.load_cpu_fill_h2d_async(
-                        layer_idx + 1, next_plan)
-        
-        return  # 不做 recompute_kv_for_layer
-    ```
+**实际改动**：
+- 已在 `GPUModelRunner` 中新增 `replay_plan_provider` 成员，并在 `_maybe_init_layer_recompute_manager(...)` 中：
+  - 复用 Step 2 的 phase-1 校验
+  - 规范化 `layer_recompute_io_prefix_blocks`
+  - 初始化 `StaticReplayPlanProvider`
+- 已在 `GPUModelRunner` 中新增动态路径 helper：
+  - `_is_prev_layer_output_dynamic_enabled()`
+  - `_build_dynamic_layer_plan(...)`
+  - `_prepare_dynamic_replay_runtime(...)`
+- 已扩展 `_prepare_layer_recompute_step_metadata(...)`：
+  - 除已有 `req_indices / positions / logical_ids / block_offsets` 外
+  - 还缓存每个 request 的 `num_scheduled_tokens_np`
+  - 供 Step 8/Step 7 共同消费
+- 已在 step 执行流中接通 runtime 注入：
+  - `execute_model()` 在进入 `set_forward_context(...)` 前调用 `_prepare_dynamic_replay_runtime(...)`
+  - layer 0 plan / metadata 会在这里即时构造
+  - layer 0 的 IO prefix KV 加载和 `cpu_fill` H2D（如果有）也会在这里异步启动
+  - 生成的 `OPTDynamicReplayRuntime` 会通过 `set_forward_context(..., layer_recompute_runtime=runtime)` 注入到本轮 forward
+- 已重写 `_runkv_pre_hook()` 的 dynamic 分支：
+  - 先 `get_plan(i+1)` / `build_meta(i+1)`
+  - 再 `sync_load_layer(i)` / `sync_cpu_fill_h2d(i)`
+  - 最后异步启动 layer `i+1` 的 KV load 和 `cpu_fill` H2D
+  - dynamic 分支会直接 `return`，不再调用旧模式的：
+    - `prefetch_recompute_inputs_for_layer()`
+    - `recompute_kv_for_layer()`
+- 已在 `ForwardContext` / `set_forward_context()` 中增加 `layer_recompute_runtime` 透传字段
+- 保持 scheduled-token KV offload 语义不变：
+  - replay suffix 在主干 forward 中会写 GPU staging buffer，但不会并入 dirty blocks
+  - post-hook 的 CPU flush 仍然只针对 scheduled tokens 真正写脏的 blocks
+  - 这符合 replay token 的 CPU 侧 KV / hidden states 已有完整备份的设计前提
 
 **流水线重叠效果**：
 ```
@@ -1091,10 +1077,46 @@ Layer i forward:   [GPU compute layer i]  ← 与 layer i+1 的 IO/H2D 并行
 Layer i+1 pre-hook: get_plan(i+2) → build_meta(i+2) → sync(i+1) → async_load(i+2) → ...
 ```
 
+**如何使用**：
+- 开启 RunKV 和 layer recompute，并选择动态模式：
+
+```bash
+vllm serve MODEL_PATH \
+  --enable-runkv \
+  --runkv-enable-layer-recompute \
+  --runkv-layer-recompute-mode prev_layer_output_dynamic
+```
+
+- 当前 phase-1 约束仍然有效：
+  - 只支持 `OPT`
+  - 只支持 pre-LN
+  - 只支持单机单卡
+  - 不支持 cudagraph / TP / PP / DP / DCP / cascade / ubatching
+- 满足这些约束时，runner 会自动：
+  - 构造 layer 0 plan/metadata
+  - 在 pre-hook 中逐层构造后续 plan/metadata
+  - 把 `OPTDynamicReplayRuntime` 注入到 `ForwardContext`
+  - 让 Step 7 的 `OPTDecoder.forward()` 自动切到动态 replay 主干路径
+
 **验证方式**：
-- 启动新模式，验证 pre-hook 不再调用 recompute_kv_for_layer
-- 验证 layer i+1 的 IO 加载与 layer i 的 GPU 计算并行（通过 nsys profile 可视化验证）
-- 验证 ForwardContext 中 runtime 被正确设置，每层 plan/metadata 按需填充
+- 单元测试：
+  - `tests/v1/kv_offload/test_layer_recompute_manager.py`
+    - 验证动态模式初始化会创建 manager + provider
+    - 验证 `_prepare_dynamic_replay_runtime()` 会构造 layer 0 plan/metadata 并启动预取
+    - 验证 `_runkv_pre_hook()` 会按 `get_plan/build_meta -> sync -> async_load` 顺序推进
+- 回归测试：
+  - `tests/v1/kv_offload/test_opt_dynamic_replay.py`
+  - `tests/v1/kv_offload/test_opt_dynamic_replay_plan.py`
+  - `tests/v1/kv_offload/test_opt_dynamic_replay_metadata.py`
+  - `tests/v1/kv_offload/test_opt_dynamic_replay_forward.py`
+
+Step 8 验证命令：
+
+```bash
+./.venv/bin/python -m py_compile vllm/forward_context.py vllm/v1/worker/gpu_model_runner.py tests/v1/kv_offload/test_layer_recompute_manager.py
+./.venv/bin/python -m pytest -q tests/v1/kv_offload/test_layer_recompute_manager.py -k 'dynamic_mode or prepare_dynamic_replay_runtime or runkv_pre_hook_dynamic_mode or prepare_layer_recompute_step_metadata'
+./.venv/bin/python -m pytest -q tests/v1/kv_offload/test_opt_dynamic_replay.py tests/v1/kv_offload/test_opt_dynamic_replay_plan.py tests/v1/kv_offload/test_opt_dynamic_replay_metadata.py tests/v1/kv_offload/test_opt_dynamic_replay_forward.py
+```
 
 **依赖**：Step 4, 5, 7
 

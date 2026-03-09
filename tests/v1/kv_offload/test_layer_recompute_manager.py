@@ -10,10 +10,15 @@ import torch
 from torch import nn
 
 from vllm.config import CUDAGraphMode
+from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.v1.core.kv_cache_offload_config import RunKVOffloadConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.layer_recompute import LayerRecomputeManager
+from vllm.v1.worker.opt_dynamic_replay import (
+    LayerReplayPlan,
+    OPTDynamicReplayRuntime,
+)
 
 
 class _DummyDecoderLayer(nn.Module):
@@ -258,6 +263,7 @@ def _make_dynamic_mode_runner(
     runner.use_runkv = True
     runner.layer_recompute_enabled = False
     runner.layer_recompute_manager = None
+    runner.replay_plan_provider = None
     runner.kv_offload_config = RunKVOffloadConfig(
         enabled=True,
         enable_layer_recompute=True,
@@ -268,6 +274,7 @@ def _make_dynamic_mode_runner(
         hf_config=SimpleNamespace(
             model_type=model_type,
             do_layer_norm_before=do_layer_norm_before,
+            hidden_size=16,
         )
     )
     runner.parallel_config = SimpleNamespace(
@@ -279,7 +286,54 @@ def _make_dynamic_mode_runner(
     )
     runner.compilation_config = SimpleNamespace(cudagraph_mode=cudagraph_mode)
     runner.cascade_attn_enabled = cascade_attn_enabled
+    runner.device = torch.device("cpu")
+    runner.dtype = torch.float32
+    runner.model = SimpleNamespace(
+        model=SimpleNamespace(
+            decoder=SimpleNamespace(
+                layers=nn.ModuleList([nn.Identity(), nn.Identity()])
+            )
+        )
+    )
     return runner
+
+
+def _make_dynamic_plan(
+    *,
+    cpu_fill_token_count: int = 0,
+    cpu_fill_positions: list[int] | None = None,
+    cpu_fill_logical_ids: list[int] | None = None,
+    cpu_fill_block_offsets: list[int] | None = None,
+    gpu_reuse_slice_per_req: list[tuple[int, int]] | None = None,
+    replay_token_count: int = 0,
+    scheduled_token_count: int = 2,
+    num_actual_tokens: int = 2,
+) -> LayerReplayPlan:
+    cpu_fill_positions = cpu_fill_positions or []
+    cpu_fill_logical_ids = cpu_fill_logical_ids or []
+    cpu_fill_block_offsets = cpu_fill_block_offsets or []
+    gpu_reuse_slice_per_req = gpu_reuse_slice_per_req or [(0, 0)]
+    return LayerReplayPlan(
+        kv_replay_start_per_req=np.array([0], dtype=np.int32),
+        computed_lens_per_req=np.array([4], dtype=np.int32),
+        prev_gpu_start_per_req=np.array([4], dtype=np.int32),
+        cpu_fill_token_count=cpu_fill_token_count,
+        gpu_reuse_token_count=0,
+        replay_token_count=replay_token_count,
+        scheduled_token_count=scheduled_token_count,
+        num_actual_tokens=num_actual_tokens,
+        max_query_len=max(replay_token_count + scheduled_token_count, 1),
+        query_start_loc=torch.tensor([0, num_actual_tokens], dtype=torch.int32),
+        slot_mapping=torch.arange(num_actual_tokens, dtype=torch.int64),
+        combined_replay_indices=torch.arange(replay_token_count, dtype=torch.int64),
+        combined_scheduled_indices=torch.arange(
+            replay_token_count, num_actual_tokens, dtype=torch.int64
+        ),
+        cpu_fill_positions=np.asarray(cpu_fill_positions, dtype=np.int32),
+        cpu_fill_logical_ids=np.asarray(cpu_fill_logical_ids, dtype=np.int32),
+        cpu_fill_block_offsets=np.asarray(cpu_fill_block_offsets, dtype=np.int32),
+        gpu_reuse_slice_per_req=gpu_reuse_slice_per_req,
+    )
 
 
 def test_validate_prev_layer_output_dynamic_mode_accepts_phase1_config() -> None:
@@ -359,14 +413,179 @@ def test_validate_prev_layer_output_dynamic_mode_rejects_ubatching() -> None:
         )
 
 
-def test_dynamic_mode_fails_fast_until_execution_path_is_implemented() -> None:
+def test_dynamic_mode_initializes_manager_and_plan_provider() -> None:
     runner = _make_dynamic_mode_runner()
 
-    with pytest.raises(NotImplementedError, match="not implemented yet"):
-        runner._maybe_init_layer_recompute_manager(
-            SimpleNamespace(kv_cache_groups=[object()]),
-            group_block_sizes=[16],
+    runner._maybe_init_layer_recompute_manager(
+        SimpleNamespace(kv_cache_groups=[object()], num_blocks=16),
+        group_block_sizes=[16],
+    )
+
+    assert runner.layer_recompute_enabled is True
+    assert runner.layer_recompute_manager is not None
+    assert runner.replay_plan_provider is not None
+
+
+def test_prepare_dynamic_replay_runtime_builds_layer0_plan_and_prefetches() -> None:
+    runner = _make_dynamic_mode_runner()
+    runner.layer_recompute_enabled = True
+    runner.layer_recompute_manager = Mock()
+    runner.replay_plan_provider = Mock()
+    runner._runkv_num_layers = 2
+    runner._runkv_layer_info = [("layer.0", 0, 0), ("layer.1", 1, 0)]
+    runner._lr_req_indices_np = np.array([0, 0], dtype=np.int32)
+    runner._lr_positions_np = np.array([4, 5], dtype=np.int32)
+    runner.input_batch = SimpleNamespace(
+        num_computed_tokens_cpu=np.array([4], dtype=np.int32),
+        block_table=SimpleNamespace(
+            block_tables=[
+                SimpleNamespace(
+                    block_size=16,
+                    get_numpy_array=lambda: np.array([[10, 11]], dtype=np.int32),
+                )
+            ]
+        ),
+    )
+    runner.seq_lens = SimpleNamespace(
+        np=np.array([6], dtype=np.int32),
+        cpu=torch.tensor([6], dtype=torch.int32),
+    )
+    runner.paged_block_tables = [torch.zeros((1, 2), dtype=torch.int32)]
+    runner.paged_dirty_blocks = [set()]
+    mapper = Mock()
+    mapper.mapping = {10: 0, 11: 1}
+    runner.paged_block_mappers = [mapper]
+    layer0_plan = _make_dynamic_plan(
+        cpu_fill_token_count=2,
+        cpu_fill_positions=[0, 1],
+        cpu_fill_logical_ids=[10, 10],
+        cpu_fill_block_offsets=[0, 1],
+        replay_token_count=2,
+        num_actual_tokens=4,
+    )
+    runner._build_dynamic_layer_plan = Mock(return_value=layer0_plan)
+    layer0_metadata = {"layer.0.attn": object()}
+    runner._build_layer_attn_metadata = Mock(return_value=layer0_metadata)
+    runner.layer_recompute_manager.cpu_layer_inputs_by_layer = [torch.empty(1, 1, 1)]
+    runner.layer_recompute_manager.compute_skip_block_ids_for_layer.return_value = {11}
+
+    runtime = runner._prepare_dynamic_replay_runtime(
+        num_reqs=1,
+        num_scheduled_tokens_np=np.array([2], dtype=np.int32),
+    )
+
+    assert isinstance(runtime, OPTDynamicReplayRuntime)
+    assert runtime.current_layer_plan(0) is layer0_plan
+    assert runtime.current_layer_metadata(0) is layer0_metadata
+    np.testing.assert_array_equal(runtime.scheduled_req_indices, np.array([0, 0]))
+    np.testing.assert_array_equal(runtime.scheduled_positions, np.array([4, 5]))
+    mapper.load_layer_async.assert_called_once_with("layer.0", 0, skip_block_ids={11})
+    runner.layer_recompute_manager.load_cpu_fill_h2d_async.assert_called_once_with(
+        layer_idx=0,
+        cpu_fill_positions=layer0_plan.cpu_fill_positions,
+        cpu_fill_logical_ids=layer0_plan.cpu_fill_logical_ids,
+        cpu_fill_block_offsets=layer0_plan.cpu_fill_block_offsets,
+    )
+
+
+def test_runkv_pre_hook_dynamic_mode_builds_next_plan_and_overlaps_loads() -> None:
+    runner = _make_dynamic_mode_runner()
+    runner.layer_recompute_enabled = True
+    runner.kv_offload_config.layer_recompute_io_prefix_blocks = [1, 1]
+    runner.layer_recompute_manager = Mock()
+    runner._lr_num_reqs = 1
+    runner._lr_num_scheduled_tokens_np = np.array([2], dtype=np.int32)
+    runner.seq_lens = SimpleNamespace(
+        np=np.array([6], dtype=np.int32),
+        cpu=torch.tensor([6], dtype=torch.int32),
+    )
+    runner.paged_dirty_blocks = [set(), set()]
+    runner.paged_block_tables = [
+        torch.zeros((1, 2), dtype=torch.int32),
+        torch.zeros((1, 2), dtype=torch.int32),
+    ]
+    mapper0 = Mock()
+    mapper1 = Mock()
+    runner.paged_block_mappers = [mapper0, mapper1]
+    runner._get_next_layer_info = Mock(return_value=("layer.1", 1, 1))
+
+    current_plan = _make_dynamic_plan()
+    next_plan = _make_dynamic_plan(
+        cpu_fill_token_count=2,
+        cpu_fill_positions=[2, 3],
+        cpu_fill_logical_ids=[12, 12],
+        cpu_fill_block_offsets=[0, 1],
+        replay_token_count=2,
+        num_actual_tokens=4,
+    )
+    next_metadata = {"layer.1.attn": object()}
+    runner._build_dynamic_layer_plan = Mock(return_value=next_plan)
+    runner._build_layer_attn_metadata = Mock(return_value=next_metadata)
+    runner.layer_recompute_manager.compute_skip_block_ids_for_layer.return_value = {12}
+
+    runtime = OPTDynamicReplayRuntime(
+        num_layers=2,
+        cpu_hs_store=torch.empty(1, 1, 1),
+        replay_plan_provider=Mock(),
+        layer_recompute_manager=runner.layer_recompute_manager,
+    )
+    runtime.set_layer_plan(0, current_plan)
+    runtime.set_layer_metadata(0, {"layer.0.attn": object()})
+    forward_context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata={"base": object()},
+        virtual_engine=0,
+        layer_recompute_runtime=runtime,
+    )
+
+    events: list[str] = []
+
+    def _record_skip(**kwargs) -> set[int]:
+        events.append(f"skip_{kwargs['layer_idx']}")
+        return {12}
+
+    runner.layer_recompute_manager.sync_cpu_fill_h2d.side_effect = (
+        lambda layer_idx: events.append(f"sync_hs_{layer_idx}")
+    )
+    runner.layer_recompute_manager.load_cpu_fill_h2d_async.side_effect = (
+        lambda **kwargs: events.append(f"prefetch_hs_{kwargs['layer_idx']}")
+    )
+    runner.layer_recompute_manager.compute_skip_block_ids_for_layer.side_effect = (
+        _record_skip
+    )
+    mapper0.sync_load_layer.side_effect = lambda layer_idx: events.append(
+        f"sync_kv_{layer_idx}"
+    )
+    mapper1.load_layer_async.side_effect = lambda *args, **kwargs: events.append(
+        "prefetch_kv_1"
+    )
+
+    with override_forward_context(forward_context):
+        runner._runkv_pre_hook(
+            module=nn.Identity(),
+            inputs=(),
+            layer_name="layer.0",
+            layer_idx=0,
+            gid=0,
         )
+
+    assert runtime.current_layer_plan(1) is next_plan
+    assert runtime.current_layer_metadata(1) is next_metadata
+    assert events == [
+        "sync_kv_0",
+        "sync_hs_0",
+        "skip_1",
+        "prefetch_kv_1",
+        "prefetch_hs_1",
+    ]
+    runner._build_dynamic_layer_plan.assert_called_once_with(
+        layer_idx=1,
+        gid=1,
+        num_reqs=1,
+        num_scheduled_tokens_np=np.array([2], dtype=np.int32),
+        prev_layer_plan=current_plan,
+    )
+    runner._build_layer_attn_metadata.assert_called_once()
 
 
 def test_prepare_layer_recompute_step_metadata_caches_arrays_and_calls_manager():
@@ -401,6 +620,7 @@ def test_prepare_layer_recompute_step_metadata_caches_arrays_and_calls_manager()
         req_indices=req_indices,
         positions_np=positions,
         num_reqs=2,
+        num_scheduled_tokens_np=np.array([2, 2], dtype=np.int32),
     )
 
     assert np.array_equal(runner._lr_req_indices_np, req_indices)
@@ -409,6 +629,7 @@ def test_prepare_layer_recompute_step_metadata_caches_arrays_and_calls_manager()
     assert np.array_equal(runner._lr_block_offsets_np, np.array([0, 1, 0, 1]))
     assert runner._lr_block_size == 16
     assert runner._lr_num_reqs == 2
+    assert np.array_equal(runner._lr_num_scheduled_tokens_np, np.array([2, 2]))
 
     call_kwargs = runner.layer_recompute_manager.begin_step.call_args.kwargs
     assert call_kwargs["req_ids"] == ["req-0", "req-1"]
@@ -436,6 +657,7 @@ def test_prepare_layer_recompute_step_metadata_clears_cache_when_disabled():
         req_indices=np.array([0], dtype=np.int32),
         positions_np=np.array([0], dtype=np.int32),
         num_reqs=0,
+        num_scheduled_tokens_np=np.array([], dtype=np.int32),
     )
 
     assert runner._lr_req_indices_np is None
@@ -444,6 +666,7 @@ def test_prepare_layer_recompute_step_metadata_clears_cache_when_disabled():
     assert runner._lr_block_offsets_np is None
     assert runner._lr_block_size == 0
     assert runner._lr_num_reqs == 0
+    assert runner._lr_num_scheduled_tokens_np is None
     runner.layer_recompute_manager.begin_step.assert_not_called()
 
 
