@@ -27,10 +27,10 @@ logger = init_logger(__name__)
 
 @dataclass
 class _PendingLayerWrite:
-    hs_cpu: torch.Tensor
-    logical_ids: np.ndarray
-    offsets: np.ndarray
-    positions: np.ndarray
+    packed_hs_cpu: torch.Tensor
+    target_logical_ids: np.ndarray
+    target_block_offsets: np.ndarray
+    token_positions: np.ndarray
 
 
 @dataclass
@@ -38,6 +38,12 @@ class _PrefetchedLayerInputs:
     hs_gpu: torch.Tensor
     pos_gpu: torch.Tensor
     slot_gpu: torch.Tensor
+    ready_event: torch.cuda.Event | None
+
+
+@dataclass
+class _PendingCPUFillLoad:
+    gathered_hs_gpu: torch.Tensor
     ready_event: torch.cuda.Event | None
 
 
@@ -67,6 +73,9 @@ class LayerRecomputeManager:
         self.layer_recompute_io_prefix_blocks = list(
             kv_offload_config.layer_recompute_io_prefix_blocks
         )
+        self.layer_recompute_mode = getattr(
+            kv_offload_config, "layer_recompute_mode", "io_hidden_states"
+        )
         self.layer_recompute_measure_overhead = bool(
             kv_offload_config.layer_recompute_measure_overhead
         )
@@ -84,6 +93,9 @@ class LayerRecomputeManager:
             )
             for _ in range(self.num_layers)
         ]
+        # Dynamic replay reuses the same physical storage but interprets it as
+        # "target layer inputs" instead of layernorm outputs.
+        self.cpu_layer_inputs_by_layer = self.cpu_attn_inputs_by_layer
         self.cpu_block_positions = torch.full(
             (self.num_cpu_blocks, self.block_size),
             -1,
@@ -128,6 +140,8 @@ class LayerRecomputeManager:
         self._step_positions_np: np.ndarray | None = None
         self._step_logical_ids_np: np.ndarray | None = None
         self._step_block_offsets_np: np.ndarray | None = None
+        self._step_logical_block_table_np: np.ndarray | None = None
+        self._step_num_blocks_per_row_np: np.ndarray | None = None
         # logical block id -> block index within its owner request for current step.
         self._step_logical_block_indices: dict[int, int] = {}
 
@@ -135,6 +149,7 @@ class LayerRecomputeManager:
         self._pending_writes_by_layer: dict[int, list[_PendingLayerWrite]] = (
             defaultdict(list)
         )
+        self._pending_cpu_fill_h2d_by_layer: dict[int, _PendingCPUFillLoad] = {}
         self._hs_d2h_events_by_layer: dict[int, list[torch.cuda.Event]] = defaultdict(
             list
         )
@@ -160,6 +175,8 @@ class LayerRecomputeManager:
 
     def register_layernorm_hooks(self, gpu_model_runner: Any) -> None:
         """Attach hooks to the decoder layer norm before self-attention."""
+        if self.layer_recompute_mode == "prev_layer_output_dynamic":
+            return
         self.remove_layernorm_hooks()
         for layer_idx, decoder_layer in enumerate(self._decoder_layers):
             layernorm_module = getattr(decoder_layer, self._layernorm_module_name, None)
@@ -198,7 +215,10 @@ class LayerRecomputeManager:
         self._step_positions_np = positions_np
         self._step_logical_ids_np = logical_ids_np
         self._step_block_offsets_np = block_offsets_np
+        self._step_logical_block_table_np = logical_block_table_np
+        self._step_num_blocks_per_row_np = num_blocks_per_row
         self._step_logical_block_indices.clear()
+        self._pending_cpu_fill_h2d_by_layer.clear()
 
         num_reqs = min(len(req_ids), logical_block_table_np.shape[0])
         for row in range(num_reqs):
@@ -264,6 +284,156 @@ class LayerRecomputeManager:
             )
             if prefetched is not None:
                 self._prefetched_inputs_by_layer[layer_idx] = prefetched
+
+    def capture_layer_input_d2h(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        req_indices: np.ndarray,
+        positions: np.ndarray,
+    ) -> None:
+        # hidden_states arrives token-contiguous from the live forward path.
+        # We resolve a block-store address for each row and defer the actual
+        # scatter into the CPU store to sync_hs_d2h().
+        if hidden_states.ndim != 2:
+            raise ValueError(
+                f"hidden_states must be 2D, got shape={tuple(hidden_states.shape)}."
+            )
+
+        req_indices_np = np.asarray(req_indices, dtype=np.int64)
+        positions_np = np.asarray(positions, dtype=np.int64)
+        if req_indices_np.ndim != 1 or positions_np.ndim != 1:
+            raise ValueError("req_indices and positions must both be 1D arrays.")
+        if req_indices_np.shape[0] != hidden_states.shape[0]:
+            raise ValueError(
+                "req_indices length must match hidden_states rows, got "
+                f"{req_indices_np.shape[0]} and {hidden_states.shape[0]}."
+            )
+        if positions_np.shape[0] != hidden_states.shape[0]:
+            raise ValueError(
+                "positions length must match hidden_states rows, got "
+                f"{positions_np.shape[0]} and {hidden_states.shape[0]}."
+            )
+
+        (
+            target_logical_ids,
+            target_block_offsets,
+            token_positions_i32,
+        ) = self._resolve_logical_ids_and_offsets(
+            req_indices=req_indices_np,
+            positions=positions_np,
+        )
+        self._enqueue_hidden_state_write(
+            layer_idx=layer_idx,
+            packed_hs_gpu=hidden_states.contiguous(),
+            target_logical_ids=target_logical_ids,
+            target_block_offsets=target_block_offsets,
+            token_positions=token_positions_i32,
+        )
+
+    def load_cpu_fill_h2d_async(
+        self,
+        layer_idx: int,
+        cpu_fill_positions: np.ndarray,
+        cpu_fill_logical_ids: np.ndarray,
+        cpu_fill_block_offsets: np.ndarray,
+    ) -> torch.Tensor:
+        target_logical_ids = np.asarray(cpu_fill_logical_ids, dtype=np.int64)
+        target_block_offsets = np.asarray(cpu_fill_block_offsets, dtype=np.int64)
+        token_positions = np.asarray(cpu_fill_positions, dtype=np.int32)
+
+        if (
+            target_logical_ids.ndim != 1
+            or target_block_offsets.ndim != 1
+            or token_positions.ndim != 1
+        ):
+            raise ValueError(
+                "cpu_fill_positions/logical_ids/block_offsets must all be 1D arrays."
+            )
+        if not (
+            target_logical_ids.shape[0]
+            == target_block_offsets.shape[0]
+            == token_positions.shape[0]
+        ):
+            raise ValueError(
+                "cpu_fill_positions/logical_ids/block_offsets must have the same "
+                "length."
+            )
+
+        if target_logical_ids.shape[0] == 0:
+            hs_gpu = torch.empty(
+                (0, self.hidden_size),
+                dtype=self.cpu_layer_inputs_by_layer[layer_idx].dtype,
+                device=self.device,
+            )
+            self._pending_cpu_fill_h2d_by_layer[layer_idx] = _PendingCPUFillLoad(
+                gathered_hs_gpu=hs_gpu,
+                ready_event=None,
+            )
+            return hs_gpu
+
+        store_logical_ids_t = torch.from_numpy(target_logical_ids)
+        store_block_offsets_t = torch.from_numpy(target_block_offsets)
+        token_positions_t = torch.from_numpy(token_positions)
+        stored_token_positions = self.cpu_block_positions[
+            store_logical_ids_t, store_block_offsets_t
+        ]
+        if torch.any(stored_token_positions != token_positions_t):
+            raise ValueError(
+                "cpu_fill requests positions that are not materialized in the CPU "
+                "hidden-state store."
+            )
+
+        # Gather the block-addressed CPU store into a token-contiguous buffer
+        # before transferring it back to GPU. The order of
+        # target_logical_ids/target_block_offsets defines the replay token order.
+        gathered_hs_cpu = self.cpu_layer_inputs_by_layer[layer_idx][
+            store_logical_ids_t, store_block_offsets_t, :
+        ].contiguous()
+        if self.pin_memory and not gathered_hs_cpu.is_pinned():
+            gathered_hs_cpu = gathered_hs_cpu.pin_memory()
+
+        if self._hs_h2d_stream is not None and self.device.type == "cuda":
+            with torch.cuda.stream(self._hs_h2d_stream):
+                gathered_hs_gpu = gathered_hs_cpu.to(self.device, non_blocking=True)
+                ready_event = torch.cuda.Event()
+                ready_event.record(self._hs_h2d_stream)
+        else:
+            gathered_hs_gpu = gathered_hs_cpu.to(self.device)
+            ready_event = None
+
+        self._pending_cpu_fill_h2d_by_layer[layer_idx] = _PendingCPUFillLoad(
+            gathered_hs_gpu=gathered_hs_gpu,
+            ready_event=ready_event,
+        )
+        return gathered_hs_gpu
+
+    def sync_cpu_fill_h2d(self, layer_idx: int) -> torch.Tensor | None:
+        pending = self._pending_cpu_fill_h2d_by_layer.get(layer_idx)
+        if pending is None:
+            return None
+        if pending.ready_event is not None and self.device.type == "cuda":
+            torch.cuda.current_stream(device=self.device).wait_event(
+                pending.ready_event
+            )
+        return pending.gathered_hs_gpu
+
+    def load_cpu_fill_h2d(
+        self,
+        layer_idx: int,
+        cpu_fill_positions: np.ndarray,
+        cpu_fill_logical_ids: np.ndarray,
+        cpu_fill_block_offsets: np.ndarray,
+    ) -> torch.Tensor:
+        gathered_hs_gpu = self.load_cpu_fill_h2d_async(
+            layer_idx=layer_idx,
+            cpu_fill_positions=cpu_fill_positions,
+            cpu_fill_logical_ids=cpu_fill_logical_ids,
+            cpu_fill_block_offsets=cpu_fill_block_offsets,
+        )
+        synced = self.sync_cpu_fill_h2d(layer_idx)
+        assert synced is gathered_hs_gpu
+        return gathered_hs_gpu
 
     def recompute_kv_for_layer(
         self,
@@ -415,29 +585,38 @@ class LayerRecomputeManager:
 
             for layer_idx, pending_writes in self._pending_writes_by_layer.items():
                 layer_store = self.cpu_attn_inputs_by_layer[layer_idx]
-                for pending in pending_writes:
-                    logical_ids_t = torch.from_numpy(
-                        pending.logical_ids.astype(np.int64, copy=False)
+                for pending_write in pending_writes:
+                    target_logical_ids_t = torch.from_numpy(
+                        pending_write.target_logical_ids.astype(np.int64, copy=False)
                     )
-                    offsets_t = torch.from_numpy(
-                        pending.offsets.astype(np.int64, copy=False)
+                    target_block_offsets_t = torch.from_numpy(
+                        pending_write.target_block_offsets.astype(np.int64, copy=False)
                     )
-                    positions_t = torch.from_numpy(
-                        pending.positions.astype(np.int32, copy=False)
+                    token_positions_t = torch.from_numpy(
+                        pending_write.token_positions.astype(np.int32, copy=False)
                     )
 
-                    layer_store[logical_ids_t, offsets_t, :] = pending.hs_cpu
+                    # Scatter the token-contiguous CPU snapshot rows into their
+                    # block-addressed destinations in the persistent CPU store.
+                    layer_store[
+                        target_logical_ids_t,
+                        target_block_offsets_t,
+                        :,
+                    ] = pending_write.packed_hs_cpu
 
-                    self.cpu_block_positions[logical_ids_t, offsets_t] = positions_t
+                    self.cpu_block_positions[
+                        target_logical_ids_t, target_block_offsets_t
+                    ] = token_positions_t
 
                     unique_ids, inverse = np.unique(
-                        pending.logical_ids, return_inverse=True
+                        pending_write.target_logical_ids, return_inverse=True
                     )
                     max_valid_lens = np.zeros(unique_ids.shape[0], dtype=np.int32)
                     np.maximum.at(
                         max_valid_lens,
                         inverse,
-                        pending.offsets.astype(np.int32, copy=False) + 1,
+                        pending_write.target_block_offsets.astype(np.int32, copy=False)
+                        + 1,
                     )
                     unique_ids_t = torch.from_numpy(
                         unique_ids.astype(np.int64, copy=False)
@@ -473,36 +652,23 @@ class LayerRecomputeManager:
             return
 
         selected_indices = np.arange(positions_np.shape[0], dtype=np.int64)
-        logical_ids = logical_ids_np.astype(np.int64, copy=True)
-        offsets = block_offsets_np.astype(np.int64, copy=True)
-        positions = positions_np.astype(np.int32, copy=True)
+        target_logical_ids = logical_ids_np.astype(np.int64, copy=True)
+        target_block_offsets = block_offsets_np.astype(np.int64, copy=True)
+        token_positions = positions_np.astype(np.int32, copy=True)
 
         with record_function_or_nullcontext(f"runkv_recompute:capture_hs:L{layer_idx}"):
             token_indices = torch.from_numpy(selected_indices).to(
                 hidden_states_normed.device, dtype=torch.long
             )
-            hs_gpu = hidden_states_normed.index_select(0, token_indices).contiguous()
-
-        hs_cpu: torch.Tensor
-        with record_function_or_nullcontext(
-            f"runkv_recompute:hs_d2h_copy:L{layer_idx}"
-        ):
-            if self._hs_d2h_stream is not None and hs_gpu.is_cuda:
-                with torch.cuda.stream(self._hs_d2h_stream):
-                    hs_cpu = hs_gpu.to("cpu", non_blocking=True)
-                    event = torch.cuda.Event()
-                    event.record(self._hs_d2h_stream)
-                self._hs_d2h_events_by_layer[layer_idx].append(event)
-            else:
-                hs_cpu = hs_gpu.to("cpu")
-
-        self._pending_writes_by_layer[layer_idx].append(
-            _PendingLayerWrite(
-                hs_cpu=hs_cpu,
-                logical_ids=logical_ids,
-                offsets=offsets,
-                positions=positions,
-            )
+            packed_hs_gpu = hidden_states_normed.index_select(
+                0, token_indices
+            ).contiguous()
+        self._enqueue_hidden_state_write(
+            layer_idx=layer_idx,
+            packed_hs_gpu=packed_hs_gpu,
+            target_logical_ids=target_logical_ids,
+            target_block_offsets=target_block_offsets,
+            token_positions=token_positions,
         )
 
     def _get_step_arrays(
@@ -523,6 +689,78 @@ class LayerRecomputeManager:
             getattr(gpu_model_runner, "_lr_positions_np", None),
             getattr(gpu_model_runner, "_lr_logical_ids_np", None),
             getattr(gpu_model_runner, "_lr_block_offsets_np", None),
+        )
+
+    def _resolve_logical_ids_and_offsets(
+        self,
+        *,
+        req_indices: np.ndarray,
+        positions: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if (
+            self._step_logical_block_table_np is None
+            or self._step_num_blocks_per_row_np is None
+        ):
+            raise ValueError(
+                "capture_layer_input_d2h requires begin_step() to populate the "
+                "logical block table for this step."
+            )
+
+        if np.any(req_indices < 0):
+            raise ValueError("req_indices must be non-negative.")
+        if np.any(positions < 0):
+            raise ValueError("positions must be non-negative.")
+
+        block_indices = positions // self.block_size
+        row_block_limits = self._step_num_blocks_per_row_np[req_indices]
+        if np.any(block_indices >= row_block_limits):
+            raise ValueError(
+                "positions reference a block outside the logical block table for "
+                "the current step."
+            )
+
+        logical_ids = self._step_logical_block_table_np[req_indices, block_indices]
+        if np.any(logical_ids < 0):
+            raise ValueError("Encountered invalid logical block ids while capturing.")
+
+        offsets = positions % self.block_size
+        return (
+            logical_ids.astype(np.int64, copy=False),
+            offsets.astype(np.int64, copy=False),
+            positions.astype(np.int32, copy=False),
+        )
+
+    def _enqueue_hidden_state_write(
+        self,
+        *,
+        layer_idx: int,
+        packed_hs_gpu: torch.Tensor,
+        target_logical_ids: np.ndarray,
+        target_block_offsets: np.ndarray,
+        token_positions: np.ndarray,
+    ) -> None:
+        packed_hs_cpu: torch.Tensor
+        with record_function_or_nullcontext(
+            f"runkv_recompute:hs_d2h_copy:L{layer_idx}"
+        ):
+            # Keep the rows token-contiguous here. sync_hs_d2h() later scatters
+            # them into the block-addressed CPU store using the target arrays.
+            if self._hs_d2h_stream is not None and packed_hs_gpu.is_cuda:
+                with torch.cuda.stream(self._hs_d2h_stream):
+                    packed_hs_cpu = packed_hs_gpu.to("cpu", non_blocking=True)
+                    event = torch.cuda.Event()
+                    event.record(self._hs_d2h_stream)
+                self._hs_d2h_events_by_layer[layer_idx].append(event)
+            else:
+                packed_hs_cpu = packed_hs_gpu.to("cpu")
+
+        self._pending_writes_by_layer[layer_idx].append(
+            _PendingLayerWrite(
+                packed_hs_cpu=packed_hs_cpu,
+                target_logical_ids=target_logical_ids,
+                target_block_offsets=target_block_offsets,
+                token_positions=token_positions,
+            )
         )
 
     def _resolve_model_layers(self) -> tuple[list[Any], str, str]:

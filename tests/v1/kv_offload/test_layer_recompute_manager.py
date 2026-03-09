@@ -38,12 +38,14 @@ def _make_manager(
     block_size: int = 4,
     hidden_size: int = 3,
     io_prefix_blocks: list[int] | None = None,
+    layer_recompute_mode: str = "io_hidden_states",
 ) -> LayerRecomputeManager:
     io_prefix_blocks = io_prefix_blocks or [1] * num_layers
     kv_offload_config = RunKVOffloadConfig(
         enabled=True,
         enable_layer_recompute=True,
         layer_recompute_io_prefix_blocks=io_prefix_blocks,
+        layer_recompute_mode=layer_recompute_mode,
     )
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
@@ -123,6 +125,59 @@ def test_layernorm_hook_and_sync_store_suffix_tokens() -> None:
     assert manager.cpu_block_valid_lens[2].item() == 2
 
     manager.remove_layernorm_hooks()
+
+
+def test_capture_layer_input_d2h_and_load_cpu_fill_roundtrip() -> None:
+    manager = _make_manager(io_prefix_blocks=[1, 1], block_size=4, hidden_size=3)
+
+    manager.begin_step(
+        req_ids=["req-1"],
+        req_indices_np=np.array([0, 0, 0], dtype=np.int32),
+        positions_np=np.array([4, 5, 6], dtype=np.int32),
+        logical_ids_np=np.array([2, 2, 2], dtype=np.int32),
+        block_offsets_np=np.array([0, 1, 2], dtype=np.int32),
+        logical_block_table_np=np.array([[1, 2, -1]], dtype=np.int32),
+        num_blocks_per_row=np.array([2], dtype=np.int32),
+    )
+
+    hs = torch.tensor(
+        [[2.0, 2.0, 2.0], [3.0, 3.0, 3.0], [4.0, 4.0, 4.0]], dtype=torch.float32
+    )
+    manager.capture_layer_input_d2h(
+        layer_idx=1,
+        hidden_states=hs,
+        req_indices=np.array([0, 0, 0], dtype=np.int32),
+        positions=np.array([4, 5, 6], dtype=np.int32),
+    )
+
+    manager.sync_hs_d2h()
+
+    stored = manager.cpu_layer_inputs_by_layer[1]
+    assert torch.allclose(stored[2, 0], torch.tensor([2.0, 2.0, 2.0]))
+    assert torch.allclose(stored[2, 1], torch.tensor([3.0, 3.0, 3.0]))
+    assert torch.allclose(stored[2, 2], torch.tensor([4.0, 4.0, 4.0]))
+
+    hs_gpu = manager.load_cpu_fill_h2d(
+        layer_idx=1,
+        cpu_fill_positions=np.array([4, 6], dtype=np.int32),
+        cpu_fill_logical_ids=np.array([2, 2], dtype=np.int32),
+        cpu_fill_block_offsets=np.array([0, 2], dtype=np.int32),
+    )
+
+    assert torch.allclose(
+        hs_gpu,
+        torch.tensor([[2.0, 2.0, 2.0], [4.0, 4.0, 4.0]], dtype=torch.float32),
+    )
+    assert manager.sync_cpu_fill_h2d(1) is hs_gpu
+
+
+def test_register_layernorm_hooks_is_noop_for_dynamic_mode() -> None:
+    manager = _make_manager(layer_recompute_mode="prev_layer_output_dynamic")
+    dummy_runner = SimpleNamespace()
+
+    manager.register_layernorm_hooks(dummy_runner)
+
+    assert manager._layernorm_hook_handles == []
 
 
 def test_compute_skip_block_ids_is_suffix_only_by_block_index() -> None:

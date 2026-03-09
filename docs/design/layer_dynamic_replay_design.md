@@ -838,6 +838,13 @@ Step 5 验证命令：
 
 **目标**：在新模式下，将 hidden-state 捕获从 "layernorm hook" 改为 "layer 输入/输出显式捕获"。
 
+**实现状态**：已完成（manager 侧能力）
+
+**设计原则**：
+- CPU hidden-state store 是持久化介质，用来保存可跨 step / 跨层复用的“目标层输入”副本
+- 运行时的活跃 `hidden_states` 仍然走 vLLM / OPT 原本 forward 的主通路张量，不额外维护一套长期存在的 GPU per-layer hidden-state store
+- `cpu_fill` 只在需要时从 CPU store 临时拉起一段 hidden states 到 GPU，并与上一层 replay 输出拼接；scheduled tokens 的主干计算仍直接复用 vLLM 原本的 `hidden_states`
+
 **改动文件**：
 - `vllm/v1/worker/layer_recompute.py` / `LayerRecomputeManager`
   - 新增方法 `capture_layer_input_d2h()`：
@@ -867,10 +874,72 @@ Step 5 验证命令：
     - 拼成连续 tensor，async H2D 到 GPU
     - 返回 GPU tensor `[cpu_fill_token_count, hidden_size]`
   - 在新模式下，跳过 layernorm hook 注册（不调用 `register_layernorm_hooks`）
+- `tests/v1/kv_offload/test_layer_recompute_manager.py`
+  - 补充 Step 6 manager 单元测试
+
+**实际改动**：
+- 已在 `vllm/v1/worker/layer_recompute.py` 中补充 dynamic replay 需要的 manager 侧接口
+  - `cpu_layer_inputs_by_layer`：
+    - 作为现有 `cpu_attn_inputs_by_layer` 的同一物理存储别名
+    - 供新模式按“目标层输入”语义访问
+  - `capture_layer_input_d2h()`：
+    - 接收当前层 scheduled tokens 的运行时 `hidden_states`
+    - 根据 `begin_step()` 缓存的 `logical_block_table_np + num_blocks_per_row` 反查 `logical_id / block_offset`
+    - 复用现有异步 D2H + pending write 机制，落到 CPU store
+  - `load_cpu_fill_h2d_async()` / `sync_cpu_fill_h2d()`：
+    - 从 CPU store 中按 `cpu_fill_positions / logical_ids / block_offsets` 拉取 hidden states
+    - 异步 H2D 到 GPU，并按 layer 缓存 pending load
+  - `load_cpu_fill_h2d()`：
+    - 同步包装，内部调用 async + sync
+  - `register_layernorm_hooks()`：
+    - 在 `layer_recompute_mode=\"prev_layer_output_dynamic\"` 下直接 no-op
+- 已补充 `begin_step()` 缓存：
+  - `_step_logical_block_table_np`
+  - `_step_num_blocks_per_row_np`
+  - 供显式 capture 路径反查 token 对应的 logical block
+- 已在 `tests/v1/kv_offload/test_layer_recompute_manager.py` 中新增测试：
+  - `capture_layer_input_d2h -> sync_hs_d2h -> load_cpu_fill_h2d` round-trip
+  - dynamic mode 下 `register_layernorm_hooks()` 不注册 hook
+
+**如何使用**：
+- 显式捕获当前层 scheduled token 的目标层输入：
+  ```python
+  manager.capture_layer_input_d2h(
+      layer_idx=target_layer_idx,
+      hidden_states=scheduled_hidden_states,
+      req_indices=req_indices_np,
+      positions=positions_np,
+  )
+  ```
+- 在 step 尾或需要时 materialize 到 CPU store：
+  ```python
+  manager.sync_hs_d2h()
+  ```
+- 从 CPU store 拉起当前层 `cpu_fill`：
+  ```python
+  cpu_fill_hs = manager.load_cpu_fill_h2d(
+      layer_idx=layer_idx,
+      cpu_fill_positions=plan.cpu_fill_positions,
+      cpu_fill_logical_ids=plan.cpu_fill_logical_ids,
+      cpu_fill_block_offsets=plan.cpu_fill_block_offsets,
+  )
+  ```
+- 如果要与 Step 8 的 pre-hook 流水线对接，可以改用：
+  ```python
+  manager.load_cpu_fill_h2d_async(...)
+  manager.sync_cpu_fill_h2d(layer_idx)
+  ```
 
 **验证方式**：
 - 手动调用 capture + load，验证 D2H → H2D 的数据完整性
 - 验证 layernorm hook 在新模式下不触发
+
+Step 6 验证命令：
+
+```bash
+./.venv/bin/python -m py_compile vllm/v1/worker/layer_recompute.py tests/v1/kv_offload/test_layer_recompute_manager.py
+./.venv/bin/python -m pytest -q tests/v1/kv_offload/test_layer_recompute_manager.py -k 'capture_layer_input_d2h or register_layernorm_hooks_is_noop_for_dynamic_mode'
+```
 
 **依赖**：Step 3
 
