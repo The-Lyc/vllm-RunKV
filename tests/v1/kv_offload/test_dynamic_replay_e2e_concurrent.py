@@ -2,27 +2,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-High-Concurrency E2E Test for RunKV KV Cache Offloading.
+High-Concurrency E2E Test for Dynamic Replay.
 
-This script tests RunKV under high concurrency scenarios:
+This script tests dynamic replay under high concurrency scenarios:
 - Multiple concurrent requests processed simultaneously
 - Varying prompt lengths and generation lengths
 - Stress testing the offloading/prefetching pipeline
-- Comparing outputs with baseline (RunKV disabled)
+- Comparing outputs with baseline (dynamic replay disabled)
 
 Usage:
-    python test_runkv_e2e_concurrent.py [--model MODEL] [--num-requests N]
+    python test_dynamic_replay_e2e_concurrent.py [--model MODEL] [--num-requests N]
 
 Profiling with Nsight Systems:
     # Method 1: Profile entire run with vLLM's built-in NVTX scopes
     VLLM_NVTX_SCOPES_FOR_PROFILING=1 nsys profile -o vllm_profile \
         --trace=cuda,nvtx \
-        python test_runkv_e2e_concurrent.py --num-requests 50
+        python test_dynamic_replay_e2e_concurrent.py --num-requests 50
 
     # Method 2: Profile with layer-wise NVTX tracing (more detailed)
     VLLM_NVTX_SCOPES_FOR_PROFILING=1 nsys profile -o vllm_detailed \
         --trace=cuda,nvtx \
-        python test_runkv_e2e_concurrent.py --num-requests 50 \
+        python test_dynamic_replay_e2e_concurrent.py --num-requests 50 \
         --enable-layerwise-nvtx-tracing
 
     # Method 3: Use --profile flag to control capture range
@@ -30,35 +30,45 @@ Profiling with Nsight Systems:
         --capture-range=cudaProfilerApi \
         --capture-range-end=stop \
         --trace=cuda,nvtx \
-        python test_runkv_e2e_concurrent.py --num-requests 50 --profile
+        python test_dynamic_replay_e2e_concurrent.py --num-requests 50 --profile
 
 Requirements:
     - CUDA available
-    - vLLM installed with RunKV support
+    - vLLM installed with dynamic replay support
     - nvtx package (pip install nvtx) for NVTX markers
 
 Example:
-    python test_runkv_e2e_concurrent.py --model "~/hf_models/Qwen3-0.6B" \
+    python test_dynamic_replay_e2e_concurrent.py --model "~/hf_models/Qwen3-0.6B" \
         --num-requests 100 --use-very-long-prompts
 """
 
 import argparse
 import contextlib
+import difflib
 import os
 import random
+import re
+import shutil
 import sys
+import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 try:
     from tests.v1.kv_offload.prompt_dataset import (
+        EXTRA_LONG_PROMPTS,
         MEDIUM_PROMPTS,
         SAMPLE_PROMPTS,
         VERY_LONG_PROMPTS,
     )
 except ModuleNotFoundError:
-    from prompt_dataset import MEDIUM_PROMPTS, SAMPLE_PROMPTS, VERY_LONG_PROMPTS
+    from prompt_dataset import (
+        EXTRA_LONG_PROMPTS,
+        MEDIUM_PROMPTS,
+        SAMPLE_PROMPTS,
+        VERY_LONG_PROMPTS,
+    )
 
 
 class _Ansi:
@@ -97,6 +107,153 @@ def _status_color(text: str) -> str:
     if "MISMATCH" in text:
         return _c(text, _Ansi.RED, _Ansi.BOLD)
     return _c(text, _Ansi.YELLOW, _Ansi.BOLD)
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _visible_len(text: str) -> int:
+    return len(_ANSI_ESCAPE_RE.sub("", text))
+
+
+def _first_diff_char_idx(a: str, b: str) -> int | None:
+    if a == b:
+        return None
+    min_len = min(len(a), len(b))
+    for idx in range(min_len):
+        if a[idx] != b[idx]:
+            return idx
+    return min_len
+
+
+def _first_diff_token_idx(a: list[int], b: list[int]) -> int | None:
+    if a == b:
+        return None
+    min_len = min(len(a), len(b))
+    for idx in range(min_len):
+        if a[idx] != b[idx]:
+            return idx
+    return min_len
+
+
+def _line_col_from_char_idx(text: str, char_idx: int) -> tuple[int, int]:
+    line = text.count("\n", 0, char_idx) + 1
+    last_newline = text.rfind("\n", 0, char_idx)
+    col = char_idx + 1 if last_newline == -1 else char_idx - last_newline
+    return line, col
+
+
+def _wrap_text_for_diff(text: str, width: int) -> list[str]:
+    if not text:
+        return [""]
+
+    wrapper = textwrap.TextWrapper(
+        width=width,
+        replace_whitespace=False,
+        drop_whitespace=False,
+        break_long_words=True,
+        break_on_hyphens=False,
+    )
+    wrapped_lines: list[str] = []
+    for line in text.splitlines():
+        if not line:
+            wrapped_lines.append("")
+            continue
+        wrapped = wrapper.wrap(line)
+        wrapped_lines.extend(wrapped if wrapped else [""])
+
+    if text.endswith("\n"):
+        wrapped_lines.append("")
+
+    return wrapped_lines or [""]
+
+
+def _highlight_text_diff(left: str, right: str) -> tuple[str, str]:
+    left_parts: list[str] = []
+    right_parts: list[str] = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=left, b=right).get_opcodes():
+        left_chunk = left[i1:i2]
+        right_chunk = right[j1:j2]
+        if tag == "equal":
+            left_parts.append(left_chunk)
+            right_parts.append(right_chunk)
+            continue
+        if left_chunk:
+            left_parts.append(_c(left_chunk, _Ansi.RED, _Ansi.BOLD))
+        if right_chunk:
+            right_parts.append(_c(right_chunk, _Ansi.GREEN, _Ansi.BOLD))
+    return "".join(left_parts), "".join(right_parts)
+
+
+def _print_side_by_side_text_diff(
+    baseline_label: str,
+    baseline_text: str,
+    compare_label: str,
+    compare_text: str,
+    mismatch_token_idx: int | None = None,
+    mismatch_global_idx: int | None = None,
+) -> None:
+    total_width = shutil.get_terminal_size(fallback=(180, 20)).columns
+    col_width = max(40, (total_width - 15) // 2)
+    base_lines = _wrap_text_for_diff(baseline_text, col_width)
+    comp_lines = _wrap_text_for_diff(compare_text, col_width)
+
+    first_diff = _first_diff_char_idx(baseline_text, compare_text)
+    location = ""
+    if first_diff is not None:
+        line, col = _line_col_from_char_idx(baseline_text, first_diff)
+        location = f" first diff at char {first_diff} (line {line}, col {col})"
+    token_location = ""
+    if mismatch_token_idx is not None:
+        token_location = f", token {mismatch_token_idx}"
+        if mismatch_global_idx is not None:
+            token_location += f", global#{mismatch_global_idx}"
+
+    print(
+        _c(
+            "  --- Text diff "
+            f"({baseline_label} vs {compare_label})"
+            f"{location}{token_location} ---",
+            _Ansi.YELLOW,
+            _Ansi.BOLD,
+        )
+    )
+    print(
+        _c(
+            f"  {'row':>4} | {baseline_label:<{col_width}} | "
+            f"{compare_label:<{col_width}}",
+            _Ansi.DIM,
+        )
+    )
+
+    row_idx = 0
+    matcher = difflib.SequenceMatcher(a=base_lines, b=comp_lines)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        left_block = base_lines[i1:i2]
+        right_block = comp_lines[j1:j2]
+        if tag == "equal":
+            for left_line, right_line in zip(left_block, right_block, strict=False):
+                print(f"  {row_idx:>4} | {left_line.ljust(col_width)} | {right_line}")
+                row_idx += 1
+            continue
+
+        max_rows = max(len(left_block), len(right_block))
+        for offset in range(max_rows):
+            left_line = left_block[offset] if offset < len(left_block) else None
+            right_line = right_block[offset] if offset < len(right_block) else None
+
+            if left_line is None:
+                left_render = _c("<no line>", _Ansi.DIM)
+                right_render = _c(right_line or "", _Ansi.GREEN, _Ansi.BOLD)
+            elif right_line is None:
+                left_render = _c(left_line, _Ansi.RED, _Ansi.BOLD)
+                right_render = _c("<no line>", _Ansi.DIM)
+            else:
+                left_render, right_render = _highlight_text_diff(left_line, right_line)
+
+            left_pad = " " * max(0, col_width - _visible_len(left_render))
+            print(f"  {row_idx:>4} | {left_render}{left_pad} | {right_render}")
+            row_idx += 1
 
 
 # ============================================================================
@@ -197,7 +354,7 @@ def check_cuda() -> bool:
         if not torch.cuda.is_available():
             print(
                 _c(
-                    "CUDA is not available. RunKV requires a CUDA-enabled GPU.",
+                    "CUDA is not available. Dynamic replay requires a CUDA-enabled GPU.",
                     _Ansi.RED,
                 )
             )
@@ -233,6 +390,8 @@ def _build_engine(
         gpu_memory_utilization=gpu_memory_utilization,
         enforce_eager=True,
         disable_log_stats=True,
+        disable_cascade_attn=True,
+        enable_prefix_caching=False,
         max_num_seqs=max_num_seqs,
         kv_offload_config=kv_offload_config,
         enable_layerwise_nvtx_tracing=enable_layerwise_nvtx_tracing,
@@ -249,14 +408,16 @@ def _build_engine(
 
 
 def _assert_runkv_active(engine) -> None:
-    """Verify that RunKV is properly enabled in the engine."""
+    """Verify that the replay engine's RunKV backend is properly enabled."""
     vllm_config = getattr(engine, "vllm_config", None)
     if vllm_config is None:
-        raise RuntimeError("Cannot access engine.vllm_config to verify RunKV state.")
+        raise RuntimeError(
+            "Cannot access engine.vllm_config to verify replay engine state."
+        )
 
     cfg = getattr(vllm_config, "kv_offload_config", None)
     if cfg is None or not getattr(cfg, "enabled", False):
-        raise RuntimeError("RunKV not enabled in vllm_config.kv_offload_config.")
+        raise RuntimeError("Replay config is not enabled in kv_offload_config.")
 
     executor = getattr(engine, "model_executor", None)
     if executor is None or not hasattr(executor, "driver_worker"):
@@ -271,14 +432,18 @@ def _assert_runkv_active(engine) -> None:
 
     model_runner = getattr(worker, "model_runner", None)
     if model_runner is None:
-        raise RuntimeError("Cannot access worker.model_runner to verify RunKV state.")
+        raise RuntimeError(
+            "Cannot access worker.model_runner to verify replay engine state."
+        )
 
     if not getattr(model_runner, "use_runkv", False):
-        raise RuntimeError("model_runner.use_runkv is False (RunKV not active).")
+        raise RuntimeError("model_runner.use_runkv is False (replay backend inactive).")
     if not getattr(getattr(model_runner, "kv_offload_config", None), "enabled", False):
         raise RuntimeError("model_runner.kv_offload_config.enabled is False.")
     if not getattr(model_runner, "kv_buffers", None):
-        raise RuntimeError("RunKV is active but model_runner.kv_buffers is empty.")
+        raise RuntimeError(
+            "Replay backend is active but model_runner.kv_buffers is empty."
+        )
 
 
 def _shutdown_engine(engine) -> None:
@@ -311,7 +476,9 @@ def generate_test_requests(
     max_tokens: int,
     use_long_prompts: bool = False,
     use_very_long_prompts: bool = False,
+    use_extra_long_prompts: bool = False,
     long_prompt_ratio: float = 0.3,
+    extra_prompt_ratio: float = 0.1,
     seed: int = 42,
 ) -> list[tuple[str, str, int]]:
     """
@@ -323,6 +490,7 @@ def generate_test_requests(
         max_tokens: Maximum tokens to generate per request
         use_long_prompts: Include medium-length prompts (~50-100 tokens)
         use_very_long_prompts: Include very long prompts (~512 tokens)
+        use_extra_long_prompts: Include extra long prompts (~2048 tokens)
         long_prompt_ratio: Fraction of requests using longer prompts
         seed: Random seed for reproducibility
 
@@ -335,16 +503,21 @@ def generate_test_requests(
     # Build prompt pools
     short_prompts = SAMPLE_PROMPTS
     long_prompts = []
+    extra_long_prompts = []
     if use_long_prompts:
         long_prompts.extend(MEDIUM_PROMPTS)
     if use_very_long_prompts:
         long_prompts.extend(VERY_LONG_PROMPTS)
+    if use_extra_long_prompts:
+        extra_long_prompts.extend(EXTRA_LONG_PROMPTS)
 
     for i in range(num_requests):
         request_id = f"concurrent-test-{i:06d}"
 
         # Decide whether to use long or short prompt
-        if long_prompts and random.random() < long_prompt_ratio:
+        if extra_long_prompts and random.random() < extra_prompt_ratio:
+            prompt = random.choice(extra_long_prompts)
+        elif long_prompts and random.random() < long_prompt_ratio + extra_prompt_ratio:
             prompt = random.choice(long_prompts)
         else:
             prompt = random.choice(short_prompts)
@@ -568,7 +741,7 @@ def compare_outputs_multi(
     result_sets: dict[str, list[RequestResult]],
 ) -> None:
     """
-    Compare outputs across multiple result sets (e.g. baseline, runkv, recompute).
+    Compare outputs across multiple result sets (e.g. baseline, replay).
     Prints a per-request comparison for ALL requests with per-pair match status
     and first-mismatch position for divergent pairs.
     """
@@ -617,34 +790,42 @@ def compare_outputs_multi(
                 outputs[label] = maybe_res.output_text
 
         # Build per-pair match status (each non-baseline label vs baseline)
-        pair_statuses: dict[str, str] = {}  # label -> "MATCH" / "MISMATCH@token N"
-        pair_first_diff_token: dict[
-            str, int | None
-        ] = {}  # label -> first diff token idx
+        pair_statuses: dict[str, str] = {}  # label -> "MATCH" / "MISMATCH@char N"
+        pair_first_diff_token: dict[str, int | None] = {}
+        pair_first_diff_global: dict[str, int | None] = {}
         for label in labels[1:]:
             base_r = maps[baseline_label].get(rid)
             comp_r = maps[label].get(rid)
+            base_text = base_r.output_text if base_r and base_r.finished else ""
+            comp_text = comp_r.output_text if comp_r and comp_r.finished else ""
             base_ids = base_r.token_ids if (base_r and base_r.token_ids) else []
             comp_ids = comp_r.token_ids if (comp_r and comp_r.token_ids) else []
-            if base_ids == comp_ids:
-                pair_statuses[label] = "MATCH"
-                pair_first_diff_token[label] = None
+            diff_token_idx = _first_diff_token_idx(base_ids, comp_ids)
+            pair_first_diff_token[label] = diff_token_idx
+            comp_traces = comp_r.token_traces if comp_r else None
+            if (
+                diff_token_idx is not None
+                and comp_traces is not None
+                and diff_token_idx < len(comp_traces)
+            ):
+                pair_first_diff_global[label] = comp_traces[diff_token_idx].global_idx
             else:
-                # Find first divergent token index
-                min_len = min(len(base_ids), len(comp_ids))
-                first_diff = min_len
-                for ti in range(min_len):
-                    if base_ids[ti] != comp_ids[ti]:
-                        first_diff = ti
-                        break
-                pair_first_diff_token[label] = first_diff
-                # Annotate with global decode index if traces available
-                comp_traces = comp_r.token_traces if comp_r else None
-                global_info = ""
-                if comp_traces and first_diff < len(comp_traces):
-                    g = comp_traces[first_diff].global_idx
-                    global_info = f", global#{g}"
-                pair_statuses[label] = f"MISMATCH@token {first_diff}{global_info}"
+                pair_first_diff_global[label] = None
+
+            first_diff = _first_diff_char_idx(base_text, comp_text)
+            if first_diff is None:
+                pair_statuses[label] = "MATCH"
+            else:
+                line, col = _line_col_from_char_idx(base_text, first_diff)
+                token_info = ""
+                if diff_token_idx is not None:
+                    token_info = f", token {diff_token_idx}"
+                    global_idx = pair_first_diff_global[label]
+                    if global_idx is not None:
+                        token_info += f", global#{global_idx}"
+                pair_statuses[label] = (
+                    f"MISMATCH@char {first_diff} (L{line}:C{col}{token_info})"
+                )
 
         # Update pairwise counts (all pairs, not just vs baseline)
         for i, la in enumerate(labels):
@@ -662,7 +843,7 @@ def compare_outputs_multi(
                 prompt = maybe_res.prompt
                 break
 
-        # Build status line: e.g. "RunKV=MATCH | Recompute=MISMATCH@char 42"
+        # Build status line: e.g. "Replay=MISMATCH@char 42"
         status_parts = [f"{label}={pair_statuses[label]}" for label in labels[1:]]
         all_match = all(s == "MATCH" for s in pair_statuses.values())
         overall = "ALL MATCH" if all_match else " | ".join(status_parts)
@@ -689,58 +870,23 @@ def compare_outputs_multi(
                 f"  [{_status_color(tag)}]"
             )
 
-        # For mismatches, print token-level detail around the divergence point
+        # For mismatches, print side-by-side text diff with inline highlights.
         for label in labels[1:]:
-            diff_idx = pair_first_diff_token.get(label)
-            if diff_idx is None:
+            if pair_statuses.get(label) == "MATCH":
                 continue  # MATCH
 
             base_r = maps[baseline_label].get(rid)
             comp_r = maps[label].get(rid)
-            base_ids = base_r.token_ids if (base_r and base_r.token_ids) else []
-            comp_ids = comp_r.token_ids if (comp_r and comp_r.token_ids) else []
-            comp_traces = comp_r.token_traces if comp_r else None
-
-            # Show a window of tokens around the divergence
-            ctx_before = 3
-            ctx_after = 5
-            start = max(0, diff_idx - ctx_before)
-            end = min(max(len(base_ids), len(comp_ids)), diff_idx + ctx_after + 1)
-
-            print(
-                _c(
-                    f"  --- Token detail ({baseline_label} vs {label})"
-                    f" around divergence at token {diff_idx} ---",
-                    _Ansi.YELLOW,
-                    _Ansi.BOLD,
-                )
+            base_text = base_r.output_text if base_r and base_r.finished else ""
+            comp_text = comp_r.output_text if comp_r and comp_r.finished else ""
+            _print_side_by_side_text_diff(
+                baseline_label,
+                base_text,
+                label,
+                comp_text,
+                mismatch_token_idx=pair_first_diff_token.get(label),
+                mismatch_global_idx=pair_first_diff_global.get(label),
             )
-            print(
-                _c(
-                    f"  {'idx':>5} {'global':>7} | "
-                    f"{'baseline_tid':>13} {'compare_tid':>13} {'status':>10}",
-                    _Ansi.DIM,
-                )
-            )
-            for ti in range(start, end):
-                b_tid = base_ids[ti] if ti < len(base_ids) else "<eos>"
-                c_tid = comp_ids[ti] if ti < len(comp_ids) else "<eos>"
-
-                # Global decode index from the compare side
-                g_str = ""
-                if comp_traces and ti < len(comp_traces):
-                    g_str = str(comp_traces[ti].global_idx)
-
-                marker = " " if b_tid == c_tid else "<<"
-                arrow = " >>>>" if ti == diff_idx else ""
-                line = (
-                    f"  {ti:>5} {g_str:>7} | {str(b_tid):>13} {str(c_tid):>13}"
-                    f" {marker:>10}{arrow}"
-                )
-                if marker != " ":
-                    print(_c(line, _Ansi.RED))
-                else:
-                    print(line)
 
     # Print summary
     print(_c("\n" + "-" * 80, _Ansi.DIM))
@@ -769,7 +915,9 @@ def run_benchmark(
     max_num_seqs: int,
     use_long_prompts: bool,
     use_very_long_prompts: bool,
+    use_extra_long_prompts: bool,
     long_prompt_ratio: float,
+    extra_prompt_ratio: float,
     kv_offload_config,
     label: str = "",
     verbose: bool = False,
@@ -809,10 +957,16 @@ def run_benchmark(
         )
 
     try:
-        # Verify RunKV is active if enabled
+        # Verify replay backend is active if enabled
         if kv_offload_config.enabled:
             _assert_runkv_active(engine)
-            print(_c("RunKV verification: PASSED", _Ansi.GREEN, _Ansi.BOLD))
+            print(
+                _c(
+                    "Dynamic replay engine verification: PASSED",
+                    _Ansi.GREEN,
+                    _Ansi.BOLD,
+                )
+            )
 
         # Generate test requests
         requests = generate_test_requests(
@@ -821,7 +975,9 @@ def run_benchmark(
             max_tokens=max_tokens,
             use_long_prompts=use_long_prompts,
             use_very_long_prompts=use_very_long_prompts,
+            use_extra_long_prompts=use_extra_long_prompts,
             long_prompt_ratio=long_prompt_ratio,
+            extra_prompt_ratio=extra_prompt_ratio,
         )
         print(_c(f"Generated {len(requests)} test requests", _Ansi.BLUE))
 
@@ -846,12 +1002,14 @@ def run_benchmark(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RunKV High-Concurrency E2E Test")
+    parser = argparse.ArgumentParser(
+        description="Dynamic Replay High-Concurrency E2E Test"
+    )
     parser.add_argument(
         "--model",
         type=str,
-        default="~/hf_models/opt-1.3b",
-        help="HuggingFace model name (default: ~/hf_models/opt-1.3b)",
+        default="~/hf_models/opt-2.7b",
+        help="HuggingFace model name (default: ~/hf_models/opt-2.7b)",
     )
     parser.add_argument(
         "--num-requests",
@@ -880,19 +1038,19 @@ def main():
     parser.add_argument(
         "--cpu-memory-gb",
         type=float,
-        default=30.0,
-        help="CPU memory limit for RunKV in GB (default: 20.0)",
+        default=40.0,
+        help="CPU memory limit for replay backing store in GB (default: 40.0)",
     )
     parser.add_argument(
         "--cpu-memory-fraction",
         type=float,
-        default=0.3,
-        help="CPU memory fraction for RunKV (default: 0.2)",
+        default=0.4,
+        help="CPU memory fraction for replay backing store (default: 0.4)",
     )
     parser.add_argument(
         "--compare-baseline",
         action="store_true",
-        help="Compare RunKV outputs with baseline (RunKV disabled)",
+        help="Compare replay outputs with baseline (dynamic replay disabled)",
     )
     parser.add_argument(
         "--skip-cuda-check",
@@ -914,20 +1072,20 @@ def main():
     parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
-        default=0.4,
-        help="GPU memory utilization for vLLM (default: 0.4)",
+        default=0.8,
+        help="GPU memory utilization for vLLM (default: 0.8)",
     )
     parser.add_argument(
         "--num-device-buffers",
         type=int,
         default=3,
-        help="RunKV GPU ring buffer count (default: 3)",
+        help="Replay GPU ring buffer count (default: 3)",
     )
     parser.add_argument(
         "--gpu-memory-fraction",
         type=float,
-        default=0.85,
-        help="Fraction of GPU budget for RunKV staging buffers (default: 0.85)",
+        default=0.9,
+        help="Fraction of GPU budget for replay staging buffers (default: 0.9)",
     )
     parser.add_argument(
         "--max-staging-blocks",
@@ -946,10 +1104,21 @@ def main():
         help="Include very long prompts (~512 tokens) for stress testing",
     )
     parser.add_argument(
+        "--use-extra-long-prompts",
+        action="store_true",
+        help="Include extra long prompts (~2048 tokens) for stress testing",
+    )
+    parser.add_argument(
         "--long-prompt-ratio",
         type=float,
         default=0.3,
         help="Fraction of requests using longer prompts (default: 0.3)",
+    )
+    parser.add_argument(
+        "--extra-long-prompt-ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of requests using extra long prompts (default: 0.1)",
     )
     parser.add_argument(
         "--verbose",
@@ -973,16 +1142,16 @@ def main():
         help="Enable per-layer NVTX markers for detailed profiling",
     )
     parser.add_argument(
-        "--enable-layer-recompute",
+        "--enable-dynamic-replay",
         action="store_true",
-        help="Run an additional benchmark with layer recompute enabled",
+        help="Run an additional benchmark with dynamic replay enabled",
     )
     parser.add_argument(
         "--layer-recompute-io-prefix-blocks",
         type=int,
         nargs="+",
-        default=[19900],
-        help="IO prefix blocks per layer for recompute (default: [19900])",
+        default=[23],
+        help="IO prefix blocks per layer for recompute (default: [23])",
     )
 
     args = parser.parse_args()
@@ -993,7 +1162,10 @@ def main():
         os.environ.setdefault("VLLM_NVTX_SCOPES_FOR_PROFILING", "1")
 
     print(_c("=" * 60, _Ansi.DIM), flush=True)
-    print(_c("RunKV High-Concurrency E2E Test", _Ansi.BOLD, _Ansi.CYAN), flush=True)
+    print(
+        _c("Dynamic Replay High-Concurrency E2E Test", _Ansi.BOLD, _Ansi.CYAN),
+        flush=True,
+    )
     print(_c("=" * 60, _Ansi.DIM), flush=True)
 
     # Expand and validate model path
@@ -1067,52 +1239,21 @@ def main():
             max_num_seqs=args.max_num_seqs,
             use_long_prompts=args.use_long_prompts,
             use_very_long_prompts=args.use_very_long_prompts,
+            use_extra_long_prompts=args.use_extra_long_prompts,
             long_prompt_ratio=args.long_prompt_ratio,
+            extra_prompt_ratio=args.extra_long_prompt_ratio,
             kv_offload_config=baseline_config,
-            label="Baseline (RunKV disabled)",
+            label="Baseline",
             verbose=args.verbose,
             enable_profiling=False,  # Don't profile baseline
             enable_layerwise_nvtx_tracing=args.enable_layerwise_nvtx_tracing,
         )
 
-    # Run RunKV benchmark
-    runkv_config = RunKVOffloadConfig(
-        enabled=True,
-        num_device_buffers=args.num_device_buffers,
-        gpu_memory_fraction=args.gpu_memory_fraction,
-        enable_async_prefetch=False,
-        enable_async_offload=False,
-        cpu_memory_limit=cpu_limit_bytes,
-        cpu_memory_fraction=args.cpu_memory_fraction,
-        max_staging_blocks=(args.max_staging_blocks or None),
-    )
-
-    runkv_results: list[RequestResult]
-    runkv_stats: BenchmarkStats
-    runkv_results, runkv_stats = run_benchmark(
-        model_name=args.model,
-        num_requests=args.num_requests,
-        min_tokens=args.min_tokens,
-        max_tokens=args.max_tokens,
-        max_model_len=args.max_model_len,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_steps=args.max_steps,
-        max_num_seqs=args.max_num_seqs,
-        use_long_prompts=args.use_long_prompts,
-        use_very_long_prompts=args.use_very_long_prompts,
-        long_prompt_ratio=args.long_prompt_ratio,
-        kv_offload_config=runkv_config,
-        label="RunKV enabled",
-        verbose=args.verbose,
-        enable_profiling=args.profile,
-        enable_layerwise_nvtx_tracing=args.enable_layerwise_nvtx_tracing,
-    )
-
-    # Run Recompute benchmark (if requested)
-    recompute_results: list[RequestResult] | None = None
-    recompute_stats: BenchmarkStats | None = None
-    if args.enable_layer_recompute:
-        recompute_config = RunKVOffloadConfig(
+    # Run Replay benchmark (if requested)
+    replay_results: list[RequestResult] | None = None
+    replay_stats: BenchmarkStats | None = None
+    if args.enable_dynamic_replay:
+        replay_config = RunKVOffloadConfig(
             enabled=True,
             num_device_buffers=args.num_device_buffers,
             gpu_memory_fraction=args.gpu_memory_fraction,
@@ -1122,9 +1263,10 @@ def main():
             cpu_memory_fraction=args.cpu_memory_fraction,
             max_staging_blocks=(args.max_staging_blocks or None),
             enable_layer_recompute=True,
+            layer_recompute_mode="prev_layer_output_dynamic",
             layer_recompute_io_prefix_blocks=args.layer_recompute_io_prefix_blocks,
         )
-        recompute_results, recompute_stats = run_benchmark(
+        replay_results, replay_stats = run_benchmark(
             model_name=args.model,
             num_requests=args.num_requests,
             min_tokens=args.min_tokens,
@@ -1135,9 +1277,11 @@ def main():
             max_num_seqs=args.max_num_seqs,
             use_long_prompts=args.use_long_prompts,
             use_very_long_prompts=args.use_very_long_prompts,
+            use_extra_long_prompts=args.use_extra_long_prompts,
             long_prompt_ratio=args.long_prompt_ratio,
-            kv_offload_config=recompute_config,
-            label="RunKV + Layer Recompute",
+            extra_prompt_ratio=args.extra_long_prompt_ratio,
+            kv_offload_config=replay_config,
+            label="Dynamic Replay",
             verbose=args.verbose,
             enable_profiling=args.profile,
             enable_layerwise_nvtx_tracing=args.enable_layerwise_nvtx_tracing,
@@ -1147,9 +1291,8 @@ def main():
     result_sets: dict[str, list[RequestResult]] = {}
     if baseline_results is not None:
         result_sets["Baseline"] = baseline_results
-    result_sets["RunKV"] = runkv_results
-    if recompute_results is not None:
-        result_sets["Recompute"] = recompute_results
+    if replay_results is not None:
+        result_sets["Replay"] = replay_results
 
     if len(result_sets) >= 2:
         compare_outputs_multi(result_sets)
@@ -1203,17 +1346,9 @@ def main():
                 diff_colored = _c(diff, _Ansi.GREEN)
             print(f"{metric:<25} {va:>15.2f} {vb:>15.2f} {diff_colored:>15}")
 
-    # ---------- Baseline vs RunKV comparison ----------
-    if baseline_results is not None and baseline_stats is not None:
-        _print_perf_comparison("Baseline", baseline_stats, "RunKV", runkv_stats)
-
-    # ---------- RunKV vs Recompute comparison ----------
-    if recompute_stats is not None:
-        _print_perf_comparison("RunKV", runkv_stats, "Recompute", recompute_stats)
-
-    # ---------- Baseline vs Recompute comparison ----------
-    if baseline_stats is not None and recompute_stats is not None:
-        _print_perf_comparison("Baseline", baseline_stats, "Recompute", recompute_stats)
+    # ---------- Baseline vs Replay comparison ----------
+    if baseline_stats is not None and replay_stats is not None:
+        _print_perf_comparison("Baseline", baseline_stats, "Replay", replay_stats)
 
     # Final summary
     print(_c("\n" + "=" * 60, _Ansi.DIM))
@@ -1222,31 +1357,12 @@ def main():
 
     success = True
 
-    # RunKV summary
-    if runkv_stats.failed_requests == 0:
-        print(
-            _c(
-                f"✓ RunKV: All {runkv_stats.completed_requests} requests completed",
-                _Ansi.GREEN,
-                _Ansi.BOLD,
-            )
-        )
-    else:
-        print(
-            _c(
-                f"✗ RunKV: {runkv_stats.failed_requests} requests failed",
-                _Ansi.RED,
-                _Ansi.BOLD,
-            )
-        )
-        success = False
-
-    # Recompute summary
-    if recompute_stats is not None:
-        if recompute_stats.failed_requests == 0:
+    # Replay summary
+    if replay_stats is not None:
+        if replay_stats.failed_requests == 0:
             print(
                 _c(
-                    f"✓ Recompute: All {recompute_stats.completed_requests}"
+                    f"✓ Replay: All {replay_stats.completed_requests}"
                     " requests completed",
                     _Ansi.GREEN,
                     _Ansi.BOLD,
@@ -1255,7 +1371,7 @@ def main():
         else:
             print(
                 _c(
-                    f"✗ Recompute: {recompute_stats.failed_requests} requests failed",
+                    f"✗ Replay: {replay_stats.failed_requests} requests failed",
                     _Ansi.RED,
                     _Ansi.BOLD,
                 )

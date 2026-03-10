@@ -28,6 +28,18 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    from tests.v1.kv_offload.prompt_dataset import (
+        MEDIUM_PROMPTS,
+        PROMPT_POOLS,
+        SHORT_PROMPTS,
+        VERY_LONG_PROMPTS,
+    )
+except ModuleNotFoundError:
+    from prompt_dataset import (
+        PROMPT_POOLS,
+    )
+
 
 class _Ansi:
     RESET = "\033[0m"
@@ -111,118 +123,6 @@ def cuda_profiler_stop():
         print(_c("[PROFILE] CUDA profiler stopped", _Ansi.CYAN))
     except Exception as e:
         print(_c(f"[PROFILE] Could not stop CUDA profiler: {e}", _Ansi.RED))
-
-
-# Built-in prompt pools for single-request length sweeps.
-SHORT_PROMPTS = [
-    "Hello, my name is",
-    "The capital of France is",
-    "Explain quantum computing in simple terms:",
-    "Write a short poem about the ocean:",
-    "What is the meaning of life?",
-    "Once upon a time in a land far away,",
-    "Describe the process of photosynthesis:",
-    "What are the benefits of regular exercise?",
-]
-
-MEDIUM_PROMPTS = [
-    (
-        "Please provide a detailed explanation of how neural networks learn "
-        "through backpropagation, including the mathematical foundations and "
-        "practical considerations:"
-    ),
-    (
-        "Write a comprehensive essay about the history of computing, from "
-        "early mechanical calculators to modern quantum computers, discussing "
-        "key innovations and pioneers:"
-    ),
-    (
-        "Describe the evolution of programming languages from assembly to "
-        "modern high-level languages, including their design philosophies and "
-        "use cases:"
-    ),
-    (
-        "Discuss the impact of social media on modern communication, "
-        "relationships, and mental health, with both positive and negative "
-        "aspects:"
-    ),
-]
-
-VERY_LONG_PROMPTS = [
-    """You are an expert software architect reviewing a complex distributed system.
-The system consists of multiple microservices communicating via message queues and
-REST APIs. The main components include:
-
-1. User Authentication Service: Handles user login, registration, and token
-management. Uses JWT tokens with RSA-256 signing. Stores user credentials in
-PostgreSQL with bcrypt hashing.
-
-2. Product Catalog Service: Manages product information, categories, and
-inventory. Uses Elasticsearch for full-text search and Redis for caching
-frequently accessed items.
-
-3. Order Processing Service: Handles order creation, payment processing, and
-fulfillment. Integrates with external payment gateways and shipping providers.
-
-4. Notification Service: Sends emails, SMS, and push notifications. Uses
-message queues and supports templated messages with internationalization.
-
-5. Analytics Service: Collects and processes user behavior data. Uses event
-streaming and analytical storage for large-scale query workloads.
-
-6. API Gateway: Routes requests to appropriate services, handles rate limiting,
-and manages API versioning. Implements circuit breaker patterns for fault
-tolerance.
-
-The system currently handles 10,000 requests per second during peak hours and
-stores 50TB of data across all services. Recent performance issues have been
-reported:
-- Order processing latency increased from 200ms to 800ms
-- Search queries timing out during high traffic
-- Memory usage spiking on the notification service
-
-Please analyze the architecture and provide detailed recommendations for:""",
-    """Abstract: Recent advances in large language models have demonstrated strong
-capabilities in natural language understanding and generation. However, the
-computational requirements for training and inference remain a significant
-challenge.
-
-Introduction:
-The transformer architecture has become the foundation for modern language
-models. Large models have shown impressive performance across diverse tasks
-including text generation, code completion, and reasoning. However, these
-models contain billions of parameters, requiring substantial computational
-resources.
-
-Key challenges in LLM deployment include:
-1. Memory bandwidth limitations during inference
-2. KV cache management for long sequences
-3. Batch processing efficiency under varying sequence lengths
-4. Quantization effects on model quality
-5. Distributed inference across multiple devices
-
-Related Work:
-Previous approaches to efficient LLM inference include paged cache management,
-attention kernel optimization, and speculative decoding. Each approach improves
-one bottleneck but often introduces new tradeoffs in complexity and reliability.
-
-Our contribution focuses on KV cache offloading to CPU memory, enabling larger
-batch sizes and longer sequences without GPU memory constraints.
-
-Methodology:
-We propose an approach called RunKV that addresses memory limitations through
-intelligent cache management. The key innovations include staged transfers,
-overlapped prefetch/offload, and robust scheduling under variable request
-lengths.
-
-Based on this context, provide a detailed technical analysis of:""",
-]
-
-PROMPT_POOLS = {
-    "short": SHORT_PROMPTS,
-    "medium": MEDIUM_PROMPTS,
-    "very-long": VERY_LONG_PROMPTS,
-}
 
 
 @dataclass
