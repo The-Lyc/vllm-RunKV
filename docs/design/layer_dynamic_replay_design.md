@@ -1126,54 +1126,37 @@ Step 8 验证命令：
 
 **目标**：验证 `compute_layer_replay_plan_for_layer()` 的核心算法正确性，以及 `RandomReplayPlanProvider` 生成的随机 plan 在各种边界条件下的正确性。
 
-**新建文件**：`tests/v1/kv_offload/test_opt_dynamic_replay_plan.py`
+**实现状态**：已完成
 
-**测试用例**：
+**改动文件**：
+- `tests/v1/kv_offload/test_opt_dynamic_replay_plan.py`
 
+**实际改动**：
+- 已为 `compute_layer_replay_plan_for_layer()` 补齐以下单元测试：
+  - token 级 `desired_replay_start_tokens` 会向下对齐到 block 边界
+  - `query_start_loc / slot_mapping / combined_*_indices` 构造正确
+  - 当前层 replay 更短时只走 GPU suffix reuse
+  - 当前层 replay 更长时会出现 `cpu_fill + gpu_reuse` 混合
+  - replay 长度为 0 时只保留 scheduled token
+  - `combined_replay_indices / combined_scheduled_indices` 对 pack/unpack 是对称的
+- 已为 provider 层补齐以下测试：
+  - `StaticReplayPlanProvider` 满足 `ReplayPlanProvider` protocol，且会按 `io_prefix_blocks * block_size` 生成起点
+  - `RandomReplayPlanProvider` 在相同 seed 下 deterministic，且输出 block-aligned
+  - 多层随机 plan 会保持核心不变量：
+    - `cpu_fill_token_count + gpu_reuse_token_count == replay_token_count`
+    - `replay_token_count + scheduled_token_count == num_actual_tokens`
+
+**如何使用**：
+- 直接运行 Step 9 对应的单测文件：
+
+```bash
+./.venv/bin/python -m pytest -q tests/v1/kv_offload/test_opt_dynamic_replay_plan.py
 ```
-Test 1: 当前层 replay 更短（静态 provider）
-  io_prefix_blocks = [2, 4]  # layer 0: 2 blocks, layer 1: 4 blocks
-  computed_len = 128, block_size = 16
-  layer 0: replay [32, 128), prev_gpu = 128 → cpu_fill [32, 128), gpu_reuse empty
-  layer 1: replay [64, 128), prev_gpu = 32  → cpu_fill empty, gpu_reuse = layer 0 output 的后缀 [64, 128)
-  验证：layer 1 的 cpu_fill_token_count == 0
 
-Test 2: 当前层 replay 相等（静态 provider）
-  io_prefix_blocks = [2, 2]
-  验证：layer 1 完全复用，cpu_fill_token_count == 0, gpu_reuse == full
-
-Test 3: 当前层 replay 更长（静态 provider）
-  io_prefix_blocks = [4, 2]
-  验证：layer 1 cpu_fill_token_count > 0 且 gpu_reuse_token_count > 0
-
-Test 4: 随机 plan 多层交替（随机 provider）
-  使用 RandomReplayPlanProvider(num_layers=8, max_blocks=8, seed=42)
-  验证每层只按自己窗口工作，无全局传播
-  验证所有层的 plan 满足不变量：
-    replay_token_count == cpu_fill_token_count + gpu_reuse_token_count
-    num_actual_tokens == replay_token_count + scheduled_token_count
-
-Test 5: 随机 plan 多 request 长度不均（随机 provider）
-  req 0: computed_len = 128, req 1: computed_len = 64
-  使用 RandomReplayPlanProvider 生成 plan
-  验证 query_start_loc / slot_mapping 正确排布
-
-Test 6: replay 长度为 0
-  io_prefix_blocks[layer] 足够大 → 该层无 replay
-  验证 plan.replay_token_count == 0
-
-Test 7: pack/unpack 对称性（随机 provider）
-  用 RandomReplayPlanProvider 生成多层 plan
-  对每层：构造 combined → unpack → 验证与原始 replay/scheduled 完全一致
-
-Test 8: slot_mapping 正确性
-  验证 slot = mapper_mapping[logical_id] * block_size + pos % block_size
-  验证 per-req 排列顺序：replay 在前、scheduled 在后
-
-Test 9: provider 接口合规性
-  StaticReplayPlanProvider 和 RandomReplayPlanProvider 都满足 ReplayPlanProvider Protocol
-  get_layer_plan 可以逐层调用，prev_layer_plan 正确传递
-```
+- 如果只想看 plan 核心算法，可聚焦：
+  - `compute_layer_replay_plan_for_layer(...)`
+  - `StaticReplayPlanProvider`
+  - `RandomReplayPlanProvider`
 
 **依赖**：Step 4
 
@@ -1183,28 +1166,39 @@ Test 9: provider 接口合规性
 
 **目标**：验证 per-layer metadata 构造逻辑。
 
-**新建文件**：`tests/v1/kv_offload/test_opt_dynamic_replay_metadata.py`
+**实现状态**：已完成
 
-**测试用例**：
+**改动文件**：
+- `tests/v1/kv_offload/test_opt_dynamic_replay_metadata.py`
 
+**实际改动**：
+- 已为 `_build_layer_attn_metadata(...)` 补齐以下测试：
+  - replay 窗口不变时 metadata 对象直接复用
+  - replay 窗口变化时 metadata 重新 build
+  - build 出来的 `CommonAttentionMetadata` 会正确携带：
+    - `query_start_loc`
+    - `seq_lens`
+    - `_num_computed_tokens_cpu`
+    - `num_actual_tokens`
+    - `max_query_len`
+    - `slot_mapping`
+    - `block_table_tensor`
+- 已补“比例变化但窗口不变”的真实语义测试：
+  - 即使 `cpu_fill / gpu_reuse` 比例变化，只要当前层 replay 窗口不变，metadata 仍可复用
+- 已补 replay 窗口变化测试：
+  - 窗口变化会导致 `query_start_loc / slot_mapping` 变化，metadata 必须重建
+- 已补基础输入校验测试：
+  - `base_seq_lens` 形状非法时会报错
+
+**如何使用**：
+- 直接运行 Step 10 对应的单测文件：
+
+```bash
+./.venv/bin/python -m pytest -q tests/v1/kv_offload/test_opt_dynamic_replay_metadata.py
 ```
-Test 1: 两层 replay 窗口相同 → metadata 对象复用
-  验证 layer_0_metadata is layer_1_metadata
 
-Test 2: 两层 replay 窗口不同 → metadata 不同
-  验证 layer_0_metadata is not layer_1_metadata
-  验证各自的 query_start_loc / num_actual_tokens / slot_mapping 正确
-
-Test 3: query_start_loc 正确性
-  2 reqs, layer 有 replay + scheduled
-  验证 query_start_loc[0] == 0
-  验证 query_start_loc[1] == req0_replay + req0_scheduled
-  验证 query_start_loc[2] == total tokens
-
-Test 4: slot_mapping 与 block_table 一致性
-  构造已知 block_table + mapper_mapping
-  验证 slot_mapping 中每个 slot 的计算正确
-```
+- 如果只想看 metadata patch / reuse 逻辑，可聚焦：
+  - `GPUModelRunner._build_layer_attn_metadata(...)`
 
 **依赖**：Step 5
 
@@ -1214,47 +1208,69 @@ Test 4: slot_mapping 与 block_table 一致性
 
 **目标**：验证新模式在真实 OPT 模型上的输出与 baseline 一致。
 
-**新建文件**：`tests/v1/kv_offload/test_opt_dynamic_replay_e2e.py`
+**实现状态**：已完成（phase-1 correctness 覆盖）
 
-**测试用例**：
+**改动文件**：
+- `tests/v1/kv_offload/test_opt_dynamic_replay_e2e.py`
 
+**实际改动**：
+- 已新增一个专用的 OPT dynamic replay e2e 文件，并改造成与 `tests/v1/kv_offload/test_runkv_e2e_concurrent.py` 相同的 benchmark/评测组织方式：
+  - 复用 `RequestResult` / `BenchmarkStats`
+  - 复用 `generate_test_requests(...)`
+  - 复用 `run_concurrent_requests(...)`
+  - 复用 `print_stats(...)`
+  - 复用 `compare_outputs_multi(...)`
+  - 本地只保留 dynamic replay 专属的 `_build_engine(...)`、config helper 和 runtime/provider 校验
+- e2e 的 engine 构建已显式传 `disable_cascade_attn=True`
+  - 避免触发 dynamic replay phase-1 对 cascade attention 的禁用校验
+- e2e 的 config 组织也已对齐并发 benchmark 风格：
+  - `Baseline(enabled=False)`
+  - `RunKV(enabled=True, async_prefetch/offload=False)`
+  - `RunKV + Dynamic Replay(enabled=True, async_prefetch/offload=True, enable_layer_recompute=True, layer_recompute_mode="prev_layer_output_dynamic")`
+- 已新增静态 provider correctness 用例：
+  - 单 request：`vanilla` vs `RunKV(no recompute)` vs `prev_layer_output_dynamic`
+  - 并发多 request：`vanilla` vs `RunKV(no recompute)` vs `prev_layer_output_dynamic`
+- 已新增随机 provider correctness 用例：
+  - 在 benchmark 运行前，把 `model_runner.replay_plan_provider` 替换成 `RandomReplayPlanProvider(seed=42)`
+  - 对比 `vanilla` 与随机 plan 动态 replay 输出完全一致
+- e2e 用例在运行前会显式检查：
+  - 模型必须是 `OPT`
+  - 必须是 pre-LN
+  - 当前环境有 CUDA
+  - 且能找到本地权重（默认复用现有 `VLLM_RUNKV_E2E_MODEL` / 本地候选路径逻辑）
+
+**如何使用**：
+- 指向本地 OPT 权重：
+
+```bash
+export VLLM_RUNKV_E2E_MODEL=/path/to/local/opt-model
 ```
-Test 1: 基础 correctness（静态 provider）
-  模型：facebook/opt-125m (pre-LN)
-  配置：runkv + layer_recompute + prev_layer_output_dynamic
-  io_prefix_blocks: [2]（单值广播到所有层）
-  单 request，prompt 128 tokens，生成 32 tokens
-  对比：新模式 output vs 旧模式 output → token 完全一致
 
-Test 2: 交替 io_prefix_blocks（静态 provider）
-  io_prefix_blocks: 逐层不同（如 [2,4,2,4,...] 按层数展开）
-  验证 output 与 baseline 一致
+- 运行 Step 11 的 e2e：
 
-Test 3: 随机 plan（随机 provider）
-  使用 RandomReplayPlanProvider(seed=42) 生成完全随机的 per-layer plan
-  验证 output 与 baseline（无 replay，全 IO）一致
-  用多个 seed 重复验证
+```bash
+./.venv/bin/python -m pytest -q tests/v1/kv_offload/test_opt_dynamic_replay_e2e.py
+```
 
-Test 4: 并发多 request（随机 provider）
-  3 个不同长度 request 并发
-  使用 RandomReplayPlanProvider
-  验证每个 request output 与单独运行一致
+- 当前 e2e 的覆盖重点是 correctness，但输出和评测形式与并发 benchmark 保持一致：
+  - benchmark 风格打印每种模式的统计信息
+  - 用 `compare_outputs_multi(...)` 打印多结果集比较
+  - 再对 `token_ids` 做严格断言，确保动态 replay 与 `vanilla` / `RunKV baseline` 完全一致
+  - 还不在这一步验证 profile 上的 IO/H2D 重叠收益
 
-Test 5: 纯 decode step
-  prompt 已跑完，每步只 decode 1 token
-  验证 replay 窗口正确（decode step 中 computed_len 持续增长）
+**验证方式**：
+- `test_opt_dynamic_replay_single_request_matches_vanilla_and_runkv_baseline`
+  - 覆盖单 request correctness
+- `test_opt_dynamic_replay_concurrent_requests_match_vanilla_and_runkv_baseline`
+  - 覆盖并发多 request correctness
+- `test_opt_dynamic_replay_random_provider_matches_vanilla_baseline`
+  - 覆盖随机 per-layer replay plan correctness
 
-Test 6: extend（multi-token scheduled）
-  一次 schedule 多个新 token
-  验证 pack/unpack 在 scheduled > 1 时正确
+Step 11 验证命令：
 
-Test 7: replay 窗口从短变长
-  先运行几步（KV cache 积累），再触发 replay 窗口变长
-  验证 CPU fill 补洞正确
-
-Test 8: 流水线预取验证
-  验证 layer i 计算时 layer i+1 的 IO/H2D 已异步启动
-  通过 nsys profile 或手动 event 计时验证重叠
+```bash
+./.venv/bin/python -m py_compile tests/v1/kv_offload/test_opt_dynamic_replay_e2e.py
+./.venv/bin/python -m pytest -q tests/v1/kv_offload/test_opt_dynamic_replay_e2e.py
 ```
 
 **依赖**：Step 8（所有代码就绪）

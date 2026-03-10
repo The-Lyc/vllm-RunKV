@@ -34,6 +34,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -59,6 +60,8 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
+logger = init_logger(__name__)
 
 
 class OPTLearnedPositionalEmbedding(nn.Embedding):
@@ -264,6 +267,8 @@ class OPTDecoder(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        self._dynamic_replay_forward_logged = False
+        self._dynamic_replay_nonzero_replay_logged = False
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -373,6 +378,16 @@ class OPTDecoder(nn.Module):
 
         scheduled_hidden_states = hidden_states
         replay_hidden_states: torch.Tensor | None = None
+        if not self._dynamic_replay_forward_logged:
+            logger.info(
+                "OPT dynamic replay forward entered: start_layer=%d, end_layer=%d, "
+                "scheduled_tokens=%d, hidden_size=%d.",
+                self.start_layer,
+                self.end_layer,
+                int(hidden_states.shape[0]),
+                int(hidden_states.shape[-1]),
+            )
+            self._dynamic_replay_forward_logged = True
         runtime.capture_scheduled_layer_input(
             target_layer_idx=self.start_layer,
             hidden_states=scheduled_hidden_states,
@@ -389,6 +404,19 @@ class OPTDecoder(nn.Module):
                     scheduled_hidden_states = layer(scheduled_hidden_states)
                 replay_hidden_states = None
             else:
+                if not self._dynamic_replay_nonzero_replay_logged:
+                    logger.info(
+                        "OPT dynamic replay active on layer %d: replay_tokens=%d "
+                        "(cpu_fill=%d, gpu_reuse=%d), scheduled_tokens=%d, "
+                        "num_actual_tokens=%d.",
+                        layer_idx,
+                        int(plan.replay_token_count),
+                        int(plan.cpu_fill_token_count),
+                        int(plan.gpu_reuse_token_count),
+                        int(plan.scheduled_token_count),
+                        int(plan.num_actual_tokens),
+                    )
+                    self._dynamic_replay_nonzero_replay_logged = True
                 cpu_fill_hidden_states = None
                 if plan.cpu_fill_token_count > 0:
                     cpu_fill_hidden_states = runtime.load_cpu_fill(layer_idx, plan)

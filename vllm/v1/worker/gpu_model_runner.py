@@ -1122,6 +1122,9 @@ class GPUModelRunner(
         self._lr_block_size: int = 0
         self._lr_num_reqs: int = 0
         self._lr_num_scheduled_tokens_np: np.ndarray | None = None
+        self._dynamic_replay_runtime_logged: bool = False
+        self._dynamic_replay_prehook_logged: bool = False
+        self._dynamic_replay_warmup_bypass_logged: bool = False
 
         # ---- RunKV debug instrumentation ----
         self._runkv_debug_enabled = runkv_debug_enabled()
@@ -2772,71 +2775,105 @@ class GPUModelRunner(
                 forward_context = get_forward_context()
                 runtime = forward_context.layer_recompute_runtime
                 if runtime is None:
-                    raise AssertionError(
-                        "Dynamic replay pre-hook requires layer_recompute_runtime."
-                    )
-                if self._lr_num_scheduled_tokens_np is None:
-                    raise AssertionError(
-                        "Dynamic replay pre-hook requires scheduled token lengths."
-                    )
-
-                current_plan = runtime.get_layer_plan(layer_idx)
-                current_metadata = runtime.get_layer_metadata(layer_idx)
-
-                next_layer_info = self._get_next_layer_info(layer_idx)
-                if next_layer_info is not None:
-                    next_layer_name, next_layer_idx, next_gid = next_layer_info
-                    next_plan = self._build_dynamic_layer_plan(
-                        layer_idx=next_layer_idx,
-                        gid=next_gid,
-                        num_reqs=self._lr_num_reqs,
-                        num_scheduled_tokens_np=self._lr_num_scheduled_tokens_np,
-                        prev_layer_plan=current_plan,
-                    )
-                    runtime.set_layer_plan(next_layer_idx, next_plan)
-                    next_metadata = self._build_layer_attn_metadata(
-                        layer_idx=next_layer_idx,
-                        plan=next_plan,
-                        prev_plan=current_plan,
-                        prev_metadata=current_metadata,
-                        base_seq_lens=self.seq_lens.cpu,
-                        base_max_seq_len=(
-                            int(np.max(self.seq_lens.np[: self._lr_num_reqs]))
-                            if self._lr_num_reqs > 0
-                            else 0
-                        ),
-                        block_table_tensor=self.paged_block_tables[next_gid],
-                        num_reqs=self._lr_num_reqs,
-                    )
-                    runtime.set_layer_metadata(next_layer_idx, next_metadata)
-
-                mapper.sync_load_layer(layer_idx)
-                manager.sync_cpu_fill_h2d(layer_idx)
-
-                if next_layer_info is not None:
-                    next_layer_name, next_layer_idx, next_gid = next_layer_info
-                    next_mapper = self.paged_block_mappers[next_gid]
-                    next_plan = runtime.get_layer_plan(next_layer_idx)
-                    next_skip_block_ids = manager.compute_skip_block_ids_for_layer(
-                        layer_idx=next_layer_idx,
-                        gid=next_gid,
-                        mapper=next_mapper,
-                        dirty_blocks=self.paged_dirty_blocks[next_gid],
-                        io_prefix_blocks=self.kv_offload_config.layer_recompute_io_prefix_blocks,
-                    )
-                    next_mapper.load_layer_async(
-                        next_layer_name,
-                        next_layer_idx,
-                        skip_block_ids=next_skip_block_ids,
-                    )
-                    if next_plan.cpu_fill_token_count > 0:
-                        manager.load_cpu_fill_h2d_async(
-                            layer_idx=next_layer_idx,
-                            cpu_fill_positions=next_plan.cpu_fill_positions,
-                            cpu_fill_logical_ids=next_plan.cpu_fill_logical_ids,
-                            cpu_fill_block_offsets=next_plan.cpu_fill_block_offsets,
+                    # Dummy/warmup forwards do not prepare dynamic replay
+                    # runtime state. Fall back to plain RunKV IO without
+                    # layer recompute for those forwards.
+                    if not getattr(
+                        self,
+                        "_dynamic_replay_warmup_bypass_logged",
+                        False,
+                    ):
+                        logger.info(
+                            "RunKV dynamic replay warmup bypass: layer=%s(L%d) "
+                            "has no layer_recompute_runtime; falling back to "
+                            "plain RunKV IO for this forward.",
+                            layer_name,
+                            layer_idx,
                         )
-                return
+                        self._dynamic_replay_warmup_bypass_logged = True
+                    manager = None
+                else:
+                    if self._lr_num_scheduled_tokens_np is None:
+                        raise AssertionError(
+                            "Dynamic replay pre-hook requires scheduled token lengths."
+                        )
+
+                    current_plan = runtime.get_layer_plan(layer_idx)
+                    current_metadata = runtime.get_layer_metadata(layer_idx)
+                    if not getattr(
+                        self,
+                        "_dynamic_replay_prehook_logged",
+                        False,
+                    ):
+                        logger.info(
+                            "RunKV dynamic replay pre-hook hit: layer=%s(L%d), "
+                            "replay_tokens=%d (cpu_fill=%d, gpu_reuse=%d), "
+                            "scheduled_tokens=%d.",
+                            layer_name,
+                            layer_idx,
+                            int(current_plan.replay_token_count),
+                            int(current_plan.cpu_fill_token_count),
+                            int(current_plan.gpu_reuse_token_count),
+                            int(current_plan.scheduled_token_count),
+                        )
+                        self._dynamic_replay_prehook_logged = True
+
+                    next_layer_info = self._get_next_layer_info(layer_idx)
+                    if next_layer_info is not None:
+                        next_layer_name, next_layer_idx, next_gid = next_layer_info
+                        next_plan = self._build_dynamic_layer_plan(
+                            layer_idx=next_layer_idx,
+                            gid=next_gid,
+                            num_reqs=self._lr_num_reqs,
+                            num_scheduled_tokens_np=self._lr_num_scheduled_tokens_np,
+                            prev_layer_plan=current_plan,
+                        )
+                        runtime.set_layer_plan(next_layer_idx, next_plan)
+                        next_metadata = self._build_layer_attn_metadata(
+                            layer_idx=next_layer_idx,
+                            plan=next_plan,
+                            prev_plan=current_plan,
+                            prev_metadata=current_metadata,
+                            base_seq_lens=self.seq_lens.cpu,
+                            base_max_seq_len=(
+                                int(np.max(self.seq_lens.np[: self._lr_num_reqs]))
+                                if self._lr_num_reqs > 0
+                                else 0
+                            ),
+                            block_table_tensor=self.paged_block_tables[next_gid],
+                            num_reqs=self._lr_num_reqs,
+                        )
+                        runtime.set_layer_metadata(next_layer_idx, next_metadata)
+
+                    mapper.sync_load_layer(layer_idx)
+                    manager.sync_cpu_fill_h2d(layer_idx)
+
+                    if next_layer_info is not None:
+                        next_layer_name, next_layer_idx, next_gid = next_layer_info
+                        next_mapper = self.paged_block_mappers[next_gid]
+                        next_plan = runtime.get_layer_plan(next_layer_idx)
+                        next_skip_block_ids = manager.compute_skip_block_ids_for_layer(
+                            layer_idx=next_layer_idx,
+                            gid=next_gid,
+                            mapper=next_mapper,
+                            dirty_blocks=self.paged_dirty_blocks[next_gid],
+                            io_prefix_blocks=(
+                                self.kv_offload_config.layer_recompute_io_prefix_blocks
+                            ),
+                        )
+                        next_mapper.load_layer_async(
+                            next_layer_name,
+                            next_layer_idx,
+                            skip_block_ids=next_skip_block_ids,
+                        )
+                        if next_plan.cpu_fill_token_count > 0:
+                            manager.load_cpu_fill_h2d_async(
+                                layer_idx=next_layer_idx,
+                                cpu_fill_positions=next_plan.cpu_fill_positions,
+                                cpu_fill_logical_ids=next_plan.cpu_fill_logical_ids,
+                                cpu_fill_block_offsets=next_plan.cpu_fill_block_offsets,
+                            )
+                    return
 
             skip_block_ids: set[int] | None = None
             if manager is not None:
@@ -7416,6 +7453,18 @@ class GPUModelRunner(
         )
         self.layer_recompute_manager.register_layernorm_hooks(self)
         self.layer_recompute_enabled = True
+        if self._is_prev_layer_output_dynamic_enabled():
+            logger.info(
+                "RunKV dynamic replay enabled: mode=%s, num_layers=%d, "
+                "block_size=%d, provider=%s, io_prefix_blocks=%s.",
+                self.kv_offload_config.layer_recompute_mode,
+                num_layers,
+                int(group_block_sizes[0]),
+                type(self.replay_plan_provider).__name__
+                if self.replay_plan_provider is not None
+                else "None",
+                self.kv_offload_config.layer_recompute_io_prefix_blocks,
+            )
 
     def _is_prev_layer_output_dynamic_enabled(self) -> bool:
         return bool(
@@ -7531,6 +7580,23 @@ class GPUModelRunner(
                 cpu_fill_logical_ids=layer0_plan.cpu_fill_logical_ids,
                 cpu_fill_block_offsets=layer0_plan.cpu_fill_block_offsets,
             )
+        if not getattr(
+            self,
+            "_dynamic_replay_runtime_logged",
+            False,
+        ):
+            logger.info(
+                "RunKV dynamic replay runtime prepared: num_reqs=%d, layer0=%s, "
+                "replay_tokens=%d (cpu_fill=%d, gpu_reuse=%d), "
+                "scheduled_tokens=%d.",
+                num_reqs,
+                layer0_name,
+                int(layer0_plan.replay_token_count),
+                int(layer0_plan.cpu_fill_token_count),
+                int(layer0_plan.gpu_reuse_token_count),
+                int(layer0_plan.scheduled_token_count),
+            )
+            self._dynamic_replay_runtime_logged = True
 
         return runtime
 
