@@ -143,6 +143,10 @@ from vllm.v1.outputs import (
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
+from vllm.v1.profiling.opt_component_mfu import (
+    OPT_COMPONENT_MFU_PROFILER_KEY,
+    OPTComponentMFUStepProfiler,
+)
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -996,6 +1000,28 @@ class GPUModelRunner(
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+        self._opt_component_mfu_step = 0
+        self._opt_component_mfu_skip_logged = False
+        self._opt_component_mfu_enabled = (
+            self.observability_config.enable_opt_component_mfu_profiling
+            and getattr(self.model_config.hf_config, "model_type", None) == "opt"
+        )
+        self._opt_component_mfu_output_path = (
+            self.observability_config.opt_component_mfu_output_path
+        )
+        self._opt_component_mfu_peak_tflops = (
+            self.observability_config.opt_component_mfu_peak_tflops
+        )
+
+        if (
+            self.observability_config.enable_opt_component_mfu_profiling
+            and not self._opt_component_mfu_enabled
+        ):
+            logger.warning_once(
+                "OPT component MFU profiling only supports OPT models; "
+                "profiling will be disabled for model_type=%s.",
+                getattr(self.model_config.hf_config, "model_type", None),
+            )
 
         # offloading parameters
         self.kv_offload_config = vllm_config.kv_offload_config
@@ -4617,6 +4643,56 @@ class GPUModelRunner(
                 pyt_hooks.register_hooks(self.model, self.model.__class__.__name__)
                 self.layerwise_nvtx_hooks_registered = True
 
+    def _get_opt_component_mfu_output_path(self) -> str | None:
+        if not self._opt_component_mfu_output_path:
+            return None
+        path = self._opt_component_mfu_output_path
+        if self.parallel_config.world_size <= 1:
+            return path
+        stem, ext = os.path.splitext(path)
+        return f"{stem}.rank{self.parallel_config.rank}{ext}"
+
+    def _maybe_create_opt_component_profiler(
+        self,
+        *,
+        cudagraph_mode: CUDAGraphMode,
+        num_scheduled_tokens: int,
+        num_reqs: int,
+    ) -> OPTComponentMFUStepProfiler | None:
+        if not self._opt_component_mfu_enabled:
+            return None
+
+        output_path = self._get_opt_component_mfu_output_path()
+        if not output_path:
+            logger.warning_once(
+                "OPT component MFU profiling is enabled but "
+                "--opt-component-mfu-output-path is not set; skipping profiling."
+            )
+            return None
+
+        if cudagraph_mode != CUDAGraphMode.NONE:
+            if not self._opt_component_mfu_skip_logged:
+                logger.warning_once(
+                    "OPT component MFU profiling only supports eager execution. "
+                    "Current step uses cudagraph mode %s; skipping profiling. "
+                    "Use --enforce-eager for stable measurements.",
+                    cudagraph_mode,
+                )
+                self._opt_component_mfu_skip_logged = True
+            return None
+
+        profiler = OPTComponentMFUStepProfiler(
+            output_path=output_path,
+            step_idx=self._opt_component_mfu_step,
+            rank=self.parallel_config.rank,
+            model_name=self.model_config.model,
+            total_scheduled_tokens=num_scheduled_tokens,
+            num_reqs=num_reqs,
+            peak_tflops=self._opt_component_mfu_peak_tflops,
+        )
+        self._opt_component_mfu_step += 1
+        return profiler
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -4779,6 +4855,16 @@ class GPUModelRunner(
             num_reqs=num_reqs,
             num_scheduled_tokens_np=num_scheduled_tokens_np,
         )
+        opt_component_profiler = self._maybe_create_opt_component_profiler(
+            cudagraph_mode=cudagraph_mode,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_reqs=num_reqs,
+        )
+        forward_additional_kwargs = (
+            {OPT_COMPONENT_MFU_PROFILER_KEY: opt_component_profiler}
+            if opt_component_profiler is not None
+            else None
+        )
         with (
             set_forward_context(
                 attn_metadata,
@@ -4789,6 +4875,7 @@ class GPUModelRunner(
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
                 layer_recompute_runtime=layer_recompute_runtime,
+                additional_kwargs=forward_additional_kwargs,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
@@ -4802,6 +4889,9 @@ class GPUModelRunner(
             )
 
             self._sync_runkv_step_end_state()
+
+        if opt_component_profiler is not None:
+            opt_component_profiler.finish_step()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

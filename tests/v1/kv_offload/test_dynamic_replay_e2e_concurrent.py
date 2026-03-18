@@ -47,13 +47,14 @@ import contextlib
 import difflib
 import os
 import random
-import re
 import shutil
 import sys
 import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+import regex as re
 
 try:
     from tests.v1.kv_offload.prompt_dataset import (
@@ -239,17 +240,24 @@ def _print_side_by_side_text_diff(
 
         max_rows = max(len(left_block), len(right_block))
         for offset in range(max_rows):
-            left_line = left_block[offset] if offset < len(left_block) else None
-            right_line = right_block[offset] if offset < len(right_block) else None
+            left_line_opt: str | None = (
+                left_block[offset] if offset < len(left_block) else None
+            )
+            right_line_opt: str | None = (
+                right_block[offset] if offset < len(right_block) else None
+            )
 
-            if left_line is None:
+            if left_line_opt is None:
                 left_render = _c("<no line>", _Ansi.DIM)
-                right_render = _c(right_line or "", _Ansi.GREEN, _Ansi.BOLD)
-            elif right_line is None:
-                left_render = _c(left_line, _Ansi.RED, _Ansi.BOLD)
+                right_render = _c(right_line_opt or "", _Ansi.GREEN, _Ansi.BOLD)
+            elif right_line_opt is None:
+                left_render = _c(left_line_opt, _Ansi.RED, _Ansi.BOLD)
                 right_render = _c("<no line>", _Ansi.DIM)
             else:
-                left_render, right_render = _highlight_text_diff(left_line, right_line)
+                left_render, right_render = _highlight_text_diff(
+                    left_line_opt,
+                    right_line_opt,
+                )
 
             left_pad = " " * max(0, col_width - _visible_len(left_render))
             print(f"  {row_idx:>4} | {left_render}{left_pad} | {right_render}")
@@ -354,7 +362,8 @@ def check_cuda() -> bool:
         if not torch.cuda.is_available():
             print(
                 _c(
-                    "CUDA is not available. Dynamic replay requires a CUDA-enabled GPU.",
+                    "CUDA is not available. Dynamic replay requires a "
+                    "CUDA-enabled GPU.",
                     _Ansi.RED,
                 )
             )
@@ -895,11 +904,11 @@ def compare_outputs_multi(
         for lb in labels[i + 1 :]:
             m = match_counts[(la, lb)]
             mm = mismatch_counts[(la, lb)]
-            line = f"  {la} vs {lb}: {m} match, {mm} mismatch"
+            summary_line = f"  {la} vs {lb}: {m} match, {mm} mismatch"
             if mm > 0:
-                print(_c(line, _Ansi.YELLOW))
+                print(_c(summary_line, _Ansi.YELLOW))
             else:
-                print(_c(line, _Ansi.GREEN))
+                print(_c(summary_line, _Ansi.GREEN))
     print(_c("-" * 80, _Ansi.DIM))
 
 
@@ -1150,8 +1159,41 @@ def main():
         "--layer-recompute-io-prefix-blocks",
         type=int,
         nargs="+",
-        default=[23],
-        help="IO prefix blocks per layer for recompute (default: [23])",
+        default=[
+            1,
+            10,
+            2,
+            9,
+            3,
+            8,
+            4,
+            7,
+            5,
+            6,
+            1,
+            10,
+            2,
+            9,
+            3,
+            8,
+            4,
+            7,
+            5,
+            6,
+            1,
+            10,
+            2,
+            9,
+            3,
+            8,
+            4,
+            7,
+            5,
+            6,
+            10,
+            10,
+        ],
+        help="IO prefix blocks per layer for recompute (default: [10])",
     )
 
     args = parser.parse_args()

@@ -50,11 +50,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
+from vllm.v1.profiling.opt_component_mfu import get_opt_component_mfu_profiler
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
+    extract_layer_index,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -118,15 +120,25 @@ class OPTAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )
+        self.layer_idx = extract_layer_index(prefix)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.chunk(chunks=3, dim=-1)
-        attn_output = self.attn(q, k, v)
-        output, _ = self.out_proj(attn_output)
+        profiler = get_opt_component_mfu_profiler()
+        if profiler is None:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.chunk(chunks=3, dim=-1)
+            attn_output = self.attn(q, k, v)
+            output, _ = self.out_proj(attn_output)
+            return output
+
+        with profiler.profile_attention(self, hidden_states):
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.chunk(chunks=3, dim=-1)
+            attn_output = self.attn(q, k, v)
+            output, _ = self.out_proj(attn_output)
         return output
 
 
@@ -172,6 +184,7 @@ class OPTDecoderLayer(nn.Module):
         self.final_layer_norm = nn.LayerNorm(
             self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine
         )
+        self.layer_idx = extract_layer_index(prefix)
 
     def forward(
         self,
@@ -193,9 +206,16 @@ class OPTDecoderLayer(nn.Module):
         # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
         if self.do_layer_norm_before:
             hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states, _ = self.fc1(hidden_states)
-        hidden_states = self.activation_fn(hidden_states)
-        hidden_states, _ = self.fc2(hidden_states)
+        profiler = get_opt_component_mfu_profiler()
+        if profiler is None:
+            hidden_states, _ = self.fc1(hidden_states)
+            hidden_states = self.activation_fn(hidden_states)
+            hidden_states, _ = self.fc2(hidden_states)
+        else:
+            with profiler.profile_ffn(self, hidden_states):
+                hidden_states, _ = self.fc1(hidden_states)
+                hidden_states = self.activation_fn(hidden_states)
+                hidden_states, _ = self.fc2(hidden_states)
         hidden_states = residual + hidden_states
         # 350m applies layer norm AFTER attention
         if not self.do_layer_norm_before:

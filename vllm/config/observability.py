@@ -67,6 +67,15 @@ class ObservabilityConfig:
     enable_mfu_metrics: bool = False
     """Enable Model FLOPs Utilization (MFU) metrics."""
 
+    enable_opt_component_mfu_profiling: bool = False
+    """Enable CUDA-event profiling for OPT attention and FFN modules."""
+
+    opt_component_mfu_output_path: str | None = None
+    """JSONL output path for OPT attention/FFN MFU step summaries."""
+
+    opt_component_mfu_peak_tflops: float | None = None
+    """Peak device throughput used to normalize OPT component TFLOPS into MFU."""
+
     enable_mm_processor_stats: bool = False
     """Enable collection of timing statistics for multimodal processor operations.
     This is for internal use only (e.g., benchmarks) and is not exposed as a CLI

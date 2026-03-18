@@ -524,6 +524,15 @@ class EngineArgs:
         ObservabilityConfig.enable_layerwise_nvtx_tracing
     )
     enable_mfu_metrics: bool = ObservabilityConfig.enable_mfu_metrics
+    enable_opt_component_mfu_profiling: bool = (
+        ObservabilityConfig.enable_opt_component_mfu_profiling
+    )
+    opt_component_mfu_output_path: str | None = (
+        ObservabilityConfig.opt_component_mfu_output_path
+    )
+    opt_component_mfu_peak_tflops: float | None = (
+        ObservabilityConfig.opt_component_mfu_peak_tflops
+    )
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
@@ -1150,6 +1159,18 @@ class EngineArgs:
         observability_group.add_argument(
             "--enable-mfu-metrics",
             **observability_kwargs["enable_mfu_metrics"],
+        )
+        observability_group.add_argument(
+            "--enable-opt-component-mfu-profiling",
+            **observability_kwargs["enable_opt_component_mfu_profiling"],
+        )
+        observability_group.add_argument(
+            "--opt-component-mfu-output-path",
+            **observability_kwargs["opt_component_mfu_output_path"],
+        )
+        observability_group.add_argument(
+            "--opt-component-mfu-peak-tflops",
+            **observability_kwargs["opt_component_mfu_peak_tflops"],
         )
 
         # Scheduler arguments
@@ -1814,6 +1835,11 @@ class EngineArgs:
             cudagraph_metrics=self.cudagraph_metrics,
             enable_layerwise_nvtx_tracing=self.enable_layerwise_nvtx_tracing,
             enable_mfu_metrics=self.enable_mfu_metrics,
+            enable_opt_component_mfu_profiling=(
+                self.enable_opt_component_mfu_profiling
+            ),
+            opt_component_mfu_output_path=self.opt_component_mfu_output_path,
+            opt_component_mfu_peak_tflops=self.opt_component_mfu_peak_tflops,
             enable_mm_processor_stats=self.enable_mm_processor_stats,
         )
 
