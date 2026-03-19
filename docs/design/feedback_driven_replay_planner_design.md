@@ -786,18 +786,26 @@ MVP 处理：
 
 #### Step 3: 扩展 `LayerReplayPlan` 为 block-aware
 **目标**：让 replay plan 显式带出 block 级决策结果。  
-**实现状态**：规划中  
+**实现状态**：已完成  
 **改动文件**：
 - `vllm/v1/worker/opt_dynamic_replay.py`
 **实际改动**：
-- 新增字段：
+- `LayerReplayPlan` 已新增字段：
   - `replay_blocks_per_req`
   - `replay_block_count`
   - `skip_logical_block_ids`
   - `per_req_replay_block_ranges`
-- static provider 先同步填这些字段
+- `compute_layer_replay_plan_for_layer()` 已同步计算并填充这些 block-level 字段
+- 当前字段语义为：
+  - `per_req_replay_block_ranges`：每个 request 的 replay block 区间 `[start_block, end_block)`
+  - `replay_blocks_per_req`：每个 request 的 replay block 数
+  - `replay_block_count`：batch 内 replay block 总数
+  - `skip_logical_block_ids`：当前 plan 对应的 replay suffix logical block id 集合
+- `StaticReplayPlanProvider` 与 `FeedbackReplayPlanProvider` 都通过同一条 plan 构造路径拿到这些字段
 **验证方式**：
 - static plan 也能正确生成 block-level 结果
+- 已执行：
+  - `python -m py_compile vllm/v1/worker/opt_dynamic_replay.py`
 **依赖**：Step 2
 
 ---

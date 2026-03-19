@@ -16,6 +16,10 @@ class LayerReplayPlan:
     kv_replay_start_per_req: np.ndarray
     computed_lens_per_req: np.ndarray
     prev_gpu_start_per_req: np.ndarray
+    replay_blocks_per_req: np.ndarray
+    replay_block_count: int
+    skip_logical_block_ids: np.ndarray
+    per_req_replay_block_ranges: np.ndarray
     cpu_fill_token_count: int
     gpu_reuse_token_count: int
     replay_token_count: int
@@ -110,6 +114,10 @@ def _lookup_slot_and_block(
     return logical_id, block_offset, slot
 
 
+def _ceil_div(value: int, divisor: int) -> int:
+    return (value + divisor - 1) // divisor
+
+
 def compute_layer_replay_plan_for_layer(
     *,
     layer_idx: int,
@@ -184,6 +192,9 @@ def compute_layer_replay_plan_for_layer(
     cpu_fill_positions: list[int] = []
     cpu_fill_logical_ids: list[int] = []
     cpu_fill_block_offsets: list[int] = []
+    replay_blocks_per_req: list[int] = []
+    skip_logical_block_ids: list[int] = []
+    per_req_replay_block_ranges: list[tuple[int, int]] = []
     slot_mapping_values: list[int] = []
     combined_replay_indices: list[int] = []
     combined_scheduled_indices: list[int] = []
@@ -201,6 +212,15 @@ def compute_layer_replay_plan_for_layer(
         replay_len = int(replay_lens_per_req[req_idx])
         gpu_reuse_len = int(gpu_reuse_lens_per_req[req_idx])
         prev_replay_len = max(computed_len - prev_gpu_start, 0)
+        replay_start_block = replay_start // block_size
+        computed_block_end = _ceil_div(computed_len, block_size)
+
+        per_req_replay_block_ranges.append((replay_start_block, computed_block_end))
+        replay_blocks_per_req.append(max(computed_block_end - replay_start_block, 0))
+        for block_idx in range(replay_start_block, computed_block_end):
+            logical_id = int(logical_block_tables[req_idx, block_idx])
+            if logical_id >= 0:
+                skip_logical_block_ids.append(logical_id)
 
         gpu_reuse_start = max(replay_start, prev_gpu_start)
         gpu_slice_start = prev_replay_prefix + max(gpu_reuse_start - prev_gpu_start, 0)
@@ -250,9 +270,19 @@ def compute_layer_replay_plan_for_layer(
     combined_scheduled_indices_tensor = torch.tensor(
         combined_scheduled_indices, dtype=torch.int64
     )
+    replay_blocks_per_req_array = np.asarray(replay_blocks_per_req, dtype=np.int32)
+    skip_logical_block_ids_array = np.asarray(
+        sorted(set(skip_logical_block_ids)),
+        dtype=np.int32,
+    )
+    per_req_replay_block_ranges_array = np.asarray(
+        per_req_replay_block_ranges,
+        dtype=np.int32,
+    ).reshape(num_reqs, 2)
 
     scheduled_token_count = int(scheduled_lens_i32.sum())
     replay_token_count = int(replay_lens_per_req.sum())
+    replay_block_count = int(replay_blocks_per_req_array.sum())
     num_actual_tokens = replay_token_count + scheduled_token_count
     if slot_mapping_tensor.shape[0] != num_actual_tokens:
         raise AssertionError(
@@ -264,6 +294,10 @@ def compute_layer_replay_plan_for_layer(
         kv_replay_start_per_req=kv_replay_start_per_req,
         computed_lens_per_req=computed_lens_i32,
         prev_gpu_start_per_req=prev_gpu_start_per_req,
+        replay_blocks_per_req=replay_blocks_per_req_array,
+        replay_block_count=replay_block_count,
+        skip_logical_block_ids=skip_logical_block_ids_array,
+        per_req_replay_block_ranges=per_req_replay_block_ranges_array,
         cpu_fill_token_count=len(cpu_fill_positions),
         gpu_reuse_token_count=int(gpu_reuse_lens_per_req.sum()),
         replay_token_count=replay_token_count,
