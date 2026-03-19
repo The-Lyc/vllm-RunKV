@@ -2416,6 +2416,14 @@ class GPUModelRunner(
                 logical_block_table_np=logical_table_np,
                 num_blocks_per_row=block_table.num_blocks_per_row,
             )
+            if self.replay_plan_provider is not None:
+                self.replay_plan_provider.begin_step(
+                    req_ids=list(self.input_batch.req_ids[:num_reqs]),
+                    computed_lens=self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                    scheduled_lens=self._lr_num_scheduled_tokens_np,
+                    num_blocks_per_row=block_table.num_blocks_per_row[:num_reqs],
+                    block_size=block_size,
+                )
 
     def _prepare_paged_block_tables(
         self,

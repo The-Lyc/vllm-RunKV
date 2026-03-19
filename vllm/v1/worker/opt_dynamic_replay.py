@@ -36,8 +36,75 @@ class LayerReplayPlan:
     gpu_reuse_slice_per_req: list[tuple[int, int]]
 
 
+@dataclass
+class FeedbackPlannerBatchFingerprint:
+    """Lightweight step summary used to decide whether cross-step state can
+    still be trusted for the next batch.
+
+    This intentionally stores only a compact fingerprint instead of the raw
+    step metadata. The authoritative per-step metadata remains owned by
+    LayerRecomputeManager.
+    """
+
+    num_reqs: int
+    req_ids: tuple[str, ...]
+    total_computed_tokens: int
+    total_scheduled_tokens: int
+    total_replayable_blocks: int
+
+
+@dataclass
+class FeedbackPlannerProbeState:
+    """Controller-side probe bookkeeping.
+
+    Later steps will use this state to remember whether the planner recently
+    perturbed the replay budget in order to estimate a local
+    budget->imbalance slope.
+    """
+
+    active: bool = False
+    reference_budget_blocks: int | None = None
+    reference_imbalance_ms: float | None = None
+
+
+@dataclass
+class FeedbackPlannerControllerState:
+    """Cross-step planner state that survives across execute_model steps.
+
+    This is the state we actually want to carry from one step to the next.
+    It does not duplicate raw token/block metadata already owned by
+    LayerRecomputeManager. Instead it keeps only controller variables and a
+    compact fingerprint of the last batch they were derived from.
+    """
+
+    global_budget_blocks: int = 0
+    estimated_local_gain: float | None = None
+    last_budget_blocks: int | None = None
+    last_imbalance_ms: float | None = None
+    probe_state: FeedbackPlannerProbeState = field(
+        default_factory=FeedbackPlannerProbeState
+    )
+    reinit_generation: int = 0
+    step_batch_fingerprint: FeedbackPlannerBatchFingerprint | None = None
+
+
+@dataclass
+class FeedbackPlannerStepSummary:
+    """Planner-owned summary derived from the current step metadata.
+
+    The manager still owns the full logical block tables and token-level step
+    metadata. The planner only keeps the compact per-request quantities needed
+    for later budget/allocation logic.
+    """
+
+    replayable_blocks_per_req: np.ndarray
+    total_replayable_blocks: int
+
+
 @runtime_checkable
 class ReplayPlanProvider(Protocol):
+    def begin_step(self, **metadata: Any) -> None: ...
+
     def get_layer_plan(
         self,
         layer_idx: int,
@@ -319,6 +386,9 @@ def compute_layer_replay_plan_for_layer(
 class StaticReplayPlanProvider:
     io_prefix_blocks: list[int]
 
+    def begin_step(self, **metadata: Any) -> None:
+        del metadata
+
     def get_layer_plan(
         self,
         layer_idx: int,
@@ -358,7 +428,12 @@ class FeedbackReplayPlanProvider:
     io_prefix_blocks: list[int]
     dry_run: bool = False
     static_provider: StaticReplayPlanProvider = field(init=False)
-    last_step_metadata: dict[str, Any] | None = field(init=False, default=None)
+    controller_state: FeedbackPlannerControllerState = field(
+        init=False, default_factory=FeedbackPlannerControllerState
+    )
+    current_step_summary: FeedbackPlannerStepSummary | None = field(
+        init=False, default=None
+    )
     last_feedback_by_layer: dict[int, float] = field(init=False, default_factory=dict)
     begin_step_count: int = field(init=False, default=0)
     observe_feedback_count: int = field(init=False, default=0)
@@ -369,26 +444,100 @@ class FeedbackReplayPlanProvider:
         )
 
     def begin_step(self, **metadata: Any) -> None:
-        # TODO: initialize any state needed for dynamic replay decisions based
-        # on the provided metadata, such as request-level information or historical
-        # feedback. For now, we just record the metadata and reset feedback state.
+        # Step-boundary metadata is still owned by LayerRecomputeManager.
+        # The planner only derives compact summaries from it and stores the
+        # cross-step controller state that later steps will evolve.
         self.begin_step_count += 1
-        self.last_step_metadata = dict(metadata)
+        req_ids = tuple(str(req_id) for req_id in metadata.get("req_ids", ()))
+        computed_lens = _coerce_int32_array(
+            "computed_lens",
+            metadata.get("computed_lens", np.zeros(0, dtype=np.int32)),
+        )
+        scheduled_lens = _coerce_int32_array(
+            "scheduled_lens",
+            metadata.get("scheduled_lens", np.zeros(0, dtype=np.int32)),
+        )
+        num_blocks_per_row = _coerce_int32_array(
+            "num_blocks_per_row",
+            metadata.get("num_blocks_per_row", np.zeros(0, dtype=np.int32)),
+        )
+        block_size = int(metadata.get("block_size", 0))
+        if block_size <= 0:
+            raise ValueError(
+                "FeedbackReplayPlanProvider.begin_step requires block_size."
+            )
+
+        replayable_blocks_per_req = np.minimum(
+            (computed_lens.astype(np.int64) + block_size - 1) // block_size,
+            num_blocks_per_row,
+        ).astype(np.int32)
+        total_replayable_blocks = int(replayable_blocks_per_req.sum())
+        self.current_step_summary = FeedbackPlannerStepSummary(
+            replayable_blocks_per_req=replayable_blocks_per_req,
+            total_replayable_blocks=total_replayable_blocks,
+        )
+        self.controller_state.step_batch_fingerprint = FeedbackPlannerBatchFingerprint(
+            num_reqs=len(req_ids),
+            req_ids=req_ids,
+            total_computed_tokens=int(computed_lens.sum()),
+            total_scheduled_tokens=int(scheduled_lens.sum()),
+            total_replayable_blocks=total_replayable_blocks,
+        )
         self.last_feedback_by_layer.clear()
 
     def observe_layer_feedback(self, layer_idx: int, imbalance_ms: float) -> None:
         # TODO: incorporate the observed feedback into future replay plan decisions.
         # For now, we just record the feedback by layer.
         self.observe_feedback_count += 1
-        self.last_feedback_by_layer[int(layer_idx)] = float(imbalance_ms)
+        imbalance_value = float(imbalance_ms)
+        self.last_feedback_by_layer[int(layer_idx)] = imbalance_value
+        self.controller_state.last_imbalance_ms = imbalance_value
 
     def get_debug_snapshot(self) -> dict[str, Any]:
+        step_summary = None
+        if self.current_step_summary is not None:
+            step_summary = {
+                "replayable_blocks_per_req": (
+                    self.current_step_summary.replayable_blocks_per_req.tolist()
+                ),
+                "total_replayable_blocks": (
+                    self.current_step_summary.total_replayable_blocks
+                ),
+            }
+        fingerprint = self.controller_state.step_batch_fingerprint
         return {
             "provider": type(self).__name__,
             "dry_run": self.dry_run,
             "begin_step_count": self.begin_step_count,
             "observe_feedback_count": self.observe_feedback_count,
-            "last_step_metadata": self.last_step_metadata,
+            "controller_state": {
+                "global_budget_blocks": self.controller_state.global_budget_blocks,
+                "estimated_local_gain": self.controller_state.estimated_local_gain,
+                "last_budget_blocks": self.controller_state.last_budget_blocks,
+                "last_imbalance_ms": self.controller_state.last_imbalance_ms,
+                "probe_state": {
+                    "active": self.controller_state.probe_state.active,
+                    "reference_budget_blocks": (
+                        self.controller_state.probe_state.reference_budget_blocks
+                    ),
+                    "reference_imbalance_ms": (
+                        self.controller_state.probe_state.reference_imbalance_ms
+                    ),
+                },
+                "reinit_generation": self.controller_state.reinit_generation,
+                "step_batch_fingerprint": (
+                    None
+                    if fingerprint is None
+                    else {
+                        "num_reqs": fingerprint.num_reqs,
+                        "req_ids": list(fingerprint.req_ids),
+                        "total_computed_tokens": fingerprint.total_computed_tokens,
+                        "total_scheduled_tokens": fingerprint.total_scheduled_tokens,
+                        "total_replayable_blocks": fingerprint.total_replayable_blocks,
+                    }
+                ),
+            },
+            "current_step_summary": step_summary,
             "last_feedback_by_layer": dict(self.last_feedback_by_layer),
         }
 
@@ -459,6 +608,9 @@ class RandomReplayPlanProvider:
         )
         self._desired_start_tokens_by_block_size[block_size] = random_tokens
         return random_tokens
+
+    def begin_step(self, **metadata: Any) -> None:
+        del metadata
 
     def get_layer_plan(
         self,

@@ -759,12 +759,23 @@ MVP 处理：
  - `vllm/v1/worker/gpu_model_runner.py`
 **实际改动**：
 - 已新增 class `FeedbackReplayPlanProvider`
-- provider 当前维护最小 state：
-  - `last_step_metadata`
-  - `last_feedback_by_layer`
-  - `begin_step_count`
-  - `observe_feedback_count`
-  - `dry_run`
+- provider 当前维护的 state 已收敛为两层：
+  - 跨 step 的 `FeedbackPlannerControllerState`
+  - 当前 step 的 `FeedbackPlannerStepSummary`
+- `FeedbackPlannerControllerState` 当前包含：
+  - `global_budget_blocks`
+  - `estimated_local_gain`
+  - `last_budget_blocks`
+  - `last_imbalance_ms`
+  - `probe_state`
+  - `reinit_generation`
+  - `step_batch_fingerprint`
+- `FeedbackPlannerStepSummary` 当前包含：
+  - `replayable_blocks_per_req`
+  - `total_replayable_blocks`
+- 不再保存 raw step metadata；这部分仍由 `LayerRecomputeManager` 持有
+- 已补充注释，明确这两个数据结构分别负责跨 step controller state 与当前 step 派生摘要
+- `dry_run`
 - 已新增方法：
   - `begin_step(...)`
   - `observe_layer_feedback(...)`
@@ -812,15 +823,30 @@ MVP 处理：
 
 #### Step 4: step 边界 hook — planner begin_step 接入
 **目标**：在 step 开始时获取完整 active batch truth。  
-**实现状态**：规划中  
+**实现状态**：已完成  
 **改动文件**：
 - `vllm/v1/worker/gpu_model_runner.py`
+ - `vllm/v1/worker/opt_dynamic_replay.py`
 **实际改动**：
-- 在 `_prepare_layer_recompute_step_metadata()` 后调用 `provider.begin_step(...)`
-- 传入 req ids、computed_lens、scheduled_lens、logical block table、`num_blocks_per_row`
+- `ReplayPlanProvider` 已扩展出 `begin_step(...)` 接口
+- `StaticReplayPlanProvider` 与 `RandomReplayPlanProvider` 已提供 no-op `begin_step(...)`
+- `FeedbackReplayPlanProvider.begin_step(...)` 不再保存 raw metadata
+- 它现在只基于 step 边界输入派生并更新：
+  - `replayable_blocks_per_req`
+  - `total_replayable_blocks`
+  - `step_batch_fingerprint`
+- 在 `_prepare_layer_recompute_step_metadata()` 中，`layer_recompute_manager.begin_step(...)` 之后已调用 `replay_plan_provider.begin_step(...)`
+- 当前传入字段包括：
+  - `req_ids`
+  - `computed_lens`
+  - `scheduled_lens`
+  - `num_blocks_per_row`
+  - `block_size`
 **验证方式**：
 - 每个 step 都能得到 batch fingerprint
 - 不改变 replay 行为
+- 已执行：
+  - `python -m py_compile vllm/v1/worker/opt_dynamic_replay.py vllm/v1/worker/gpu_model_runner.py`
 **依赖**：Step 2
 
 ---
