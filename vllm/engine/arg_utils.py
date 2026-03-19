@@ -601,6 +601,8 @@ class EngineArgs:
     runkv_layer_recompute_mode: Literal[
         "io_hidden_states", "prev_layer_output_dynamic"
     ] = "io_hidden_states"
+    runkv_layer_recompute_planner: Literal["static", "feedback"] = "static"
+    runkv_layer_recompute_planner_dry_run: bool = False
 
     # RunKV layer-wise KV cache offload configuration
     kv_offload_config: RunKVOffloadConfig | dict[str, Any] | None = None
@@ -1042,6 +1044,19 @@ class EngineArgs:
             default="io_hidden_states",
             help="Replay input source mode for RunKV layer recompute. "
             "Default: io_hidden_states",
+        )
+        runkv_group.add_argument(
+            "--runkv-layer-recompute-planner",
+            type=str,
+            choices=["static", "feedback"],
+            default="static",
+            help="Planner mode for RunKV dynamic replay. Default: static",
+        )
+        runkv_group.add_argument(
+            "--runkv-layer-recompute-planner-dry-run",
+            action="store_true",
+            default=False,
+            help="Update planner state without changing the execution plan.",
         )
 
         # Multimodal related configs
@@ -1905,6 +1920,11 @@ class EngineArgs:
             config.layer_recompute_mode = self._validate_runkv_layer_recompute_mode(
                 config.layer_recompute_mode
             )
+            config.layer_recompute_planner = (
+                self._validate_runkv_layer_recompute_planner(
+                    config.layer_recompute_planner
+                )
+            )
             return config
 
         # Build from individual CLI arguments
@@ -1935,6 +1955,12 @@ class EngineArgs:
             ),
             layer_recompute_mode=self._validate_runkv_layer_recompute_mode(
                 self.runkv_layer_recompute_mode
+            ),
+            layer_recompute_planner=self._validate_runkv_layer_recompute_planner(
+                self.runkv_layer_recompute_planner
+            ),
+            layer_recompute_planner_dry_run=(
+                self.runkv_layer_recompute_planner_dry_run
             ),
         )
 
@@ -1976,6 +2002,18 @@ class EngineArgs:
                 f"expected one of {allowed}, got '{raw_value}'."
             )
         return cast(Literal["io_hidden_states", "prev_layer_output_dynamic"], raw_value)
+
+    @staticmethod
+    def _validate_runkv_layer_recompute_planner(
+        raw_value: str,
+    ) -> Literal["static", "feedback"]:
+        allowed = ("static", "feedback")
+        if raw_value not in allowed:
+            raise ValueError(
+                "Invalid --runkv-layer-recompute-planner: "
+                f"expected one of {allowed}, got '{raw_value}'."
+            )
+        return cast(Literal["static", "feedback"], raw_value)
 
     def _check_feature_supported(self, model_config: ModelConfig):
         """Raise an error if the feature is not supported."""

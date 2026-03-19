@@ -55,3 +55,9 @@ class RunKVOffloadConfig:
     layer_recompute_mode: Literal["io_hidden_states", "prev_layer_output_dynamic"] = (
         "io_hidden_states"
     )
+
+    # Planner mode for dynamic replay. "static" preserves the current behavior.
+    layer_recompute_planner: Literal["static", "feedback"] = "static"
+
+    # When enabled, planner state may update but must not change execution.
+    layer_recompute_planner_dry_run: bool = False
