@@ -168,8 +168,10 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunne
 from vllm.v1.worker.layer_recompute import LayerRecomputeManager
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.opt_dynamic_replay import (
+    FeedbackReplayPlanProvider,
     LayerReplayPlan,
     OPTDynamicReplayRuntime,
+    ReplayPlanProvider,
     StaticReplayPlanProvider,
 )
 from vllm.v1.worker.runkv_debug import (
@@ -1138,7 +1140,7 @@ class GPUModelRunner(
         self._runkv_layer_info: list[tuple[str, int, int]] = []
         self._runkv_num_layers: int = 0
         self.layer_recompute_manager: LayerRecomputeManager | None = None
-        self.replay_plan_provider: StaticReplayPlanProvider | None = None
+        self.replay_plan_provider: ReplayPlanProvider | None = None
         self.layer_recompute_enabled: bool = False
         # Current-step cached metadata for layer recompute hooks.
         self._lr_req_indices_np: np.ndarray | None = None
@@ -7519,7 +7521,22 @@ class GPUModelRunner(
             num_layers
         )
         self.kv_offload_config.layer_recompute_io_prefix_blocks = normalized_io_prefix
-        self.replay_plan_provider = StaticReplayPlanProvider(normalized_io_prefix)
+        planner_mode = getattr(
+            self.kv_offload_config, "layer_recompute_planner", "static"
+        )
+        if planner_mode == "feedback":
+            self.replay_plan_provider = FeedbackReplayPlanProvider(
+                io_prefix_blocks=normalized_io_prefix,
+                dry_run=bool(
+                    getattr(
+                        self.kv_offload_config,
+                        "layer_recompute_planner_dry_run",
+                        False,
+                    )
+                ),
+            )
+        else:
+            self.replay_plan_provider = StaticReplayPlanProvider(normalized_io_prefix)
 
         if self.layer_recompute_manager is not None:
             self.layer_recompute_manager.remove_layernorm_hooks()

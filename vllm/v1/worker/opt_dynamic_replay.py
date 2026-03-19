@@ -320,6 +320,72 @@ class StaticReplayPlanProvider:
 
 
 @dataclass
+class FeedbackReplayPlanProvider:
+    io_prefix_blocks: list[int]
+    dry_run: bool = False
+    static_provider: StaticReplayPlanProvider = field(init=False)
+    last_step_metadata: dict[str, Any] | None = field(init=False, default=None)
+    last_feedback_by_layer: dict[int, float] = field(init=False, default_factory=dict)
+    begin_step_count: int = field(init=False, default=0)
+    observe_feedback_count: int = field(init=False, default=0)
+
+    def __post_init__(self) -> None:
+        self.static_provider = StaticReplayPlanProvider(
+            io_prefix_blocks=list(self.io_prefix_blocks)
+        )
+
+    def begin_step(self, **metadata: Any) -> None:
+        # TODO: initialize any state needed for dynamic replay decisions based
+        # on the provided metadata, such as request-level information or historical
+        # feedback. For now, we just record the metadata and reset feedback state.
+        self.begin_step_count += 1
+        self.last_step_metadata = dict(metadata)
+        self.last_feedback_by_layer.clear()
+
+    def observe_layer_feedback(self, layer_idx: int, imbalance_ms: float) -> None:
+        # TODO: incorporate the observed feedback into future replay plan decisions.
+        # For now, we just record the feedback by layer.
+        self.observe_feedback_count += 1
+        self.last_feedback_by_layer[int(layer_idx)] = float(imbalance_ms)
+
+    def get_debug_snapshot(self) -> dict[str, Any]:
+        return {
+            "provider": type(self).__name__,
+            "dry_run": self.dry_run,
+            "begin_step_count": self.begin_step_count,
+            "observe_feedback_count": self.observe_feedback_count,
+            "last_step_metadata": self.last_step_metadata,
+            "last_feedback_by_layer": dict(self.last_feedback_by_layer),
+        }
+
+    def get_layer_plan(
+        self,
+        layer_idx: int,
+        num_reqs: int,
+        computed_lens: np.ndarray,
+        scheduled_lens: np.ndarray,
+        logical_block_tables: np.ndarray,
+        block_size: int,
+        mapper_mapping: dict[int, int],
+        prev_layer_plan: LayerReplayPlan | None,
+    ) -> LayerReplayPlan:
+        # TODO: use the recorded metadata and feedback to make dynamic decisions
+        # about the replay plan(including replay budget and per-request allocation)
+        # for the current layer. For now, we just delegate to a static provider
+        # that uses fixed prefix block settings.
+        return self.static_provider.get_layer_plan(
+            layer_idx=layer_idx,
+            num_reqs=num_reqs,
+            computed_lens=computed_lens,
+            scheduled_lens=scheduled_lens,
+            logical_block_tables=logical_block_tables,
+            block_size=block_size,
+            mapper_mapping=mapper_mapping,
+            prev_layer_plan=prev_layer_plan,
+        )
+
+
+@dataclass
 class RandomReplayPlanProvider:
     num_layers: int
     max_tokens: int | None = None

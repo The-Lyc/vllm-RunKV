@@ -753,19 +753,33 @@ MVP 处理：
 
 #### Step 2: Provider 骨架 — 新增 `FeedbackReplayPlanProvider`
 **目标**：定义 stateful feedback planner 骨架，但先不做任何控制逻辑。  
-**实现状态**：规划中  
+**实现状态**：已完成  
 **改动文件**：
 - `vllm/v1/worker/opt_dynamic_replay.py`
+ - `vllm/v1/worker/gpu_model_runner.py`
 **实际改动**：
-- 新增 class `FeedbackReplayPlanProvider`
-- 保留 `ReplayPlanProvider` 兼容接口
-- 新增：
+- 已新增 class `FeedbackReplayPlanProvider`
+- provider 当前维护最小 state：
+  - `last_step_metadata`
+  - `last_feedback_by_layer`
+  - `begin_step_count`
+  - `observe_feedback_count`
+  - `dry_run`
+- 已新增方法：
   - `begin_step(...)`
   - `observe_layer_feedback(...)`
   - `get_debug_snapshot(...)`
+- `get_layer_plan(...)` 当前直接委托给内部 `StaticReplayPlanProvider`
+- `GpuModelRunner` 已按 `layer_recompute_planner` 选择 provider：
+  - `static` -> `StaticReplayPlanProvider`
+  - `feedback` -> `FeedbackReplayPlanProvider`
+- `GpuModelRunner.replay_plan_provider` 类型已放宽为 `ReplayPlanProvider | None`
+- 当前不引入任何控制逻辑，执行行为保持不变
 **验证方式**：
 - provider 可被 `GpuModelRunner` 持有
 - 可跨 step 存活
+- 已执行：
+  - `python -m py_compile vllm/v1/worker/opt_dynamic_replay.py vllm/v1/worker/gpu_model_runner.py`
 **依赖**：Step 1
 
 ---
