@@ -853,16 +853,23 @@ MVP 处理：
 
 #### Step 5: instrumentation A — 接入 `t_i_end`
 **目标**：增加可靠的 layer end timing。  
-**实现状态**：规划中  
+**实现状态**：已完成  
 **改动文件**：
 - `vllm/model_executor/models/opt.py`
 - `vllm/v1/worker/opt_dynamic_replay.py`
 **实际改动**：
-- 在 `_forward_dynamic_replay()` 每层 layer forward 返回后记录 CUDA event
-- runtime 缓存 per-layer `layer_end_event`
+- `OPTDynamicReplayRuntime` 已新增 per-layer `layer_end_event` 缓存
+- 已新增：
+  - `set_layer_end_event(...)`
+  - `get_layer_end_event(...)`
+- 在 `OPTDecoder._forward_dynamic_replay()` 中，每层 layer forward 完成后都会记录一个 CUDA event
+- 该事件只在 CUDA 张量路径上创建；非 CUDA 情况下写入 `None`
+- 已补充注释，明确这个事件后续会和 next-layer-ready event 配对，用于计算 signed imbalance
 **验证方式**：
 - event 可成功记录
 - 对模型输出无影响
+- 已执行：
+  - `python -m py_compile vllm/v1/worker/opt_dynamic_replay.py vllm/model_executor/models/opt.py`
 **依赖**：Step 2
 
 ---

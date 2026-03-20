@@ -657,10 +657,12 @@ class OPTDynamicReplayRuntime:
     scheduled_positions: np.ndarray | None = None
     _layer_plans: list[LayerReplayPlan | None] = field(init=False)
     _per_layer_attn_metadata: list[dict[str, Any] | None] = field(init=False)
+    _layer_end_events: list[torch.cuda.Event | None] = field(init=False)
 
     def __post_init__(self) -> None:
         self._layer_plans = [None] * self.num_layers
         self._per_layer_attn_metadata = [None] * self.num_layers
+        self._layer_end_events = [None] * self.num_layers
 
     def get_layer_plan(self, layer_idx: int) -> LayerReplayPlan:
         plan = self._layer_plans[layer_idx]
@@ -683,6 +685,19 @@ class OPTDynamicReplayRuntime:
 
     def current_layer_metadata(self, layer_idx: int) -> dict[str, Any] | None:
         return self._per_layer_attn_metadata[layer_idx]
+
+    def set_layer_end_event(
+        self,
+        layer_idx: int,
+        event: torch.cuda.Event | None,
+    ) -> None:
+        # TODO: Step 5 records one event per layer at the exact point where the
+        # current layer's forward finishes. Later steps will pair this with the
+        # next layer's ready event to compute signed imbalance.
+        self._layer_end_events[layer_idx] = event
+
+    def get_layer_end_event(self, layer_idx: int) -> torch.cuda.Event | None:
+        return self._layer_end_events[layer_idx]
 
     def set_capture_token_metadata(
         self,

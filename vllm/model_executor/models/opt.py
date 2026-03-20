@@ -462,6 +462,7 @@ class OPTDecoder(nn.Module):
                 combined_hidden_states[scheduled_indices] = scheduled_hidden_states
 
                 with self._with_runtime_attn_metadata(layer_idx=layer_idx):
+                    # commit replay version computation to the computing stream
                     combined_hidden_states = layer(combined_hidden_states)
 
                 replay_hidden_states = combined_hidden_states.index_select(
@@ -470,6 +471,14 @@ class OPTDecoder(nn.Module):
                 scheduled_hidden_states = combined_hidden_states.index_select(
                     0, scheduled_indices
                 )
+
+            layer_end_event: torch.cuda.Event | None = None
+            if scheduled_hidden_states.device.type == "cuda":
+                # Record the exact end of this layer's forward so later steps
+                # can compare it against the next layer's ready timestamp.
+                layer_end_event = torch.cuda.Event(enable_timing=True)
+                layer_end_event.record()
+            runtime.set_layer_end_event(layer_idx, layer_end_event)
 
             runtime.capture_scheduled_layer_input(
                 target_layer_idx=layer_idx + 1,
