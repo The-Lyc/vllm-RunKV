@@ -876,15 +876,22 @@ MVP 处理：
 
 #### Step 6: instrumentation B — 接入 `t_{i+1}_ready`
 **目标**：增加可靠的 next-layer-ready timing。  
-**实现状态**：规划中  
+**实现状态**：已完成  
 **改动文件**：
 - `vllm/v1/worker/gpu_model_runner.py`
 - `vllm/v1/worker/opt_dynamic_replay.py`
 **实际改动**：
-- 在 dynamic pre-hook 中，`sync_load_layer + sync_cpu_fill_h2d` 后记录 ready event
-- runtime 缓存 per-layer `layer_ready_event`
+- `OPTDynamicReplayRuntime` 已新增 per-layer `layer_ready_event` 缓存
+- 已新增：
+  - `set_layer_ready_event(...)`
+  - `get_layer_ready_event(...)`
+- 在 dynamic replay pre-hook 中，`mapper.sync_load_layer(layer_idx)` 和 `manager.sync_cpu_fill_h2d(layer_idx)` 完成后记录一个 CUDA event
+- 该事件只在 CUDA 路径上创建；非 CUDA 情况下写入 `None`
+- 已补充注释，明确这个事件表示“当前层 IO prefix load 和可选 CPU-fill H2D 都已 ready”的边界
 **验证方式**：
 - ready 事件与真实 sync 边界一致
+- 已执行：
+  - `python -m py_compile vllm/v1/worker/opt_dynamic_replay.py vllm/v1/worker/gpu_model_runner.py`
 **依赖**：Step 5
 
 ---

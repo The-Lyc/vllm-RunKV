@@ -658,11 +658,13 @@ class OPTDynamicReplayRuntime:
     _layer_plans: list[LayerReplayPlan | None] = field(init=False)
     _per_layer_attn_metadata: list[dict[str, Any] | None] = field(init=False)
     _layer_end_events: list[torch.cuda.Event | None] = field(init=False)
+    _layer_ready_events: list[torch.cuda.Event | None] = field(init=False)
 
     def __post_init__(self) -> None:
         self._layer_plans = [None] * self.num_layers
         self._per_layer_attn_metadata = [None] * self.num_layers
         self._layer_end_events = [None] * self.num_layers
+        self._layer_ready_events = [None] * self.num_layers
 
     def get_layer_plan(self, layer_idx: int) -> LayerReplayPlan:
         plan = self._layer_plans[layer_idx]
@@ -698,6 +700,20 @@ class OPTDynamicReplayRuntime:
 
     def get_layer_end_event(self, layer_idx: int) -> torch.cuda.Event | None:
         return self._layer_end_events[layer_idx]
+
+    def set_layer_ready_event(
+        self,
+        layer_idx: int,
+        event: torch.cuda.Event | None,
+    ) -> None:
+        # TODO: Step 6 records one event per layer at the point where the current
+        # layer's KV/CPU-fill inputs have both become ready on the default
+        # stream. Later steps will pair this with the previous layer's end
+        # event to measure signed imbalance.
+        self._layer_ready_events[layer_idx] = event
+
+    def get_layer_ready_event(self, layer_idx: int) -> torch.cuda.Event | None:
+        return self._layer_ready_events[layer_idx]
 
     def set_capture_token_metadata(
         self,

@@ -795,7 +795,10 @@ class PagedBlockMapper:
                             src_block_id=logical_id,
                             non_blocking=True,
                         )
-                # Record event after all copies are queued
+                # This event lives on load_stream and marks "the async KV load
+                # work for this layer has been queued and completed on the load
+                # stream". sync_load_layer() will later make the compute stream
+                # wait on this event before the layer consumes the staged KV.
                 event = torch.cuda.Event()
                 event.record(self.load_stream)
                 self.load_events[layer_idx] = event
@@ -814,7 +817,10 @@ class PagedBlockMapper:
         event = self.load_events.get(layer_idx)
         if event is not None:
             with record_function_or_nullcontext(f"runkv:h2d_sync:L{layer_idx}"):
-                # Make the default stream wait for the load stream
+                # This does not record a new timing event. It inserts a
+                # stream-wait so the current compute stream cannot proceed until
+                # the load_stream event recorded in load_layer_async() has
+                # completed.
                 event.wait(torch.cuda.current_stream())
             # Clean up the event
             del self.load_events[layer_idx]
@@ -2883,6 +2889,16 @@ class GPUModelRunner(
 
                     mapper.sync_load_layer(layer_idx)
                     manager.sync_cpu_fill_h2d(layer_idx)
+                    layer_ready_event: torch.cuda.Event | None = None
+                    if self.device.type == "cuda":
+                        # Record a compute-stream-visible ready boundary after
+                        # both waits above have been inserted. This is not the
+                        # raw completion timestamp on load_stream / H2D stream;
+                        # it is the point on the compute stream after those
+                        # async producers have become ready-to-consume here.
+                        layer_ready_event = torch.cuda.Event(enable_timing=True)
+                        layer_ready_event.record()
+                    runtime.set_layer_ready_event(layer_idx, layer_ready_event)
 
                     if next_layer_info is not None:
                         next_layer_name, next_layer_idx, next_gid = next_layer_info

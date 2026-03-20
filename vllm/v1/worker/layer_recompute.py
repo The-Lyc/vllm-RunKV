@@ -396,6 +396,9 @@ class LayerRecomputeManager:
         if self._hs_h2d_stream is not None and self.device.type == "cuda":
             with torch.cuda.stream(self._hs_h2d_stream):
                 gathered_hs_gpu = gathered_hs_cpu.to(self.device, non_blocking=True)
+                # This event lives on the dedicated H2D stream and marks the
+                # point where the async CPU-fill copy has completed there. The
+                # compute stream will wait on it in sync_cpu_fill_h2d().
                 ready_event = torch.cuda.Event()
                 ready_event.record(self._hs_h2d_stream)
         else:
@@ -413,6 +416,9 @@ class LayerRecomputeManager:
         if pending is None:
             return None
         if pending.ready_event is not None and self.device.type == "cuda":
+            # Make the current compute stream wait until the H2D-stream event
+            # recorded in load_cpu_fill_h2d_async() has completed. This is a
+            # stream dependency, not a new timestamp.
             torch.cuda.current_stream(device=self.device).wait_event(
                 pending.ready_event
             )
