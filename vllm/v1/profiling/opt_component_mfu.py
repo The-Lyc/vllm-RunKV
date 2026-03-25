@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -17,24 +16,14 @@ from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.opt import OPTAttention, OPTDecoderLayer
-    from vllm.v1.worker.opt_dynamic_replay import LayerReplayPlan
+    from vllm.v1.worker.opt_dynamic_replay import (
+        LayerReplayPlan,
+        OPTDynamicReplayRuntime,
+    )
 
 logger = init_logger(__name__)
 
 OPT_COMPONENT_MFU_PROFILER_KEY = "opt_component_mfu_profiler"
-
-
-@dataclass
-class _PendingRecord:
-    component: str
-    layer_idx: int
-    num_tokens: int
-    replay_token_count: int
-    num_actual_tokens: int
-    replay_ratio: float
-    flops: float
-    start_event: torch.cuda.Event
-    end_event: torch.cuda.Event
 
 
 def get_opt_component_mfu_profiler() -> OPTComponentMFUStepProfiler | None:
@@ -53,7 +42,6 @@ class OPTComponentMFUStepProfiler:
         model_name: str,
         total_scheduled_tokens: int,
         num_reqs: int,
-        peak_tflops: float | None = None,
     ) -> None:
         self.output_path = Path(output_path).expanduser()
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -62,8 +50,17 @@ class OPTComponentMFUStepProfiler:
         self.model_name = model_name
         self.total_scheduled_tokens = total_scheduled_tokens
         self.num_reqs = num_reqs
-        self.peak_tflops = peak_tflops
-        self._records: list[_PendingRecord] = []
+        self._layer_imbalance_ms: dict[int, float] = {}
+        self._dynamic_replay_runtime: OPTDynamicReplayRuntime | None = None
+
+    def attach_dynamic_replay_runtime(
+        self,
+        runtime: OPTDynamicReplayRuntime | None,
+    ) -> None:
+        self._dynamic_replay_runtime = runtime
+
+    def set_layer_imbalance_ms(self, layer_idx: int, imbalance_ms: float) -> None:
+        self._layer_imbalance_ms[int(layer_idx)] = float(imbalance_ms)
 
     @contextmanager
     def profile_attention(
@@ -71,14 +68,8 @@ class OPTComponentMFUStepProfiler:
         layer: OPTAttention,
         hidden_states: torch.Tensor,
     ):
-        with self._profile_component(
-            component="attention",
-            layer_idx=layer.layer_idx,
-            num_tokens=_num_tokens(hidden_states),
-            flops=self._estimate_attention_flops(layer, hidden_states),
-            hidden_states=hidden_states,
-        ):
-            yield
+        del layer, hidden_states
+        yield
 
     @contextmanager
     def profile_ffn(
@@ -86,79 +77,14 @@ class OPTComponentMFUStepProfiler:
         layer: OPTDecoderLayer,
         hidden_states: torch.Tensor,
     ):
-        with self._profile_component(
-            component="ffn",
-            layer_idx=layer.layer_idx,
-            num_tokens=_num_tokens(hidden_states),
-            flops=self._estimate_ffn_flops(layer, hidden_states),
-            hidden_states=hidden_states,
-        ):
-            yield
-
-    @contextmanager
-    def _profile_component(
-        self,
-        *,
-        component: str,
-        layer_idx: int,
-        num_tokens: int,
-        flops: float,
-        hidden_states: torch.Tensor,
-    ):
-        if hidden_states.device.type != "cuda" or num_tokens <= 0:
-            yield
-            return
-
-        replay_ratio, replay_token_count, num_actual_tokens = self._get_replay_stats(
-            layer_idx
-        )
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-        try:
-            yield
-        finally:
-            end_event.record()
-            self._records.append(
-                _PendingRecord(
-                    component=component,
-                    layer_idx=layer_idx,
-                    num_tokens=num_tokens,
-                    replay_token_count=replay_token_count,
-                    num_actual_tokens=num_actual_tokens,
-                    replay_ratio=replay_ratio,
-                    flops=flops,
-                    start_event=start_event,
-                    end_event=end_event,
-                )
-            )
+        del layer, hidden_states
+        yield
 
     def finish_step(self) -> None:
-        if not self._records:
-            return
+        if self._dynamic_replay_runtime is not None:
+            torch.cuda.synchronize()
 
-        torch.cuda.synchronize()
-        layer_records: list[dict[str, Any]] = []
-        for record in self._records:
-            elapsed_ms = record.start_event.elapsed_time(record.end_event)
-            tflops = _compute_tflops(record.flops, elapsed_ms)
-            entry = {
-                "component": record.component,
-                "layer_idx": record.layer_idx,
-                "num_tokens": record.num_tokens,
-                "replay_token_count": record.replay_token_count,
-                "num_actual_tokens": record.num_actual_tokens,
-                "replay_ratio": record.replay_ratio,
-                "time_ms": elapsed_ms,
-                "flops": record.flops,
-                "tflops": tflops,
-                "mfu": (
-                    tflops / self.peak_tflops
-                    if tflops is not None and self.peak_tflops
-                    else None
-                ),
-            }
-            layer_records.append(entry)
+        layer_records = self._build_layer_records()
 
         payload = {
             "step": self.step_idx,
@@ -166,164 +92,86 @@ class OPTComponentMFUStepProfiler:
             "model_name": self.model_name,
             "total_scheduled_tokens": self.total_scheduled_tokens,
             "num_reqs": self.num_reqs,
-            "attention": self._aggregate_component(layer_records, "attention"),
-            "ffn": self._aggregate_component(layer_records, "ffn"),
             "layers": layer_records,
         }
         with self.output_path.open("a", encoding="utf-8") as f:
             json.dump(payload, f, sort_keys=True)
             f.write("\n")
-
-        self._records.clear()
-
-    def _aggregate_component(
-        self,
-        layer_records: list[dict[str, Any]],
-        component: str,
-    ) -> dict[str, Any]:
-        records = [
-            record for record in layer_records if record["component"] == component
-        ]
-        if not records:
-            return {
-                "calls": 0,
-                "time_ms": 0.0,
-                "flops": 0.0,
-                "tflops": None,
-                "mfu": None,
-                "weighted_replay_ratio": 0.0,
-                "num_tokens": 0,
-                "replay_token_count": 0,
-            }
-
-        total_time_ms = sum(record["time_ms"] for record in records)
-        total_flops = sum(record["flops"] for record in records)
-        total_num_tokens = sum(record["num_tokens"] for record in records)
-        total_replay_tokens = sum(record["replay_token_count"] for record in records)
-        weighted_replay_ratio = (
-            sum(record["replay_ratio"] * record["flops"] for record in records)
-            / total_flops
-            if total_flops > 0
-            else 0.0
+        flat_path = self.output_path.with_name(
+            f"{self.output_path.stem}.flat{self.output_path.suffix}"
         )
-        tflops = _compute_tflops(total_flops, total_time_ms)
-        return {
-            "calls": len(records),
-            "time_ms": total_time_ms,
-            "flops": total_flops,
-            "tflops": tflops,
-            "mfu": (
-                tflops / self.peak_tflops
-                if tflops is not None and self.peak_tflops
-                else None
-            ),
-            "weighted_replay_ratio": weighted_replay_ratio,
-            "num_tokens": total_num_tokens,
-            "replay_token_count": total_replay_tokens,
-        }
+        with flat_path.open("a", encoding="utf-8") as f:
+            for layer_record in layer_records:
+                flat_row = {
+                    "step": self.step_idx,
+                    "rank": self.rank,
+                    "model_name": self.model_name,
+                    "total_scheduled_tokens": self.total_scheduled_tokens,
+                    "num_reqs": self.num_reqs,
+                    **layer_record,
+                }
+                json.dump(flat_row, f, sort_keys=True)
+                f.write("\n")
 
-    def _estimate_attention_flops(
-        self,
-        layer: OPTAttention,
-        hidden_states: torch.Tensor,
-    ) -> float:
-        num_tokens = _num_tokens(hidden_states)
-        qkv_flops = (
-            2.0
-            * num_tokens
-            * layer.qkv_proj.input_size
-            * layer.qkv_proj.output_size_per_partition
-        )
-        out_flops = (
-            2.0
-            * num_tokens
-            * layer.out_proj.input_size_per_partition
-            * layer.out_proj.output_size
-        )
+        self._layer_imbalance_ms.clear()
+        self._dynamic_replay_runtime = None
 
-        attn_metadata = self._get_attention_metadata(layer.attn.layer_name)
-        if attn_metadata is None:
-            return qkv_flops + out_flops
+    def _build_layer_records(self) -> list[dict[str, Any]]:
+        per_layer: dict[int, dict[str, Any]] = {}
 
-        query_start_loc = _to_int_list(
-            getattr(
-                attn_metadata,
-                "query_start_loc_cpu",
-                getattr(attn_metadata, "query_start_loc", None),
-            )
-        )
-        seq_lens = _to_int_list(
-            getattr(
-                attn_metadata,
-                "_seq_lens_cpu",
-                getattr(attn_metadata, "seq_lens", None),
-            )
-        )
-        if query_start_loc is None or seq_lens is None or len(query_start_loc) < 2:
-            return qkv_flops + out_flops
+        runtime = self._dynamic_replay_runtime
+        if runtime is not None:
+            step_anchor = runtime.get_step_anchor_event()
 
-        attn_core_flops = 0.0
-        for query_start, query_end, kv_len in zip(
-            query_start_loc[:-1], query_start_loc[1:], seq_lens
-        ):
-            query_len = max(query_end - query_start, 0)
-            if query_len == 0 or kv_len <= 0:
-                continue
-            query_len = min(query_len, kv_len)
-            valid_pairs = query_len * (2 * kv_len - query_len + 1) / 2.0
-            attn_core_flops += 4.0 * valid_pairs * layer.num_heads * layer.head_dim
+            for layer_idx in range(runtime.num_layers):
+                plan = runtime.current_layer_plan(layer_idx)
+                replay_ratio = None
+                replay_token_count = None
+                num_actual_tokens = None
+                num_tokens = None
+                if plan is not None:
+                    replay_ratio, replay_token_count, num_actual_tokens = (
+                        _replay_stats_from_plan(plan)
+                    )
+                    num_tokens = int(plan.scheduled_token_count)
 
-        return qkv_flops + attn_core_flops + out_flops
+                layer_entry: dict[str, Any] = {
+                    "layer_idx": layer_idx,
+                    "next_layer_idx": layer_idx + 1,
+                    "compute_end_ms_from_anchor": None,
+                    "load_ready_ms_from_anchor": None,
+                    "imbalance_ms": runtime.get_layer_imbalance_ms(layer_idx),
+                    "replay_ratio": replay_ratio,
+                    "replay_token_count": replay_token_count,
+                    "num_actual_tokens": num_actual_tokens,
+                    "num_tokens": num_tokens,
+                }
+                per_layer[layer_idx] = layer_entry
 
-    def _estimate_ffn_flops(
-        self,
-        layer: OPTDecoderLayer,
-        hidden_states: torch.Tensor,
-    ) -> float:
-        num_tokens = _num_tokens(hidden_states)
-        fc1_flops = (
-            2.0
-            * num_tokens
-            * layer.fc1.input_size
-            * layer.fc1.output_size_per_partition
-        )
-        fc2_flops = (
-            2.0
-            * num_tokens
-            * layer.fc2.input_size_per_partition
-            * layer.fc2.output_size
-        )
-        return fc1_flops + fc2_flops
+                # compute_end from layer_end_event (on compute stream)
+                if step_anchor is not None:
+                    compute_end = runtime.get_layer_end_event(layer_idx)
+                    if compute_end is not None:
+                        layer_entry["compute_end_ms_from_anchor"] = float(
+                            step_anchor.elapsed_time(compute_end)
+                        )
 
-    def _get_attention_metadata(self, layer_name: str) -> Any | None:
-        forward_context = get_forward_context()
-        attn_metadata = forward_context.attn_metadata
-        if isinstance(attn_metadata, dict):
-            return attn_metadata.get(layer_name)
-        return None
+                # load_ready for the *next* layer (on load stream)
+                next_layer_idx = layer_idx + 1
+                if next_layer_idx >= runtime.num_layers:
+                    layer_entry["next_layer_idx"] = None
+                    continue
 
-    def _get_replay_stats(self, layer_idx: int) -> tuple[float, int, int]:
-        forward_context = get_forward_context()
-        runtime = forward_context.layer_recompute_runtime
-        if runtime is None:
-            return 0.0, 0, 0
+                if step_anchor is not None:
+                    load_ready = runtime.get_layer_load_ready_event(next_layer_idx)
+                    hs_ready = runtime.get_layer_cpu_fill_ready_event(next_layer_idx)
+                    final_ready = hs_ready or load_ready
+                    if final_ready is not None:
+                        layer_entry["load_ready_ms_from_anchor"] = float(
+                            step_anchor.elapsed_time(final_ready)
+                        )
 
-        plan = runtime.current_layer_plan(layer_idx)
-        if plan is None:
-            return 0.0, 0, 0
-        return _replay_stats_from_plan(plan)
-
-
-def _compute_tflops(flops: float, elapsed_ms: float) -> float | None:
-    if elapsed_ms <= 0:
-        return None
-    return flops / (elapsed_ms * 1e-3) / 1e12
-
-
-def _num_tokens(hidden_states: torch.Tensor) -> int:
-    if hidden_states.ndim == 2:
-        return int(hidden_states.shape[0])
-    return int(hidden_states.numel() // hidden_states.shape[-1])
+        return [per_layer[layer_idx] for layer_idx in sorted(per_layer)]
 
 
 def _replay_stats_from_plan(plan: LayerReplayPlan) -> tuple[float, int, int]:
@@ -333,13 +181,3 @@ def _replay_stats_from_plan(plan: LayerReplayPlan) -> tuple[float, int, int]:
         replay_token_count / num_actual_tokens if num_actual_tokens > 0 else 0.0
     )
     return replay_ratio, replay_token_count, num_actual_tokens
-
-
-def _to_int_list(values: Any) -> list[int] | None:
-    if values is None:
-        return None
-    if torch.is_tensor(values):
-        return [int(v) for v in values.detach().cpu().tolist()]
-    if isinstance(values, (list, tuple)):
-        return [int(v) for v in values]
-    return None

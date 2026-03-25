@@ -418,7 +418,6 @@ class OPTDecoder(nn.Module):
             start=self.start_layer,
         ):
             plan = runtime.get_layer_plan(layer_idx)
-
             if plan.replay_token_count == 0:
                 with self._with_runtime_attn_metadata(layer_idx=layer_idx):
                     scheduled_hidden_states = layer(scheduled_hidden_states)

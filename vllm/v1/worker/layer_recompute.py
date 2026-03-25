@@ -61,6 +61,8 @@ class LayerRecomputeManager:
         num_layers: int,
         model: torch.nn.Module,
         dtype: torch.dtype,
+        h2d_stream: torch.cuda.Stream | None = None,
+        d2h_stream: torch.cuda.Stream | None = None,
     ) -> None:
         self.device = device
         self.model = model
@@ -157,8 +159,8 @@ class LayerRecomputeManager:
         self._hs_d2h_stream: torch.cuda.Stream | None = None
         self._hs_h2d_stream: torch.cuda.Stream | None = None
         if self.device.type == "cuda":
-            self._hs_d2h_stream = torch.cuda.Stream(device=self.device)
-            self._hs_h2d_stream = torch.cuda.Stream(device=self.device)
+            self._hs_d2h_stream = d2h_stream or torch.cuda.Stream(device=self.device)
+            self._hs_h2d_stream = h2d_stream or torch.cuda.Stream(device=self.device)
 
         (
             self._decoder_layers,
@@ -338,91 +340,110 @@ class LayerRecomputeManager:
         cpu_fill_logical_ids: np.ndarray,
         cpu_fill_block_offsets: np.ndarray,
     ) -> torch.Tensor:
-        target_logical_ids = np.asarray(cpu_fill_logical_ids, dtype=np.int64)
-        target_block_offsets = np.asarray(cpu_fill_block_offsets, dtype=np.int64)
-        token_positions = np.asarray(cpu_fill_positions, dtype=np.int32)
-
-        if (
-            target_logical_ids.ndim != 1
-            or target_block_offsets.ndim != 1
-            or token_positions.ndim != 1
+        with record_function_or_nullcontext(
+            f"runkv_recompute:cpu_fill_h2d_async:L{layer_idx}"
         ):
-            raise ValueError(
-                "cpu_fill_positions/logical_ids/block_offsets must all be 1D arrays."
-            )
-        if not (
-            target_logical_ids.shape[0]
-            == target_block_offsets.shape[0]
-            == token_positions.shape[0]
-        ):
-            raise ValueError(
-                "cpu_fill_positions/logical_ids/block_offsets must have the same "
-                "length."
-            )
+            target_logical_ids = np.asarray(cpu_fill_logical_ids, dtype=np.int64)
+            target_block_offsets = np.asarray(cpu_fill_block_offsets, dtype=np.int64)
+            token_positions = np.asarray(cpu_fill_positions, dtype=np.int32)
 
-        if target_logical_ids.shape[0] == 0:
-            hs_gpu = torch.empty(
-                (0, self.hidden_size),
-                dtype=self.cpu_layer_inputs_by_layer[layer_idx].dtype,
-                device=self.device,
-            )
+            if (
+                target_logical_ids.ndim != 1
+                or target_block_offsets.ndim != 1
+                or token_positions.ndim != 1
+            ):
+                raise ValueError(
+                    "cpu_fill_positions/logical_ids/block_offsets"
+                    " must all be 1D arrays."
+                )
+            if not (
+                target_logical_ids.shape[0]
+                == target_block_offsets.shape[0]
+                == token_positions.shape[0]
+            ):
+                raise ValueError(
+                    "cpu_fill_positions/logical_ids/block_offsets must have the same "
+                    "length."
+                )
+
+            if target_logical_ids.shape[0] == 0:
+                hs_gpu = torch.empty(
+                    (0, self.hidden_size),
+                    dtype=self.cpu_layer_inputs_by_layer[layer_idx].dtype,
+                    device=self.device,
+                )
+                self._pending_cpu_fill_h2d_by_layer[layer_idx] = _PendingCPUFillLoad(
+                    gathered_hs_gpu=hs_gpu,
+                    ready_event=None,
+                )
+                return hs_gpu
+
+            store_logical_ids_t = torch.from_numpy(target_logical_ids)
+            store_block_offsets_t = torch.from_numpy(target_block_offsets)
+            token_positions_t = torch.from_numpy(token_positions)
+            stored_token_positions = self.cpu_block_positions[
+                store_logical_ids_t, store_block_offsets_t
+            ]
+            if torch.any(stored_token_positions != token_positions_t):
+                raise ValueError(
+                    "cpu_fill requests positions that are not materialized in the CPU "
+                    "hidden-state store."
+                )
+
+            # Gather the block-addressed CPU store into a token-contiguous buffer
+            # before transferring it back to GPU. The order of
+            # target_logical_ids/target_block_offsets defines the replay token order.
+            gathered_hs_cpu = self.cpu_layer_inputs_by_layer[layer_idx][
+                store_logical_ids_t, store_block_offsets_t, :
+            ].contiguous()
+            if self.pin_memory and not gathered_hs_cpu.is_pinned():
+                gathered_hs_cpu = gathered_hs_cpu.pin_memory()
+
+            with record_function_or_nullcontext(
+                f"runkv_recompute:cpu_fill_h2d_copy:L{layer_idx}"
+            ):
+                if self._hs_h2d_stream is not None and self.device.type == "cuda":
+                    with torch.cuda.stream(self._hs_h2d_stream):
+                        gathered_hs_gpu = gathered_hs_cpu.to(
+                            self.device, non_blocking=True
+                        )
+                        # This event lives on the dedicated H2D stream and marks
+                        # the point where the async CPU-fill copy has completed
+                        # there. The compute stream will wait on it in
+                        # sync_cpu_fill_h2d().
+                        ready_event = torch.cuda.Event(enable_timing=True)
+                        ready_event.record(self._hs_h2d_stream)
+                else:
+                    gathered_hs_gpu = gathered_hs_cpu.to(self.device)
+                    ready_event = None
+
             self._pending_cpu_fill_h2d_by_layer[layer_idx] = _PendingCPUFillLoad(
-                gathered_hs_gpu=hs_gpu,
-                ready_event=None,
+                gathered_hs_gpu=gathered_hs_gpu,
+                ready_event=ready_event,
             )
-            return hs_gpu
-
-        store_logical_ids_t = torch.from_numpy(target_logical_ids)
-        store_block_offsets_t = torch.from_numpy(target_block_offsets)
-        token_positions_t = torch.from_numpy(token_positions)
-        stored_token_positions = self.cpu_block_positions[
-            store_logical_ids_t, store_block_offsets_t
-        ]
-        if torch.any(stored_token_positions != token_positions_t):
-            raise ValueError(
-                "cpu_fill requests positions that are not materialized in the CPU "
-                "hidden-state store."
-            )
-
-        # Gather the block-addressed CPU store into a token-contiguous buffer
-        # before transferring it back to GPU. The order of
-        # target_logical_ids/target_block_offsets defines the replay token order.
-        gathered_hs_cpu = self.cpu_layer_inputs_by_layer[layer_idx][
-            store_logical_ids_t, store_block_offsets_t, :
-        ].contiguous()
-        if self.pin_memory and not gathered_hs_cpu.is_pinned():
-            gathered_hs_cpu = gathered_hs_cpu.pin_memory()
-
-        if self._hs_h2d_stream is not None and self.device.type == "cuda":
-            with torch.cuda.stream(self._hs_h2d_stream):
-                gathered_hs_gpu = gathered_hs_cpu.to(self.device, non_blocking=True)
-                # This event lives on the dedicated H2D stream and marks the
-                # point where the async CPU-fill copy has completed there. The
-                # compute stream will wait on it in sync_cpu_fill_h2d().
-                ready_event = torch.cuda.Event()
-                ready_event.record(self._hs_h2d_stream)
-        else:
-            gathered_hs_gpu = gathered_hs_cpu.to(self.device)
-            ready_event = None
-
-        self._pending_cpu_fill_h2d_by_layer[layer_idx] = _PendingCPUFillLoad(
-            gathered_hs_gpu=gathered_hs_gpu,
-            ready_event=ready_event,
-        )
-        return gathered_hs_gpu
+            return gathered_hs_gpu
 
     def sync_cpu_fill_h2d(self, layer_idx: int) -> torch.Tensor | None:
         pending = self._pending_cpu_fill_h2d_by_layer.get(layer_idx)
         if pending is None:
             return None
         if pending.ready_event is not None and self.device.type == "cuda":
-            # Make the current compute stream wait until the H2D-stream event
-            # recorded in load_cpu_fill_h2d_async() has completed. This is a
-            # stream dependency, not a new timestamp.
-            torch.cuda.current_stream(device=self.device).wait_event(
-                pending.ready_event
-            )
+            with record_function_or_nullcontext(
+                f"runkv_recompute:cpu_fill_h2d_sync:L{layer_idx}"
+            ):
+                # Make the current compute stream wait until the H2D-stream
+                # event recorded in load_cpu_fill_h2d_async() has completed.
+                # This is a stream dependency, not a new timestamp.
+                torch.cuda.current_stream(device=self.device).wait_event(
+                    pending.ready_event
+                )
         return pending.gathered_hs_gpu
+
+    def peek_cpu_fill_h2d_ready_event(self, layer_idx: int) -> torch.cuda.Event | None:
+        pending = self._pending_cpu_fill_h2d_by_layer.get(layer_idx)
+        if pending is None:
+            return None
+        return pending.ready_event
 
     def load_cpu_fill_h2d(
         self,

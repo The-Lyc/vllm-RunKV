@@ -455,41 +455,45 @@ class PagedBlockMapper:
                 "(VLLM_RUNKV_SYNC_BUFFER_REUSE=1)."
             )
 
-        # UVA batch copy support
-        # Try to load the batch copy kernel (built-in or standalone)
+        # Pinned index arrays for batch copy operations (H2D and D2H).
+        max_indices = self.capacity
+        self._src_indices_pinned = torch.empty(
+            max_indices, dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        self._dst_indices_pinned = torch.empty(
+            max_indices, dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        # For dirty blocks (D2H offload)
+        self._dirty_src_indices_pinned = torch.empty(
+            max_indices, dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        self._dirty_dst_indices_pinned = torch.empty(
+            max_indices, dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        self._current_num_blocks = 0
+
+        # DMA H2D staging buffers.
+        # H2D uses gather → cudaMemcpyAsync → scatter instead of the UVA
+        # copy kernel, because the UVA kernel occupies SMs with PCIe-stalled
+        # warps and blocks compute kernels on other streams.
+        self._h2d_pinned_staging = torch.empty_like(
+            any_buffer, device="cpu", pin_memory=True
+        )
+        self._h2d_gpu_staging = torch.empty_like(any_buffer)
+        self._scatter_indices_gpu = torch.empty(
+            max_indices, dtype=torch.int64, device=device
+        )
+
+        # UVA batch copy kernel (still used for D2H offload where dirty block
+        # count is small and SM contention is negligible).
         batch_copy_fn = _get_runkv_batch_copy()
         self.use_batch_copy = batch_copy_fn is not None
         self._batch_copy_fn = batch_copy_fn
-
-        if self.use_batch_copy:
-            # Pre-allocate pinned memory for index arrays
-            # These are accessed via UVA by the GPU kernel
-            # Size them to handle max possible blocks per step
-            max_indices = self.capacity
-            self._src_indices_pinned = torch.empty(
-                max_indices, dtype=torch.int64, device="cpu", pin_memory=True
-            )
-            self._dst_indices_pinned = torch.empty(
-                max_indices, dtype=torch.int64, device="cpu", pin_memory=True
-            )
-            # Also for dirty blocks (offload)
-            self._dirty_src_indices_pinned = torch.empty(
-                max_indices, dtype=torch.int64, device="cpu", pin_memory=True
-            )
-            self._dirty_dst_indices_pinned = torch.empty(
-                max_indices, dtype=torch.int64, device="cpu", pin_memory=True
-            )
-            # Pre-computed indices for current step (set in _assign_slots)
-            self._current_num_blocks = 0
-            logger.info(
-                "RunKV: Using UVA batch copy kernel (max %d blocks)",
-                max_indices,
-            )
-        else:
-            logger.warning(
-                "RunKV: UVA batch copy kernel not available, using per-block copy. "
-                "To enable, run: python setup_runkv.py build_ext --inplace"
-            )
+        logger.info(
+            "RunKV: DMA H2D copy enabled (max %d blocks), UVA D2H kernel %s",
+            max_indices,
+            "available" if self.use_batch_copy else "unavailable (per-block fallback)",
+        )
 
     def _validate_shapes_for_layer(
         self, *, layer_name: str, gpu_buffer: torch.Tensor, cpu_cache: torch.Tensor
@@ -528,6 +532,82 @@ class PagedBlockMapper:
             non_blocking=non_blocking,
         )
 
+    def _dma_h2d_copy(
+        self,
+        gpu_buffer: torch.Tensor,
+        cpu_cache: torch.Tensor,
+        src_indices: torch.Tensor,
+        copy_count: int,
+        dst_indices: torch.Tensor | None = None,
+    ) -> None:
+        """Batch H2D copy using DMA engine (no SM contention).
+
+        Three steps:
+        1. CPU gather: index_select scattered src blocks into contiguous
+           pinned staging buffer (pure CPU work).
+        2. DMA: async memcpy from pinned CPU to GPU (copy engine, no SMs).
+        3. GPU scatter: index_copy_ to final dst positions in gpu_buffer
+           (only when dst_indices are non-contiguous, i.e. skip case).
+
+        This replaces the UVA batch copy kernel which launched one CUDA thread
+        block per KV block, causing all SMs to stall on PCIe reads and
+        preventing compute kernels on other streams from executing.
+        """
+        bd = self._blocks_dim
+        staging = self._h2d_pinned_staging
+
+        if bd == 0:
+            # blocks_dim=0: shape (num_blocks, ...).
+            # Each block slice is contiguous in memory.
+            torch.index_select(cpu_cache, 0, src_indices, out=staging[:copy_count])
+            if dst_indices is None:
+                # Fast path: dst slots are contiguous 0..N-1.
+                gpu_buffer[:copy_count].copy_(staging[:copy_count], non_blocking=True)
+            else:
+                gpu_stg = self._h2d_gpu_staging
+                gpu_stg[:copy_count].copy_(staging[:copy_count], non_blocking=True)
+                self._scatter_indices_gpu[:copy_count].copy_(
+                    dst_indices, non_blocking=True
+                )
+                gpu_buffer.index_copy_(
+                    0,
+                    self._scatter_indices_gpu[:copy_count],
+                    gpu_stg[:copy_count],
+                )
+        else:
+            # blocks_dim=1: shape (outer, num_blocks, ...).
+            # Process each outer slice (K / V) independently so every DMA
+            # source and destination is contiguous.
+            outer_size = cpu_cache.shape[0]
+            for outer in range(outer_size):
+                torch.index_select(
+                    cpu_cache[outer],
+                    0,
+                    src_indices,
+                    out=staging[outer, :copy_count],
+                )
+
+            if dst_indices is None:
+                for outer in range(outer_size):
+                    gpu_buffer[outer, :copy_count].copy_(
+                        staging[outer, :copy_count], non_blocking=True
+                    )
+            else:
+                gpu_stg = self._h2d_gpu_staging
+                for outer in range(outer_size):
+                    gpu_stg[outer, :copy_count].copy_(
+                        staging[outer, :copy_count], non_blocking=True
+                    )
+                self._scatter_indices_gpu[:copy_count].copy_(
+                    dst_indices, non_blocking=True
+                )
+                for outer in range(outer_size):
+                    gpu_buffer[outer].index_copy_(
+                        0,
+                        self._scatter_indices_gpu[:copy_count],
+                        gpu_stg[outer, :copy_count],
+                    )
+
     def _assign_slots(self, logical_block_ids: list[int]) -> None:
         """Assign GPU staging slots for the given logical blocks.
 
@@ -555,17 +635,14 @@ class PagedBlockMapper:
         for slot, logical_id in enumerate(logical_block_ids):
             self.mapping[logical_id] = slot
 
-        # Pre-fill indices for batch copy (avoid Python for-loop in load_layer_async)
-        if self.use_batch_copy:
-            num_blocks = len(logical_block_ids)
-            self._current_num_blocks = num_blocks
-            if num_blocks > 0:
-                # Convert mapping to tensors efficiently
-                # logical_block_ids are CPU indices, slots are GPU indices
-                logical_ids_tensor = torch.tensor(logical_block_ids, dtype=torch.int64)
-                slots_tensor = torch.arange(num_blocks, dtype=torch.int64)
-                self._src_indices_pinned[:num_blocks].copy_(logical_ids_tensor)
-                self._dst_indices_pinned[:num_blocks].copy_(slots_tensor)
+        # Pre-fill indices for H2D DMA copy
+        num_blocks = len(logical_block_ids)
+        self._current_num_blocks = num_blocks
+        if num_blocks > 0:
+            logical_ids_tensor = torch.tensor(logical_block_ids, dtype=torch.int64)
+            slots_tensor = torch.arange(num_blocks, dtype=torch.int64)
+            self._src_indices_pinned[:num_blocks].copy_(logical_ids_tensor)
+            self._dst_indices_pinned[:num_blocks].copy_(slots_tensor)
 
     def prepare_step(
         self,
@@ -746,60 +823,47 @@ class PagedBlockMapper:
                         ):
                             prev_offload_event.wait(self.load_stream)
 
-                if self.use_batch_copy:
-                    copy_count = 0
-                    if skip:
-                        # Build filtered (logical_id -> slot) pairs.
-                        valid_pairs = [
-                            (logical_id, slot)
-                            for logical_id, slot in self.mapping.items()
-                            if logical_id not in skip
-                        ]
-                        copy_count = len(valid_pairs)
-                        if copy_count > 0:
-                            logical_ids, slots = zip(*valid_pairs)
-                            self._src_indices_pinned[:copy_count] = torch.tensor(
-                                logical_ids, dtype=torch.int64
-                            )
-                            self._dst_indices_pinned[:copy_count] = torch.tensor(
-                                slots, dtype=torch.int64
-                            )
-                    else:
-                        # Fast path: use pre-filled full-step indices.
-                        copy_count = len(self.mapping)
-
+                # DMA-based H2D batch copy: gather → cudaMemcpyAsync → scatter.
+                # Uses the DMA copy engine instead of a GPU kernel, so no SMs
+                # are occupied and compute kernels on other streams can execute
+                # without being blocked.
+                copy_count = 0
+                if skip:
+                    valid_pairs = [
+                        (logical_id, slot)
+                        for logical_id, slot in self.mapping.items()
+                        if logical_id not in skip
+                    ]
+                    copy_count = len(valid_pairs)
                     if copy_count > 0:
-                        src_indices = self._src_indices_pinned[:copy_count]
-                        dst_indices = self._dst_indices_pinned[:copy_count]
-                        # Single kernel launch reads indices via UVA.
-                        with record_function_or_nullcontext(
-                            "runkv_kernels:batch_copy_blocks"
-                            f":h2d:L{layer_idx}:{copy_count}_blocks"
-                        ):
-                            self._batch_copy_fn(
-                                gpu_buffer,  # dst: GPU staging buffer
-                                cpu_cache,  # src: CPU cache (pinned)
-                                dst_indices,  # dst block indices (pinned, UVA)
-                                src_indices,  # src block indices (pinned, UVA)
-                                self._blocks_dim,
-                            )
+                        logical_ids, slots = zip(*valid_pairs)
+                        self._src_indices_pinned[:copy_count] = torch.tensor(
+                            logical_ids, dtype=torch.int64
+                        )
+                        self._dst_indices_pinned[:copy_count] = torch.tensor(
+                            slots, dtype=torch.int64
+                        )
                 else:
-                    # Fallback to per-block copy
-                    for logical_id, slot in self.mapping.items():
-                        if logical_id in skip:
-                            continue
-                        self._copy_block(
-                            dst=gpu_buffer,
-                            dst_block_id=slot,
-                            src=cpu_cache,
-                            src_block_id=logical_id,
-                            non_blocking=True,
+                    copy_count = len(self.mapping)
+
+                if copy_count > 0:
+                    with record_function_or_nullcontext(
+                        f"runkv:dma_h2d:L{layer_idx}:{copy_count}_blocks"
+                    ):
+                        self._dma_h2d_copy(
+                            gpu_buffer,
+                            cpu_cache,
+                            self._src_indices_pinned[:copy_count],
+                            copy_count,
+                            dst_indices=(
+                                self._dst_indices_pinned[:copy_count] if skip else None
+                            ),
                         )
                 # This event lives on load_stream and marks "the async KV load
                 # work for this layer has been queued and completed on the load
                 # stream". sync_load_layer() will later make the compute stream
                 # wait on this event before the layer consumes the staged KV.
-                event = torch.cuda.Event()
+                event = torch.cuda.Event(enable_timing=True)
                 event.record(self.load_stream)
                 self.load_events[layer_idx] = event
 
@@ -824,6 +888,9 @@ class PagedBlockMapper:
                 event.wait(torch.cuda.current_stream())
             # Clean up the event
             del self.load_events[layer_idx]
+
+    def peek_load_ready_event(self, layer_idx: int) -> torch.cuda.Event | None:
+        return self.load_events.get(layer_idx)
 
     def load_layer(
         self,
@@ -1010,24 +1077,26 @@ class GPUModelRunner(
         self.observability_config = vllm_config.observability_config
         self._opt_component_mfu_step = 0
         self._opt_component_mfu_skip_logged = False
+        self._is_opt_model = (
+            getattr(self.model_config.hf_config, "model_type", None) == "opt"
+        )
         self._opt_component_mfu_enabled = (
             self.observability_config.enable_opt_component_mfu_profiling
-            and getattr(self.model_config.hf_config, "model_type", None) == "opt"
+            and self._is_opt_model
         )
         self._opt_component_mfu_output_path = (
             self.observability_config.opt_component_mfu_output_path
         )
-        self._opt_component_mfu_peak_tflops = (
-            self.observability_config.opt_component_mfu_peak_tflops
+        self._opt_component_log_enabled = bool(
+            self._opt_component_mfu_output_path and self._is_opt_model
         )
-
         if (
             self.observability_config.enable_opt_component_mfu_profiling
-            and not self._opt_component_mfu_enabled
-        ):
+            or self._opt_component_mfu_output_path
+        ) and not self._is_opt_model:
             logger.warning_once(
-                "OPT component MFU profiling only supports OPT models; "
-                "profiling will be disabled for model_type=%s.",
+                "OPT component profiling only supports OPT models; "
+                "profiling/logging will be disabled for model_type=%s.",
                 getattr(self.model_config.hf_config, "model_type", None),
             )
 
@@ -1439,6 +1508,10 @@ class GPUModelRunner(
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
         self.layerwise_nvtx_hooks_registered = False
+        self._runkv_active_attention_nvtx_ranges: set[int] = set()
+        self._runkv_nvtx_push: Any | None = None
+        self._runkv_nvtx_pop: Any | None = None
+        self._runkv_nvtx_api_initialized = False
 
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
@@ -2789,6 +2862,45 @@ class GPUModelRunner(
                 return (layer_name, layer_idx, gid)
         return None
 
+    def _maybe_init_runkv_nvtx_api(self) -> None:
+        if self._runkv_nvtx_api_initialized:
+            return
+
+        self._runkv_nvtx_api_initialized = True
+        if not envs.VLLM_NVTX_SCOPES_FOR_PROFILING:
+            return
+
+        try:
+            import torch.cuda.nvtx as torch_nvtx
+
+            self._runkv_nvtx_push = torch_nvtx.range_push
+            self._runkv_nvtx_pop = torch_nvtx.range_pop
+        except Exception:
+            self._runkv_nvtx_push = None
+            self._runkv_nvtx_pop = None
+
+    def _push_runkv_attention_nvtx_range(
+        self, *, layer_name: str, layer_idx: int
+    ) -> None:
+        if layer_idx in self._runkv_active_attention_nvtx_ranges:
+            return
+
+        self._maybe_init_runkv_nvtx_api()
+        if self._runkv_nvtx_push is None:
+            return
+
+        self._runkv_nvtx_push(f"runkv:attention_compute:{layer_name}:L{layer_idx}")
+        self._runkv_active_attention_nvtx_ranges.add(layer_idx)
+
+    def _pop_runkv_attention_nvtx_range(self, *, layer_idx: int) -> None:
+        if layer_idx not in self._runkv_active_attention_nvtx_ranges:
+            return
+
+        self._maybe_init_runkv_nvtx_api()
+        if self._runkv_nvtx_pop is not None:
+            self._runkv_nvtx_pop()
+        self._runkv_active_attention_nvtx_ranges.discard(layer_idx)
+
     def _runkv_pre_hook(
         self,
         module: nn.Module,
@@ -2860,6 +2972,68 @@ class GPUModelRunner(
                         )
                         self._dynamic_replay_prehook_logged = True
 
+                    current_load_ready_event = mapper.peek_load_ready_event(layer_idx)
+                    current_cpu_fill_ready_event = (
+                        manager.peek_cpu_fill_h2d_ready_event(layer_idx)
+                    )
+                    runtime.set_layer_load_ready_event(
+                        layer_idx, current_load_ready_event
+                    )
+                    runtime.set_layer_cpu_fill_ready_event(
+                        layer_idx, current_cpu_fill_ready_event
+                    )
+                    with record_function_or_nullcontext(
+                        f"runkv:layer_wait_ready:{layer_name}:L{layer_idx}"
+                    ):
+                        mapper.sync_load_layer(layer_idx)
+                        manager.sync_cpu_fill_h2d(layer_idx)
+
+                    if layer_idx > 0 and self.device.type == "cuda":
+                        prev_end_event = runtime.get_layer_end_event(layer_idx - 1)
+                        step_anchor_event = runtime.get_step_anchor_event()
+                        if prev_end_event is not None and step_anchor_event is not None:
+                            final_ready_event = (
+                                current_cpu_fill_ready_event or current_load_ready_event
+                            )
+                            if final_ready_event is not None:
+                                # KV load and optional CPU-fill H2D now share the
+                                # same load stream. If CPU-fill exists, its event is
+                                # recorded after the KV load on that same stream and
+                                # therefore already represents the final ready point.
+                                prev_end_event.synchronize()
+                                final_ready_event.synchronize()
+                                end_ms = float(
+                                    step_anchor_event.elapsed_time(prev_end_event)
+                                )
+                                ready_ms = float(
+                                    step_anchor_event.elapsed_time(final_ready_event)
+                                )
+                                imbalance_ms = ready_ms - end_ms
+                                runtime.set_layer_imbalance_ms(
+                                    layer_idx - 1, imbalance_ms
+                                )
+                                if isinstance(
+                                    self.replay_plan_provider,
+                                    FeedbackReplayPlanProvider,
+                                ):
+                                    self.replay_plan_provider.observe_layer_feedback(
+                                        layer_idx=layer_idx - 1,
+                                        imbalance_ms=imbalance_ms,
+                                    )
+                                additional_kwargs = (
+                                    forward_context.additional_kwargs or {}
+                                )
+                                opt_component_profiler = additional_kwargs.get(
+                                    OPT_COMPONENT_MFU_PROFILER_KEY
+                                )
+                                if isinstance(
+                                    opt_component_profiler,
+                                    OPTComponentMFUStepProfiler,
+                                ):
+                                    opt_component_profiler.set_layer_imbalance_ms(
+                                        layer_idx - 1, imbalance_ms
+                                    )
+
                     next_layer_info = self._get_next_layer_info(layer_idx)
                     if next_layer_info is not None:
                         next_layer_name, next_layer_idx, next_gid = next_layer_info
@@ -2887,19 +3061,6 @@ class GPUModelRunner(
                         )
                         runtime.set_layer_metadata(next_layer_idx, next_metadata)
 
-                    mapper.sync_load_layer(layer_idx)
-                    manager.sync_cpu_fill_h2d(layer_idx)
-                    layer_ready_event: torch.cuda.Event | None = None
-                    if self.device.type == "cuda":
-                        # Record a compute-stream-visible ready boundary after
-                        # both waits above have been inserted. This is not the
-                        # raw completion timestamp on load_stream / H2D stream;
-                        # it is the point on the compute stream after those
-                        # async producers have become ready-to-consume here.
-                        layer_ready_event = torch.cuda.Event(enable_timing=True)
-                        layer_ready_event.record()
-                    runtime.set_layer_ready_event(layer_idx, layer_ready_event)
-
                     if next_layer_info is not None:
                         next_layer_name, next_layer_idx, next_gid = next_layer_info
                         next_mapper = self.paged_block_mappers[next_gid]
@@ -2913,18 +3074,36 @@ class GPUModelRunner(
                                 self.kv_offload_config.layer_recompute_io_prefix_blocks
                             ),
                         )
-                        next_mapper.load_layer_async(
-                            next_layer_name,
-                            next_layer_idx,
-                            skip_block_ids=next_skip_block_ids,
-                        )
-                        if next_plan.cpu_fill_token_count > 0:
-                            manager.load_cpu_fill_h2d_async(
-                                layer_idx=next_layer_idx,
-                                cpu_fill_positions=next_plan.cpu_fill_positions,
-                                cpu_fill_logical_ids=next_plan.cpu_fill_logical_ids,
-                                cpu_fill_block_offsets=next_plan.cpu_fill_block_offsets,
+                        with record_function_or_nullcontext(
+                            "runkv:layer_schedule_next_io:"
+                            f"{next_layer_name}:L{next_layer_idx}"
+                        ):
+                            next_mapper.load_layer_async(
+                                next_layer_name,
+                                next_layer_idx,
+                                skip_block_ids=next_skip_block_ids,
                             )
+                            if next_plan.cpu_fill_token_count > 0:
+                                manager.load_cpu_fill_h2d_async(
+                                    layer_idx=next_layer_idx,
+                                    cpu_fill_positions=next_plan.cpu_fill_positions,
+                                    cpu_fill_logical_ids=next_plan.cpu_fill_logical_ids,
+                                    cpu_fill_block_offsets=(
+                                        next_plan.cpu_fill_block_offsets
+                                    ),
+                                )
+                        runtime.set_layer_load_ready_event(
+                            next_layer_idx,
+                            next_mapper.peek_load_ready_event(next_layer_idx),
+                        )
+                        runtime.set_layer_cpu_fill_ready_event(
+                            next_layer_idx,
+                            manager.peek_cpu_fill_h2d_ready_event(next_layer_idx),
+                        )
+                    self._push_runkv_attention_nvtx_range(
+                        layer_name=layer_name,
+                        layer_idx=layer_idx,
+                    )
                     return
 
             skip_block_ids: set[int] | None = None
@@ -2939,9 +3118,12 @@ class GPUModelRunner(
 
             if layer_idx == 0:
                 # First layer: start async load
-                mapper.load_layer_async(
-                    layer_name, layer_idx, skip_block_ids=skip_block_ids
-                )
+                with record_function_or_nullcontext(
+                    f"runkv:layer_schedule_io:{layer_name}:L{layer_idx}"
+                ):
+                    mapper.load_layer_async(
+                        layer_name, layer_idx, skip_block_ids=skip_block_ids
+                    )
 
             # Prefetch recompute inputs (HS/pos/slots) for current layer.
             if manager is not None and skip_block_ids:
@@ -2955,7 +3137,10 @@ class GPUModelRunner(
 
             # Wait for current layer's KV to be ready (GPU-side sync)
             # This makes default stream wait for load_stream's event
-            mapper.sync_load_layer(layer_idx)
+            with record_function_or_nullcontext(
+                f"runkv:layer_wait_ready:{layer_name}:L{layer_idx}"
+            ):
+                mapper.sync_load_layer(layer_idx)
 
             # Prefetch next layer's KV + recompute inputs so it can overlap with this
             # layer's recompute and forward.
@@ -2972,27 +3157,38 @@ class GPUModelRunner(
                         dirty_blocks=self.paged_dirty_blocks[next_gid],
                         io_prefix_blocks=self.kv_offload_config.layer_recompute_io_prefix_blocks,
                     )
-                next_mapper.load_layer_async(
-                    next_layer_name, next_layer_idx, skip_block_ids=skip_next
-                )
-                if manager is not None and skip_next:
-                    manager.prefetch_recompute_inputs_for_layer(
-                        layer_idx=next_layer_idx,
-                        layer_name=next_layer_name,
-                        gid=next_gid,
-                        mapper=next_mapper,
-                        skip_block_ids=skip_next,
+                with record_function_or_nullcontext(
+                    f"runkv:layer_schedule_next_io:{next_layer_name}:L{next_layer_idx}"
+                ):
+                    next_mapper.load_layer_async(
+                        next_layer_name, next_layer_idx, skip_block_ids=skip_next
                     )
+                    if manager is not None and skip_next:
+                        manager.prefetch_recompute_inputs_for_layer(
+                            layer_idx=next_layer_idx,
+                            layer_name=next_layer_name,
+                            gid=next_gid,
+                            mapper=next_mapper,
+                            skip_block_ids=skip_next,
+                        )
 
             if manager is not None and skip_block_ids:
-                manager.recompute_kv_for_layer(
-                    layer_idx=layer_idx,
-                    layer_name=layer_name,
-                    gid=gid,
-                    mapper=mapper,
-                    attn_module=module,
-                    skip_block_ids=skip_block_ids,
-                )
+                with record_function_or_nullcontext(
+                    f"runkv:layer_recompute_stage:{layer_name}:L{layer_idx}"
+                ):
+                    manager.recompute_kv_for_layer(
+                        layer_idx=layer_idx,
+                        layer_name=layer_name,
+                        gid=gid,
+                        mapper=mapper,
+                        attn_module=module,
+                        skip_block_ids=skip_block_ids,
+                    )
+
+            self._push_runkv_attention_nvtx_range(
+                layer_name=layer_name,
+                layer_idx=layer_idx,
+            )
 
     def _runkv_post_hook(
         self,
@@ -3011,6 +3207,7 @@ class GPUModelRunner(
         sync_all_offloads() must be called at the end of forward pass
         to ensure all data is written back before the next step.
         """
+        self._pop_runkv_attention_nvtx_range(layer_idx=layer_idx)
         with record_function_or_nullcontext(
             f"runkv_recompute:post_hook:{layer_name}:L{layer_idx}"
         ):
@@ -3028,9 +3225,12 @@ class GPUModelRunner(
                     phase="after_attention",
                 )
 
-            self.paged_block_mappers[gid].flush_layer_async(
-                layer_name, layer_idx, self.paged_dirty_blocks[gid]
-            )
+            with record_function_or_nullcontext(
+                f"runkv:layer_issue_offload:{layer_name}:L{layer_idx}"
+            ):
+                self.paged_block_mappers[gid].flush_layer_async(
+                    layer_name, layer_idx, self.paged_dirty_blocks[gid]
+                )
 
     def _sync_all_runkv_offloads(self) -> None:
         """Synchronize all pending async offloads.
@@ -4685,13 +4885,13 @@ class GPUModelRunner(
         num_scheduled_tokens: int,
         num_reqs: int,
     ) -> OPTComponentMFUStepProfiler | None:
-        if not self._opt_component_mfu_enabled:
+        if not self._opt_component_log_enabled:
             return None
 
         output_path = self._get_opt_component_mfu_output_path()
         if not output_path:
             logger.warning_once(
-                "OPT component MFU profiling is enabled but "
+                "OPT component profiling is enabled but "
                 "--opt-component-mfu-output-path is not set; skipping profiling."
             )
             return None
@@ -4699,8 +4899,8 @@ class GPUModelRunner(
         if cudagraph_mode != CUDAGraphMode.NONE:
             if not self._opt_component_mfu_skip_logged:
                 logger.warning_once(
-                    "OPT component MFU profiling only supports eager execution. "
-                    "Current step uses cudagraph mode %s; skipping profiling. "
+                    "OPT component profiling only supports eager execution. "
+                    "Current step uses cudagraph mode %s; skipping profiling/logging. "
                     "Use --enforce-eager for stable measurements.",
                     cudagraph_mode,
                 )
@@ -4714,7 +4914,6 @@ class GPUModelRunner(
             model_name=self.model_config.model,
             total_scheduled_tokens=num_scheduled_tokens,
             num_reqs=num_reqs,
-            peak_tflops=self._opt_component_mfu_peak_tflops,
         )
         self._opt_component_mfu_step += 1
         return profiler
@@ -4886,6 +5085,10 @@ class GPUModelRunner(
             num_scheduled_tokens=num_scheduled_tokens,
             num_reqs=num_reqs,
         )
+        if opt_component_profiler is not None:
+            opt_component_profiler.attach_dynamic_replay_runtime(
+                layer_recompute_runtime
+            )
         forward_additional_kwargs = (
             {OPT_COMPONENT_MFU_PROFILER_KEY: opt_component_profiler}
             if opt_component_profiler is not None
@@ -7581,6 +7784,8 @@ class GPUModelRunner(
             num_layers=num_layers,
             model=self.model,
             dtype=self.dtype,
+            h2d_stream=self.paged_block_mappers[0].load_stream,
+            d2h_stream=self.paged_block_mappers[0].offload_stream,
         )
         self.layer_recompute_manager.register_layernorm_hooks(self)
         self.layer_recompute_enabled = True
@@ -7663,6 +7868,11 @@ class GPUModelRunner(
             replay_plan_provider=self.replay_plan_provider,
             layer_recompute_manager=self.layer_recompute_manager,
         )
+        step_anchor_event: torch.cuda.Event | None = None
+        if self.device.type == "cuda":
+            step_anchor_event = torch.cuda.Event(enable_timing=True)
+            step_anchor_event.record()
+        runtime.set_step_anchor_event(step_anchor_event)
         runtime.set_capture_token_metadata(
             req_indices=self._lr_req_indices_np,
             positions=self._lr_positions_np,
@@ -7711,6 +7921,14 @@ class GPUModelRunner(
                 cpu_fill_logical_ids=layer0_plan.cpu_fill_logical_ids,
                 cpu_fill_block_offsets=layer0_plan.cpu_fill_block_offsets,
             )
+        runtime.set_layer_load_ready_event(
+            layer0_idx,
+            layer0_mapper.peek_load_ready_event(layer0_idx),
+        )
+        runtime.set_layer_cpu_fill_ready_event(
+            layer0_idx,
+            self.layer_recompute_manager.peek_cpu_fill_h2d_ready_event(layer0_idx),
+        )
         if not getattr(
             self,
             "_dynamic_replay_runtime_logged",

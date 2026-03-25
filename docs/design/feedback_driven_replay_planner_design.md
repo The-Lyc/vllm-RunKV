@@ -879,39 +879,66 @@ MVP 处理：
 **实现状态**：已完成  
 **改动文件**：
 - `vllm/v1/worker/gpu_model_runner.py`
+- `vllm/v1/worker/layer_recompute.py`
 - `vllm/v1/worker/opt_dynamic_replay.py`
 **实际改动**：
-- `OPTDynamicReplayRuntime` 已新增 per-layer `layer_ready_event` 缓存
+- `OPTDynamicReplayRuntime` 已新增：
+  - step 级 `step_anchor_event`
+  - per-layer `load_ready_event`
+  - per-layer `cpu_fill_ready_event`
 - 已新增：
-  - `set_layer_ready_event(...)`
-  - `get_layer_ready_event(...)`
-- 在 dynamic replay pre-hook 中，`mapper.sync_load_layer(layer_idx)` 和 `manager.sync_cpu_fill_h2d(layer_idx)` 完成后记录一个 CUDA event
-- 该事件只在 CUDA 路径上创建；非 CUDA 情况下写入 `None`
-- 已补充注释，明确这个事件表示“当前层 IO prefix load 和可选 CPU-fill H2D 都已 ready”的边界
+- `PagedBlockMapper` 暴露只读 `peek_load_ready_event(...)`
+- `LayerRecomputeManager` 暴露只读 `peek_cpu_fill_h2d_ready_event(...)`
+- `load_ready_event` 现在直接取自 `load_stream` 上的真实 producer 完成事件
+- `cpu_fill_ready_event` 也已切到与 KV load 相同的 `load_stream`
+- hidden-state D2H offload 也已切到与 KV offload 相同的 `offload_stream`
+- `step_anchor_event` 在 step 开始时记录，用作跨 stream 的共同时间基准
 **验证方式**：
-- ready 事件与真实 sync 边界一致
+- ready 事件取自真实 producer stream，而不是 compute-stream-visible wait 边界
+- 同方向传输共用 stream，不再需要对多个 ready producer 取 `max(...)`
 - 已执行：
-  - `python -m py_compile vllm/v1/worker/opt_dynamic_replay.py vllm/v1/worker/gpu_model_runner.py`
+  - `python -m py_compile vllm/v1/worker/opt_dynamic_replay.py vllm/v1/worker/gpu_model_runner.py vllm/v1/worker/layer_recompute.py`
 **依赖**：Step 5
 
 ---
 
 #### Step 7: 阶段 A — signed imbalance 观测与日志
 **目标**：先只打通 feedback 观测，不改 replay 行为。  
-**实现状态**：规划中  
+**实现状态**：已完成  
 **改动文件**：
 - `vllm/v1/worker/opt_dynamic_replay.py`
+- `vllm/v1/worker/gpu_model_runner.py`
 - `vllm/v1/profiling/opt_component_mfu.py`
 - 可选 `vllm/v1/worker/runkv_debug.py`
 **实际改动**：
-- 根据事件对计算 `signed_imbalance_ms`
-- provider 接收 per-layer imbalance feedback，并把结果保存在内存态 runtime/planner state
-- 仅在 `layer_recompute_planner_debug=True` 或开启 profiling 输出时，才把每层 imbalance 写到 log / JSONL
-- provider 可接收 feedback，但不改变实际 plan
+- `OPTDynamicReplayRuntime` 已新增 per-layer `imbalance_ms` 缓存
+- 在 dynamic replay pre-hook 中，先等待当前层依赖 ready，再立即结算上一层的 feedback
+- timing 现在基于真实跨-stream 绝对时间：
+  - `t_end(i) = elapsed(step_anchor, compute_end_i)`
+  - `t_ready(i+1) = elapsed(step_anchor, final_ready_{i+1})`
+  - `imbalance_i = t_ready(i+1) - t_end(i)`
+- pre-hook 中会显式等待：
+  - `prev_end_event`
+  - 当前层的最终 `ready_event`
+- feedback 先更新 provider/controller state，再生成下一层 plan
+- `FeedbackReplayPlanProvider.observe_layer_feedback(...)` 已接到 per-layer `imbalance_ms`
+- provider 接收 feedback，但不改变实际 plan
+- `OPTComponentMFUStepProfiler` 在开启 profiling 输出时，会把 pre-hook 中结算好的 `imbalance_ms` 带到 JSONL
+- JSONL 里的 `layers` 字段现已调整为 layer 级输出，包含：
+  - `compute_ms`
+  - `kv_load_ms`
+  - `hs_load_ms`
+  - `load_ms`
+  - `imbalance_ms`
+  - 以及该层的 replay/token 统计
+- 原 attention/FFN component 明细保留在 `layer_components`
+- 默认模式下这些值只保存在 runtime / provider 内存态；profiling 开启时才落到 JSONL
 **验证方式**：
 - dry-run 情况下输出完全不变
 - 默认模式下无额外 per-layer 文件写入
 - debug / profiling 模式下日志中能看到每层 imbalance
+- 已执行：
+  - `python -m py_compile vllm/v1/worker/opt_dynamic_replay.py vllm/v1/worker/gpu_model_runner.py vllm/v1/profiling/opt_component_mfu.py`
 **依赖**：Step 6
 
 ---

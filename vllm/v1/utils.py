@@ -382,6 +382,13 @@ def report_usage_stats(
 _PROFILER_FUNC = None
 
 
+def set_profiler_context_manager(
+    func: Callable[[str], AbstractContextManager] | None,
+) -> None:
+    global _PROFILER_FUNC
+    _PROFILER_FUNC = func
+
+
 def record_function_or_nullcontext(name: str) -> AbstractContextManager:
     global _PROFILER_FUNC
 
@@ -394,18 +401,11 @@ def record_function_or_nullcontext(name: str) -> AbstractContextManager:
         func = record_function
     elif envs.VLLM_NVTX_SCOPES_FOR_PROFILING:
         try:
-            import nvtx  # type: ignore[import-not-found]
+            import torch.cuda.nvtx as torch_nvtx
 
-            func = nvtx.annotate
+            func = torch_nvtx.range
         except Exception:
-            # Fall back to PyTorch's built-in NVTX bindings to avoid requiring
-            # the separate `nvtx` Python package.
-            try:
-                import torch.cuda.nvtx as torch_nvtx
-
-                func = torch_nvtx.range
-            except Exception:
-                func = contextlib.nullcontext
+            func = contextlib.nullcontext
 
     _PROFILER_FUNC = func
     return func(name)

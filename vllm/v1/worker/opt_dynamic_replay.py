@@ -148,7 +148,14 @@ def _align_replay_start_tokens(
 
     clipped = np.minimum(desired, computed_lens.astype(np.int64))
     clipped = np.maximum(clipped, 0)
-    return ((clipped // block_size) * block_size).astype(np.int32)
+    aligned = ((clipped // block_size) * block_size).astype(np.int64)
+    # Preserve the exact computed_len when the caller requests a replay start
+    # at or beyond the end of the already-computed prefix. This represents
+    # "no replay" for the request; rounding down to the previous block would
+    # incorrectly force replay of the current partial block.
+    no_replay_mask = clipped >= computed_lens.astype(np.int64)
+    aligned[no_replay_mask] = computed_lens.astype(np.int64)[no_replay_mask]
+    return aligned.astype(np.int32)
 
 
 def _lookup_slot_and_block(
@@ -279,8 +286,11 @@ def compute_layer_replay_plan_for_layer(
         replay_len = int(replay_lens_per_req[req_idx])
         gpu_reuse_len = int(gpu_reuse_lens_per_req[req_idx])
         prev_replay_len = max(computed_len - prev_gpu_start, 0)
-        replay_start_block = replay_start // block_size
         computed_block_end = _ceil_div(computed_len, block_size)
+        if replay_len == 0:
+            replay_start_block = computed_block_end
+        else:
+            replay_start_block = replay_start // block_size
 
         per_req_replay_block_ranges.append((replay_start_block, computed_block_end))
         replay_blocks_per_req.append(max(computed_block_end - replay_start_block, 0))
@@ -657,14 +667,19 @@ class OPTDynamicReplayRuntime:
     scheduled_positions: np.ndarray | None = None
     _layer_plans: list[LayerReplayPlan | None] = field(init=False)
     _per_layer_attn_metadata: list[dict[str, Any] | None] = field(init=False)
+    _step_anchor_event: torch.cuda.Event | None = field(init=False, default=None)
     _layer_end_events: list[torch.cuda.Event | None] = field(init=False)
-    _layer_ready_events: list[torch.cuda.Event | None] = field(init=False)
+    _layer_load_ready_events: list[torch.cuda.Event | None] = field(init=False)
+    _layer_cpu_fill_ready_events: list[torch.cuda.Event | None] = field(init=False)
+    _layer_imbalance_ms: list[float | None] = field(init=False)
 
     def __post_init__(self) -> None:
         self._layer_plans = [None] * self.num_layers
         self._per_layer_attn_metadata = [None] * self.num_layers
         self._layer_end_events = [None] * self.num_layers
-        self._layer_ready_events = [None] * self.num_layers
+        self._layer_load_ready_events = [None] * self.num_layers
+        self._layer_cpu_fill_ready_events = [None] * self.num_layers
+        self._layer_imbalance_ms = [None] * self.num_layers
 
     def get_layer_plan(self, layer_idx: int) -> LayerReplayPlan:
         plan = self._layer_plans[layer_idx]
@@ -693,27 +708,56 @@ class OPTDynamicReplayRuntime:
         layer_idx: int,
         event: torch.cuda.Event | None,
     ) -> None:
-        # TODO: Step 5 records one event per layer at the exact point where the
-        # current layer's forward finishes. Later steps will pair this with the
-        # next layer's ready event to compute signed imbalance.
+        # Records the exact point where this layer's forward finishes on the
+        # compute stream.
         self._layer_end_events[layer_idx] = event
 
     def get_layer_end_event(self, layer_idx: int) -> torch.cuda.Event | None:
         return self._layer_end_events[layer_idx]
 
-    def set_layer_ready_event(
+    def set_step_anchor_event(self, event: torch.cuda.Event | None) -> None:
+        # Common time base for cross-stream timing. Later event timestamps are
+        # converted into absolute times by measuring against this anchor.
+        self._step_anchor_event = event
+
+    def get_step_anchor_event(self) -> torch.cuda.Event | None:
+        return self._step_anchor_event
+
+    def set_layer_load_ready_event(
         self,
         layer_idx: int,
         event: torch.cuda.Event | None,
     ) -> None:
-        # TODO: Step 6 records one event per layer at the point where the current
-        # layer's KV/CPU-fill inputs have both become ready on the default
-        # stream. Later steps will pair this with the previous layer's end
-        # event to measure signed imbalance.
-        self._layer_ready_events[layer_idx] = event
+        # Raw producer-side completion time for KV block prefetch on load_stream.
+        self._layer_load_ready_events[layer_idx] = event
 
-    def get_layer_ready_event(self, layer_idx: int) -> torch.cuda.Event | None:
-        return self._layer_ready_events[layer_idx]
+    def get_layer_load_ready_event(self, layer_idx: int) -> torch.cuda.Event | None:
+        return self._layer_load_ready_events[layer_idx]
+
+    def set_layer_cpu_fill_ready_event(
+        self,
+        layer_idx: int,
+        event: torch.cuda.Event | None,
+    ) -> None:
+        # Raw producer-side completion time for CPU-fill H2D on the dedicated
+        # H2D stream. This may be None when the layer has no CPU-fill replay.
+        self._layer_cpu_fill_ready_events[layer_idx] = event
+
+    def get_layer_cpu_fill_ready_event(
+        self,
+        layer_idx: int,
+    ) -> torch.cuda.Event | None:
+        return self._layer_cpu_fill_ready_events[layer_idx]
+
+    def set_layer_imbalance_ms(
+        self, layer_idx: int, imbalance_ms: float | None
+    ) -> None:
+        self._layer_imbalance_ms[layer_idx] = (
+            None if imbalance_ms is None else float(imbalance_ms)
+        )
+
+    def get_layer_imbalance_ms(self, layer_idx: int) -> float | None:
+        return self._layer_imbalance_ms[layer_idx]
 
     def set_capture_token_metadata(
         self,

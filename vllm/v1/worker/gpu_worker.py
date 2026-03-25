@@ -50,7 +50,7 @@ from vllm.v1.outputs import (
     DraftTokenIds,
     ModelRunnerOutput,
 )
-from vllm.v1.utils import report_usage_stats
+from vllm.v1.utils import report_usage_stats, set_profiler_context_manager
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -109,6 +109,9 @@ class Worker(WorkerBase):
             self.profiler = CudaProfilerWrapper(profiler_config)
         else:
             self.profiler = None
+        set_profiler_context_manager(
+            self.profiler.annotate_context_manager if self.profiler else None
+        )
 
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
