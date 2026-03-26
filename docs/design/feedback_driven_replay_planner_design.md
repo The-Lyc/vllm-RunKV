@@ -945,20 +945,46 @@ MVP 处理：
 
 #### Step 8: 阶段 B — planner state dry-run 更新
 **目标**：引入 budget / gain / probe / reinit 状态，但先只读不生效。  
-**实现状态**：规划中  
+**实现状态**：已完成  
 **改动文件**：
 - `vllm/v1/worker/opt_dynamic_replay.py`
+- `vllm/v1/worker/gpu_model_runner.py`
+- `vllm/v1/profiling/opt_component_mfu.py`
 **实际改动**：
-- 维护：
+- `FeedbackReplayPlanProvider` 现已维护：
   - `global_budget_blocks`
   - `estimated_local_gain`
-  - `probe_state`
+  - `last_budget_blocks`
   - `last_imbalance_ms`
-- 每层 feedback 后计算“建议 budget”
-- 默认只更新内存态 planner state；仅在 `layer_recompute_planner_debug=True` 或开启 profiling 输出时打印或写 profiler，不改变执行 plan
+- `begin_step()` 中已加入 budget 初始化 / clamp：
+  - 首个 step 用当前 batch 的 `total_replayable_blocks` 作为初始 budget
+  - 后续 step 会把 budget clamp 到当前 batch 仍可 replay 的容量内
+- `observe_layer_feedback(...)` 已从“只记录 imbalance”升级为 dry-run controller update：
+  - deadband 内不调 budget
+  - deadband 外先尝试用 secant 规则估计局部 gain
+  - 再做 damped Newton step
+  - 最后对单层 budget 改变量做 clip，并 clamp 到 `[0, total_replayable_blocks]`
+- 已新增 per-layer `FeedbackControllerLayerUpdate` 记录，包含：
+  - `budget_before`
+  - `budget_after`
+  - `imbalance_ms`
+  - `gain_used`
+  - `raw_delta`
+  - `clipped_delta`
+  - `action`
+- provider 的 debug snapshot 现已包含 `layer_controller_updates`
+- dynamic replay pre-hook 在 `observe_layer_feedback(...)` 后会把当前层的 controller update 转发给 `OPTComponentMFUStepProfiler`
+- profiling JSONL 的 `layers[*]` 现已包含 `controller_update` 字段，可直接观察每层 budget 更新轨迹
+- 该阶段仍是 dry-run：
+  - controller state / budget 会更新
+  - 但 `LayerReplayPlan` 尚未消费这个 budget，所以实际 replay 行为不变
 **验证方式**：
 - budget 可逐层变化
 - 现有执行输出保持不变
+- `planner=static` 时不会产生 `controller_update`
+- `planner=feedback` 且开启 JSONL 输出时，可在 `layers[*].controller_update` 中看到 budget 监控
+- 已执行：
+  - `python -m py_compile vllm/v1/worker/opt_dynamic_replay.py vllm/v1/worker/gpu_model_runner.py vllm/v1/profiling/opt_component_mfu.py`
 **依赖**：Step 7
 
 ---

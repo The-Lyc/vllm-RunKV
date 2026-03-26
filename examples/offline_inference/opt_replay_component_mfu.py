@@ -370,7 +370,7 @@ def main() -> None:
     print(
         "Inspect per-layer data in each JSONL row under: "
         "layers[*].{compute_end_ms_from_anchor,load_ready_ms_from_anchor,"
-        "imbalance_ms,replay_ratio}"
+        "imbalance_ms,controller_update,replay_ratio}"
     )
     print("Flat step-layer JSONL is written alongside the main file as *.flat.jsonl")
 

@@ -3033,6 +3033,21 @@ class GPUModelRunner(
                                     opt_component_profiler.set_layer_imbalance_ms(
                                         layer_idx - 1, imbalance_ms
                                     )
+                                    # Forward the controller's per-layer
+                                    # budget update to the profiler so it
+                                    # appears in the JSONL output.
+                                    if isinstance(
+                                        self.replay_plan_provider,
+                                        FeedbackReplayPlanProvider,
+                                    ):
+                                        _ctrl_upd = self.replay_plan_provider.get_layer_controller_update(
+                                            layer_idx - 1
+                                        )
+                                        if _ctrl_upd is not None:
+                                            opt_component_profiler.set_layer_controller_update(
+                                                layer_idx - 1,
+                                                _ctrl_upd.to_dict(),
+                                            )
 
                     next_layer_info = self._get_next_layer_info(layer_idx)
                     if next_layer_info is not None:

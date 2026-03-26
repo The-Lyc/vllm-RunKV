@@ -101,6 +101,36 @@ class FeedbackPlannerStepSummary:
     total_replayable_blocks: int
 
 
+@dataclass
+class FeedbackControllerLayerUpdate:
+    """Per-layer record of the controller budget update from feedback.
+
+    Captures a snapshot of the budget before/after the update, the imbalance
+    that triggered it, and the controller parameters used.  These records are
+    kept in memory by the provider and optionally forwarded to the profiler
+    when debug or profiling output is enabled.
+    """
+
+    budget_before: int
+    budget_after: int
+    imbalance_ms: float
+    gain_used: float | None = None
+    raw_delta: float | None = None
+    clipped_delta: float | None = None
+    action: str = "deadband"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "budget_before": self.budget_before,
+            "budget_after": self.budget_after,
+            "imbalance_ms": self.imbalance_ms,
+            "gain_used": self.gain_used,
+            "raw_delta": self.raw_delta,
+            "clipped_delta": self.clipped_delta,
+            "action": self.action,
+        }
+
+
 @runtime_checkable
 class ReplayPlanProvider(Protocol):
     def begin_step(self, **metadata: Any) -> None: ...
@@ -437,6 +467,23 @@ class StaticReplayPlanProvider:
 class FeedbackReplayPlanProvider:
     io_prefix_blocks: list[int]
     dry_run: bool = False
+
+    # --- Controller hyperparameters ---
+    # Imbalance values within [-deadband_ms, +deadband_ms] are considered
+    # balanced and do not trigger a budget update.
+    deadband_ms: float = 0.5
+    # Multiplicative damping factor applied to the raw Newton step before
+    # clipping.  Values in (0, 1) make the controller more conservative;
+    # 1.0 means no damping.
+    damping: float = 0.3
+    # Maximum absolute budget change (in blocks) per single layer update.
+    # Prevents the controller from making excessively large jumps.
+    max_step_blocks: int = 4
+    # Fallback value of d(imbalance_ms)/d(budget_blocks) used when no
+    # secant-based gain estimate is available yet.  Negative because
+    # increasing budget adds compute time and thus *decreases* imbalance.
+    default_gain: float = -0.1
+
     static_provider: StaticReplayPlanProvider = field(init=False)
     controller_state: FeedbackPlannerControllerState = field(
         init=False, default_factory=FeedbackPlannerControllerState
@@ -445,6 +492,12 @@ class FeedbackReplayPlanProvider:
         init=False, default=None
     )
     last_feedback_by_layer: dict[int, float] = field(init=False, default_factory=dict)
+    # Per-layer controller update records for the *current* step.
+    # Cleared at the start of each step.  Used for debug snapshots and
+    # forwarded to the profiler when profiling output is enabled.
+    _layer_controller_updates: dict[int, FeedbackControllerLayerUpdate] = field(
+        init=False, default_factory=dict
+    )
     begin_step_count: int = field(init=False, default=0)
     observe_feedback_count: int = field(init=False, default=0)
 
@@ -493,15 +546,119 @@ class FeedbackReplayPlanProvider:
             total_scheduled_tokens=int(scheduled_lens.sum()),
             total_replayable_blocks=total_replayable_blocks,
         )
+
+        # Budget initialisation / clamping.
+        # On the very first step we seed the budget at the maximum replayable
+        # level so the controller can converge downward from a safe starting
+        # point.  On subsequent steps the budget is simply clamped to the
+        # current batch's capacity (which may have shrunk if requests left).
+        cs = self.controller_state
+        if self.begin_step_count == 1:
+            cs.global_budget_blocks = total_replayable_blocks
+        else:
+            cs.global_budget_blocks = max(
+                0, min(cs.global_budget_blocks, total_replayable_blocks)
+            )
+
         self.last_feedback_by_layer.clear()
+        self._layer_controller_updates.clear()
 
     def observe_layer_feedback(self, layer_idx: int, imbalance_ms: float) -> None:
-        # TODO: incorporate the observed feedback into future replay plan decisions.
-        # For now, we just record the feedback by layer.
+        """Update the controller state based on the observed layer imbalance.
+
+        The controller uses a damped Newton / secant-style update:
+          1. If the imbalance falls within the deadband, no budget change.
+          2. Otherwise, estimate the local gain d(imbalance)/d(budget) via the
+             secant rule when a prior (budget, imbalance) pair is available.
+          3. Compute a raw Newton step: delta = -imbalance / gain.
+          4. Apply damping and step-size clipping.
+          5. Update ``global_budget_blocks`` and record the update snapshot.
+
+        In the current (Step 8 / dry-run) phase the updated budget is *not*
+        fed back into the actual replay plan; that happens in Step 10.
+        """
         self.observe_feedback_count += 1
         imbalance_value = float(imbalance_ms)
-        self.last_feedback_by_layer[int(layer_idx)] = imbalance_value
-        self.controller_state.last_imbalance_ms = imbalance_value
+        layer_key = int(layer_idx)
+        self.last_feedback_by_layer[layer_key] = imbalance_value
+
+        cs = self.controller_state
+        budget_before = cs.global_budget_blocks
+
+        # --- Deadband: don't react to small imbalance ---
+        if abs(imbalance_value) < self.deadband_ms:
+            self._layer_controller_updates[layer_key] = FeedbackControllerLayerUpdate(
+                budget_before=budget_before,
+                budget_after=budget_before,
+                imbalance_ms=imbalance_value,
+                action="deadband",
+            )
+            cs.last_imbalance_ms = imbalance_value
+            return
+
+        # --- Secant-based gain estimation ---
+        # When the budget actually changed between the last observation and now,
+        # we can use the (delta_budget, delta_imbalance) pair to refine the
+        # local gain estimate.
+        gain = cs.estimated_local_gain
+        if (
+            cs.last_budget_blocks is not None
+            and cs.last_imbalance_ms is not None
+            and cs.last_budget_blocks != budget_before
+        ):
+            delta_b = budget_before - cs.last_budget_blocks
+            delta_d = imbalance_value - cs.last_imbalance_ms
+            if abs(delta_b) > 0:
+                new_gain = delta_d / delta_b
+                # Only accept the estimate when the magnitude is sensible.
+                if abs(new_gain) > 1e-6:
+                    gain = new_gain
+                    cs.estimated_local_gain = gain
+
+        # Fall back to the configured default when no secant estimate exists.
+        effective_gain = (
+            gain if gain is not None and abs(gain) > 1e-6 else self.default_gain
+        )
+
+        # --- Newton step with damping and clipping ---
+        raw_delta = -imbalance_value / effective_gain
+        clipped_delta = max(
+            -self.max_step_blocks,
+            min(self.max_step_blocks, self.damping * raw_delta),
+        )
+        new_budget = budget_before + int(round(clipped_delta))
+
+        # Clamp to [0, total_replayable_blocks].
+        max_budget = (
+            self.current_step_summary.total_replayable_blocks
+            if self.current_step_summary is not None
+            else budget_before
+        )
+        new_budget = max(0, min(new_budget, max_budget))
+
+        # --- Record the update ---
+        self._layer_controller_updates[layer_key] = FeedbackControllerLayerUpdate(
+            budget_before=budget_before,
+            budget_after=new_budget,
+            imbalance_ms=imbalance_value,
+            gain_used=effective_gain,
+            raw_delta=raw_delta,
+            clipped_delta=clipped_delta,
+            action="update",
+        )
+
+        cs.last_budget_blocks = budget_before
+        cs.last_imbalance_ms = imbalance_value
+        cs.global_budget_blocks = new_budget
+
+    def get_layer_controller_update(
+        self,
+        layer_idx: int,
+    ) -> FeedbackControllerLayerUpdate | None:
+        """Return the controller update record for *layer_idx* in the current
+        step, or ``None`` if no feedback has been observed for that layer yet.
+        """
+        return self._layer_controller_updates.get(int(layer_idx))
 
     def get_debug_snapshot(self) -> dict[str, Any]:
         step_summary = None
@@ -549,6 +706,10 @@ class FeedbackReplayPlanProvider:
             },
             "current_step_summary": step_summary,
             "last_feedback_by_layer": dict(self.last_feedback_by_layer),
+            "layer_controller_updates": {
+                layer_idx: update.to_dict()
+                for layer_idx, update in self._layer_controller_updates.items()
+            },
         }
 
     def get_layer_plan(

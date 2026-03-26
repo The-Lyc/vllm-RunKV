@@ -51,6 +51,9 @@ class OPTComponentMFUStepProfiler:
         self.total_scheduled_tokens = total_scheduled_tokens
         self.num_reqs = num_reqs
         self._layer_imbalance_ms: dict[int, float] = {}
+        # Per-layer controller update snapshots forwarded from the feedback
+        # planner provider.  Only populated when planner == "feedback".
+        self._layer_controller_updates: dict[int, dict[str, Any]] = {}
         self._dynamic_replay_runtime: OPTDynamicReplayRuntime | None = None
 
     def attach_dynamic_replay_runtime(
@@ -61,6 +64,18 @@ class OPTComponentMFUStepProfiler:
 
     def set_layer_imbalance_ms(self, layer_idx: int, imbalance_ms: float) -> None:
         self._layer_imbalance_ms[int(layer_idx)] = float(imbalance_ms)
+
+    def set_layer_controller_update(
+        self,
+        layer_idx: int,
+        update: dict[str, Any],
+    ) -> None:
+        """Record the feedback controller's budget update for *layer_idx*.
+
+        Called from the pre-hook after ``observe_layer_feedback`` so the
+        profiler can include budget dynamics in its JSONL output.
+        """
+        self._layer_controller_updates[int(layer_idx)] = update
 
     @contextmanager
     def profile_attention(
@@ -114,6 +129,7 @@ class OPTComponentMFUStepProfiler:
                 f.write("\n")
 
         self._layer_imbalance_ms.clear()
+        self._layer_controller_updates.clear()
         self._dynamic_replay_runtime = None
 
     def _build_layer_records(self) -> list[dict[str, Any]]:
@@ -141,6 +157,9 @@ class OPTComponentMFUStepProfiler:
                     "compute_end_ms_from_anchor": None,
                     "load_ready_ms_from_anchor": None,
                     "imbalance_ms": runtime.get_layer_imbalance_ms(layer_idx),
+                    # Feedback controller budget update for this layer.
+                    # None when planner != "feedback" or no feedback observed.
+                    "controller_update": self._layer_controller_updates.get(layer_idx),
                     "replay_ratio": replay_ratio,
                     "replay_token_count": replay_token_count,
                     "num_actual_tokens": num_actual_tokens,
