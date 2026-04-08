@@ -229,7 +229,8 @@ benchmarks/**/benchmark_results/
 
 #debug logs
 runkv_debug_logs/
-
+runkv_prehook_timing/
+runkv*/
 #experimental results
 exp_results/*
 

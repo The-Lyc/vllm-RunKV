@@ -990,35 +990,59 @@ MVP 处理：
 ---
 
 #### Step 9: 阶段 C.1 — budget -> per-request allocation
-**目标**：实现 short-request-first + contiguous suffix 的 batch 内分配器。  
-**实现状态**：规划中  
+**目标**：实现 short-request-first + contiguous suffix 的 batch 内分配器。
+**实现状态**：已完成
 **改动文件**：
 - `vllm/v1/worker/opt_dynamic_replay.py`
 **实际改动**：
-- 基于本 step candidates 计算：
-  - `allocated_blocks_per_req`
-- 转成：
-  - `kv_replay_start_per_req`
-- 最后构造新的 `LayerReplayPlan`
+- 新增模块级函数 `_allocate_budget_to_requests(budget_blocks, replayable_blocks_per_req)`：
+  - 按 replayable blocks 升序稳定排序（tie-break 保留原始 req_idx 顺序）
+  - 从短 request 开始 greedy 分配，直到 budget 耗尽
+  - 返回 `allocated_blocks_per_req`（与输入同长度、同顺序的 np.ndarray）
+- `FeedbackReplayPlanProvider.get_layer_plan()` 不再无条件委托 static provider：
+  - `dry_run=True` 或 `current_step_summary is None` 时仍走 static provider（行为不变）
+  - `dry_run=False` 时：
+    1. 调用 `_allocate_budget_to_requests()` 分配 budget
+    2. 把 `allocated_blocks_per_req` 转成 `desired_replay_start_tokens`：
+       - `computed_blocks = ceil(computed_lens / block_size)`
+       - `replay_start_blocks = max(computed_blocks - allocated, 0)`
+       - `desired_replay_start_tokens = replay_start_blocks * block_size`
+    3. 调用 `compute_layer_replay_plan_for_layer()` 生成 plan
+  - contiguous suffix 天然成立（replay 区间始终为 `[replay_start, computed_len)`）
 **验证方式**：
 - 分配规则稳定、确定
 - contiguous suffix 恒成立
+- `dry_run=True` 时行为与之前完全一致
+- 已执行：
+  - `python -m py_compile vllm/v1/worker/opt_dynamic_replay.py`
 **依赖**：Step 8
 
 ---
 
 #### Step 10: 阶段 C.2 — planner 真接管执行路径
-**目标**：让 budget 真正影响实际 replay。  
-**实现状态**：规划中  
+**目标**：让 budget 真正影响实际 replay。
+**实现状态**：已完成
 **改动文件**：
 - `vllm/v1/worker/gpu_model_runner.py`
 - `vllm/v1/worker/layer_recompute.py`
 **实际改动**：
-- 所有 dynamic replay 路径中的 `skip_block_ids` 改为从 `LayerReplayPlan` 派生
-- 不再只依赖静态 `layer_recompute_io_prefix_blocks`
+- `LayerRecomputeManager` 新增 `compute_skip_block_ids_from_plan(plan)` 方法：
+  - 直接读取 `plan.skip_logical_block_ids` 转为 `set[int]`
+  - 与 `compute_skip_block_ids_for_layer` 语义等价，但以 plan 为权威来源
+- `_prepare_dynamic_replay_runtime()` 中 layer 0 的 skip set 计算：
+  - `FeedbackReplayPlanProvider` 且 `dry_run=False` → `compute_skip_block_ids_from_plan(layer0_plan)`
+  - 其余情况 → `compute_skip_block_ids_for_layer(... io_prefix_blocks=...)` （保留固定 replay 分支）
+- `_runkv_pre_hook()` dynamic 路径中 next layer 的 skip set 计算：
+  - `FeedbackReplayPlanProvider` 且 `dry_run=False` → `compute_skip_block_ids_from_plan(next_plan)`
+  - 其余情况 → `compute_skip_block_ids_for_layer(... io_prefix_blocks=...)` （保留固定 replay 分支）
+- 两处均保留 static/dry-run 分支，确保非 feedback planner 和 dry-run 模式行为完全不变
 **验证方式**：
-- replay block 总量会随 planner budget 真正变化
+- `planner=feedback, dry_run=False` 时 replay block 总量会随 planner budget 真正变化
+- `planner=feedback, dry_run=True` 时行为与 static provider 一致
+- `planner=static` 时行为完全不变
 - correctness 不变
+- 已执行：
+  - `python -m py_compile vllm/v1/worker/gpu_model_runner.py vllm/v1/worker/layer_recompute.py`
 **依赖**：Step 9
 
 ---
