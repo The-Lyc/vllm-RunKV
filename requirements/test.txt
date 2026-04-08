@@ -444,7 +444,7 @@ lightning==2.5.1.post0
     # via
     #   terratorch
     #   torchgeo
-lightning-utilities==0.14.3
+lightning-utilities==0.15.3
     # via
     #   lightning
     #   pytorch-lightning
@@ -879,7 +879,7 @@ python-dateutil==2.9.0.post0
     #   typepy
 python-rapidjson==1.20
     # via tritonclient
-pytorch-lightning==2.5.2
+pytorch-lightning==2.6.1
     # via
     #   lightly
     #   lightning
@@ -1030,7 +1030,6 @@ sentence-transformers==5.2.0
     #   mteb
 setuptools==77.0.3
     # via
-    #   lightning-utilities
     #   pytablewriter
     #   torch
 shapely==2.1.1
@@ -1175,7 +1174,7 @@ torchaudio==2.9.1+cu129
     #   vocos
 torchgeo==0.7.0
     # via terratorch
-torchmetrics==1.7.4
+torchmetrics==1.9.0
     # via
     #   lightning
     #   pytorch-lightning
@@ -1290,7 +1289,7 @@ uvicorn==0.35.0
     # via
     #   gpt-oss
     #   mlflow-skinny
-vector-quantize-pytorch==1.21.2
+vector-quantize-pytorch==1.28.1
     # via -r requirements/test.in
 virtualenv==20.31.2
     # via ray
