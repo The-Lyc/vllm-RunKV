@@ -21,6 +21,7 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import PagedBlockMapper
+    from vllm.v1.worker.opt_dynamic_replay import LayerReplayPlan
 
 logger = init_logger(__name__)
 
@@ -147,6 +148,10 @@ class LayerRecomputeManager:
         # logical block id -> block index within its owner request for current step.
         self._step_logical_block_indices: dict[int, int] = {}
 
+        # Sub-timing for load_cpu_fill_h2d_async (populated when enabled).
+        self._timing_enabled: bool = False
+        self._last_timing: dict[str, float] = {}
+
         self._layernorm_hook_handles: list[Any] = []
         self._pending_writes_by_layer: dict[int, list[_PendingLayerWrite]] = (
             defaultdict(list)
@@ -261,6 +266,21 @@ class LayerRecomputeManager:
 
         return skip_block_ids
 
+    def compute_skip_block_ids_from_plan(
+        self,
+        plan: LayerReplayPlan,
+    ) -> set[int]:
+        """Derive skip block IDs directly from a ``LayerReplayPlan``.
+
+        Unlike :meth:`compute_skip_block_ids_for_layer` which uses static
+        ``io_prefix_blocks`` to decide the IO/replay boundary, this method
+        reads the plan's pre-computed ``skip_logical_block_ids`` so the IO
+        path honours the planner's budget-driven allocation.  This is the
+        entry point used when the feedback planner has taken over the
+        execution path (Step 10).
+        """
+        return set(int(bid) for bid in plan.skip_logical_block_ids)
+
     def prefetch_recompute_inputs_for_layer(
         self,
         *,
@@ -340,9 +360,18 @@ class LayerRecomputeManager:
         cpu_fill_logical_ids: np.ndarray,
         cpu_fill_block_offsets: np.ndarray,
     ) -> torch.Tensor:
+        _t = self._timing_enabled
+        if _t:
+            import time as _time
+
+            self._last_timing = {}
+
         with record_function_or_nullcontext(
             f"runkv_recompute:cpu_fill_h2d_async:L{layer_idx}"
         ):
+            # ---- SUB-TIMING: cf_prepare (numpy convert + validation) ----
+            if _t:
+                _tp0 = _time.perf_counter()
             target_logical_ids = np.asarray(cpu_fill_logical_ids, dtype=np.int64)
             target_block_offsets = np.asarray(cpu_fill_block_offsets, dtype=np.int64)
             token_positions = np.asarray(cpu_fill_positions, dtype=np.int32)
@@ -367,6 +396,14 @@ class LayerRecomputeManager:
                 )
 
             if target_logical_ids.shape[0] == 0:
+                if _t:
+                    self._last_timing = {
+                        "cf_prepare": _time.perf_counter() - _tp0,
+                        "cf_gather": 0.0,
+                        "cf_pin": 0.0,
+                        "cf_h2d": 0.0,
+                        "cf_tokens": 0,
+                    }
                 hs_gpu = torch.empty(
                     (0, self.hidden_size),
                     dtype=self.cpu_layer_inputs_by_layer[layer_idx].dtype,
@@ -389,16 +426,29 @@ class LayerRecomputeManager:
                     "cpu_fill requests positions that are not materialized in the CPU "
                     "hidden-state store."
                 )
+            if _t:
+                self._last_timing["cf_prepare"] = _time.perf_counter() - _tp0
 
-            # Gather the block-addressed CPU store into a token-contiguous buffer
-            # before transferring it back to GPU. The order of
-            # target_logical_ids/target_block_offsets defines the replay token order.
+            # ---- SUB-TIMING: cf_gather (fancy index + contiguous) ----
+            if _t:
+                _tg0 = _time.perf_counter()
             gathered_hs_cpu = self.cpu_layer_inputs_by_layer[layer_idx][
                 store_logical_ids_t, store_block_offsets_t, :
             ].contiguous()
+            if _t:
+                self._last_timing["cf_gather"] = _time.perf_counter() - _tg0
+
+            # ---- SUB-TIMING: cf_pin (pin_memory) ----
+            if _t:
+                _tpin0 = _time.perf_counter()
             if self.pin_memory and not gathered_hs_cpu.is_pinned():
                 gathered_hs_cpu = gathered_hs_cpu.pin_memory()
+            if _t:
+                self._last_timing["cf_pin"] = _time.perf_counter() - _tpin0
 
+            # ---- SUB-TIMING: cf_h2d (async copy to GPU) ----
+            if _t:
+                _th0 = _time.perf_counter()
             with record_function_or_nullcontext(
                 f"runkv_recompute:cpu_fill_h2d_copy:L{layer_idx}"
             ):
@@ -407,15 +457,14 @@ class LayerRecomputeManager:
                         gathered_hs_gpu = gathered_hs_cpu.to(
                             self.device, non_blocking=True
                         )
-                        # This event lives on the dedicated H2D stream and marks
-                        # the point where the async CPU-fill copy has completed
-                        # there. The compute stream will wait on it in
-                        # sync_cpu_fill_h2d().
                         ready_event = torch.cuda.Event(enable_timing=True)
                         ready_event.record(self._hs_h2d_stream)
                 else:
                     gathered_hs_gpu = gathered_hs_cpu.to(self.device)
                     ready_event = None
+            if _t:
+                self._last_timing["cf_h2d"] = _time.perf_counter() - _th0
+                self._last_timing["cf_tokens"] = int(target_logical_ids.shape[0])
 
             self._pending_cpu_fill_h2d_by_layer[layer_idx] = _PendingCPUFillLoad(
                 gathered_hs_gpu=gathered_hs_gpu,
