@@ -422,6 +422,46 @@ def compute_layer_replay_plan_for_layer(
     )
 
 
+def _allocate_budget_to_requests(
+    budget_blocks: int,
+    replayable_blocks_per_req: np.ndarray,
+) -> np.ndarray:
+    """Short-request-first greedy budget allocator.
+
+    Distributes *budget_blocks* replay blocks across requests, prioritising
+    requests with fewer replayable blocks (ascending order, stable tie-break
+    by request index).  Each request receives a contiguous suffix allocation
+    of at most its full replayable block count.
+
+    Args:
+        budget_blocks: Total replay block budget to distribute.
+        replayable_blocks_per_req: Per-request upper bound on allocatable
+            replay blocks (1-D int array, length = num_reqs).
+
+    Returns:
+        allocated_blocks_per_req: Per-request allocation in the original
+            request order (same length as *replayable_blocks_per_req*).
+    """
+    num_reqs = len(replayable_blocks_per_req)
+    allocated = np.zeros(num_reqs, dtype=np.int32)
+    if budget_blocks <= 0 or num_reqs == 0:
+        return allocated
+
+    # Stable sort ensures deterministic tie-breaking by original req_idx.
+    sorted_indices = np.argsort(replayable_blocks_per_req, kind="stable")
+
+    remaining = int(budget_blocks)
+    for idx in sorted_indices:
+        if remaining <= 0:
+            break
+        cap = int(replayable_blocks_per_req[idx])
+        alloc = min(remaining, cap)
+        allocated[idx] = alloc
+        remaining -= alloc
+
+    return allocated
+
+
 @dataclass
 class StaticReplayPlanProvider:
     io_prefix_blocks: list[int]
@@ -500,6 +540,10 @@ class FeedbackReplayPlanProvider:
     )
     begin_step_count: int = field(init=False, default=0)
     observe_feedback_count: int = field(init=False, default=0)
+    # Whether the budget has been seeded to total_replayable_blocks at least
+    # once.  Deferred until the first step where replayable blocks > 0 so
+    # that prefill steps (computed_lens == 0) do not seed the budget to 0.
+    _budget_seeded: bool = field(init=False, default=False)
 
     def __post_init__(self) -> None:
         self.static_provider = StaticReplayPlanProvider(
@@ -548,13 +592,16 @@ class FeedbackReplayPlanProvider:
         )
 
         # Budget initialisation / clamping.
-        # On the very first step we seed the budget at the maximum replayable
-        # level so the controller can converge downward from a safe starting
-        # point.  On subsequent steps the budget is simply clamped to the
-        # current batch's capacity (which may have shrunk if requests left).
+        # We seed the budget at total_replayable_blocks on the first step
+        # where replayable blocks > 0, so the controller can converge
+        # downward from the maximum.  The first step is typically prefill
+        # where computed_lens == 0 and replayable blocks == 0 — seeding
+        # there would lock the budget at 0 before the controller has any
+        # chance to act.
         cs = self.controller_state
-        if self.begin_step_count == 1:
+        if not self._budget_seeded and total_replayable_blocks > 0:
             cs.global_budget_blocks = total_replayable_blocks
+            self._budget_seeded = True
         else:
             cs.global_budget_blocks = max(
                 0, min(cs.global_budget_blocks, total_replayable_blocks)
@@ -599,8 +646,11 @@ class FeedbackReplayPlanProvider:
         # --- Secant-based gain estimation ---
         # When the budget actually changed between the last observation and now,
         # we can use the (delta_budget, delta_imbalance) pair to refine the
-        # local gain estimate.
-        gain = cs.estimated_local_gain
+        # local gain estimate.  When the budget did NOT change, fall back to
+        # ``default_gain`` so the controller always reacts to imbalance —
+        # a stale ``estimated_local_gain`` from a noisy secant can otherwise
+        # lock the controller in a zero-delta dead zone.
+        gain: float | None = None
         if (
             cs.last_budget_blocks is not None
             and cs.last_imbalance_ms is not None
@@ -615,10 +665,11 @@ class FeedbackReplayPlanProvider:
                     gain = new_gain
                     cs.estimated_local_gain = gain
 
-        # Fall back to the configured default when no secant estimate exists.
-        effective_gain = (
-            gain if gain is not None and abs(gain) > 1e-6 else self.default_gain
-        )
+        # Use the freshly estimated secant gain when available; otherwise
+        # always fall back to ``default_gain``.  We intentionally do NOT
+        # reuse a stale ``estimated_local_gain`` here — the secant estimate
+        # is only trustworthy in the same update where it was computed.
+        effective_gain = gain if gain is not None else self.default_gain
 
         # --- Newton step with damping and clipping ---
         raw_delta = -imbalance_value / effective_gain
@@ -723,13 +774,44 @@ class FeedbackReplayPlanProvider:
         mapper_mapping: dict[int, int],
         prev_layer_plan: LayerReplayPlan | None,
     ) -> LayerReplayPlan:
-        # TODO: use the recorded metadata and feedback to make dynamic decisions
-        # about the replay plan(including replay budget and per-request allocation)
-        # for the current layer. For now, we just delegate to a static provider
-        # that uses fixed prefix block settings.
-        return self.static_provider.get_layer_plan(
+        # In dry-run mode or when no step summary is available, fall back to
+        # the static provider so that the actual execution remains unchanged.
+        if self.dry_run or self.current_step_summary is None:
+            return self.static_provider.get_layer_plan(
+                layer_idx=layer_idx,
+                num_reqs=num_reqs,
+                computed_lens=computed_lens,
+                scheduled_lens=scheduled_lens,
+                logical_block_tables=logical_block_tables,
+                block_size=block_size,
+                mapper_mapping=mapper_mapping,
+                prev_layer_plan=prev_layer_plan,
+            )
+
+        # --- Budget-based per-request allocation (Step 9) ---
+        # Use the short-request-first greedy allocator to distribute the
+        # controller's global budget across requests in the current batch.
+        replayable = self.current_step_summary.replayable_blocks_per_req[:num_reqs]
+        allocated = _allocate_budget_to_requests(
+            budget_blocks=self.controller_state.global_budget_blocks,
+            replayable_blocks_per_req=replayable,
+        )
+
+        # Convert per-request block allocation to per-request replay start
+        # token positions.  The replay region is always a contiguous suffix:
+        #   [replay_start_token, computed_len)
+        computed_lens_i32 = _coerce_int32_array("computed_lens", computed_lens)
+        computed_blocks = (
+            (computed_lens_i32.astype(np.int64) + block_size - 1) // block_size
+        ).astype(np.int32)
+        replay_start_blocks = np.maximum(computed_blocks - allocated, 0)
+        desired_replay_start_tokens = (
+            replay_start_blocks.astype(np.int64) * block_size
+        ).astype(np.int32)
+
+        return compute_layer_replay_plan_for_layer(
             layer_idx=layer_idx,
-            num_reqs=num_reqs,
+            desired_replay_start_tokens=desired_replay_start_tokens,
             computed_lens=computed_lens,
             scheduled_lens=scheduled_lens,
             logical_block_tables=logical_block_tables,
