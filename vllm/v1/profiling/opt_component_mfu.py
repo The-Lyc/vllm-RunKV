@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import json
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -36,15 +35,18 @@ class OPTComponentMFUStepProfiler:
     def __init__(
         self,
         *,
-        output_path: str,
+        output_path: str | None,
         step_idx: int,
         rank: int,
         model_name: str,
         total_scheduled_tokens: int,
         num_reqs: int,
     ) -> None:
-        self.output_path = Path(output_path).expanduser()
-        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.output_path = (
+            Path(output_path).expanduser() if output_path is not None else None
+        )
+        if self.output_path is not None:
+            self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self.step_idx = step_idx
         self.rank = rank
         self.model_name = model_name
@@ -98,35 +100,6 @@ class OPTComponentMFUStepProfiler:
     def finish_step(self) -> None:
         if self._dynamic_replay_runtime is not None:
             torch.cuda.synchronize()
-
-        layer_records = self._build_layer_records()
-
-        payload = {
-            "step": self.step_idx,
-            "rank": self.rank,
-            "model_name": self.model_name,
-            "total_scheduled_tokens": self.total_scheduled_tokens,
-            "num_reqs": self.num_reqs,
-            "layers": layer_records,
-        }
-        with self.output_path.open("a", encoding="utf-8") as f:
-            json.dump(payload, f, sort_keys=True)
-            f.write("\n")
-        flat_path = self.output_path.with_name(
-            f"{self.output_path.stem}.flat{self.output_path.suffix}"
-        )
-        with flat_path.open("a", encoding="utf-8") as f:
-            for layer_record in layer_records:
-                flat_row = {
-                    "step": self.step_idx,
-                    "rank": self.rank,
-                    "model_name": self.model_name,
-                    "total_scheduled_tokens": self.total_scheduled_tokens,
-                    "num_reqs": self.num_reqs,
-                    **layer_record,
-                }
-                json.dump(flat_row, f, sort_keys=True)
-                f.write("\n")
 
         self._layer_imbalance_ms.clear()
         self._layer_controller_updates.clear()

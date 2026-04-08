@@ -33,8 +33,8 @@ def main() -> None:
     )
     prefix_blocks = os.environ.get("PREFIX_BLOCKS", "1000")
     num_prompts = os.environ.get("NUM_PROMPTS", "4")
-    prompt_words = os.environ.get("PROMPT_WORDS", "1800")
-    max_tokens = os.environ.get("MAX_TOKENS", "200")
+    prompt_words = os.environ.get("PROMPT_WORDS", "2000")
+    max_tokens = os.environ.get("MAX_TOKENS", "32")
     gpu_memory_fraction = os.environ.get("GPU_MEMORY_FRACTION", "0.9")
     num_device_buffers = os.environ.get("NUM_DEVICE_BUFFERS", "3")
     planner = os.environ.get("PLANNER", "feedback")
@@ -131,11 +131,12 @@ def main() -> None:
     final_cmd = cmd
     if enable_nsys:
         nsys_output_dir.mkdir(parents=True, exist_ok=True)
+        nsys_sample = os.environ.get("NSYS_SAMPLE", "none")
         final_cmd = [
             nsys_cmd,
             "profile",
             "--trace=cuda,nvtx,osrt",
-            "--sample=none",
+            f"--sample={nsys_sample}",
             "-o",
             nsys_stem,
             *nsys_extra_args,
