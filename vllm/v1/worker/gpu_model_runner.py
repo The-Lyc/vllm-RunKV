@@ -455,33 +455,13 @@ class PagedBlockMapper:
                 "(VLLM_RUNKV_SYNC_BUFFER_REUSE=1)."
             )
 
-        # Pinned index arrays for batch copy operations (H2D and D2H).
+        # Pinned index arrays for D2H offload (dirty blocks).
         max_indices = self.capacity
-        self._src_indices_pinned = torch.empty(
-            max_indices, dtype=torch.int64, device="cpu", pin_memory=True
-        )
-        self._dst_indices_pinned = torch.empty(
-            max_indices, dtype=torch.int64, device="cpu", pin_memory=True
-        )
-        # For dirty blocks (D2H offload)
         self._dirty_src_indices_pinned = torch.empty(
             max_indices, dtype=torch.int64, device="cpu", pin_memory=True
         )
         self._dirty_dst_indices_pinned = torch.empty(
             max_indices, dtype=torch.int64, device="cpu", pin_memory=True
-        )
-        self._current_num_blocks = 0
-
-        # DMA H2D staging buffers.
-        # H2D uses gather → cudaMemcpyAsync → scatter instead of the UVA
-        # copy kernel, because the UVA kernel occupies SMs with PCIe-stalled
-        # warps and blocks compute kernels on other streams.
-        self._h2d_pinned_staging = torch.empty_like(
-            any_buffer, device="cpu", pin_memory=True
-        )
-        self._h2d_gpu_staging = torch.empty_like(any_buffer)
-        self._scatter_indices_gpu = torch.empty(
-            max_indices, dtype=torch.int64, device=device
         )
 
         # UVA batch copy kernel (still used for D2H offload where dirty block
@@ -490,7 +470,7 @@ class PagedBlockMapper:
         self.use_batch_copy = batch_copy_fn is not None
         self._batch_copy_fn = batch_copy_fn
         logger.info(
-            "RunKV: DMA H2D copy enabled (max %d blocks), UVA D2H kernel %s",
+            "RunKV: multi-segment DMA H2D (max %d blocks), UVA D2H kernel %s",
             max_indices,
             "available" if self.use_batch_copy else "unavailable (per-block fallback)",
         )
@@ -505,6 +485,7 @@ class PagedBlockMapper:
         )
         self._block_dist_records: list[dict] = []
         self._block_dist_flushed: bool = False
+        self._block_dist_step_captured: bool = False
         self._block_dist_max_records: int = int(
             os.environ.get("RUNKV_CAPTURE_BLOCK_DIST_MAX", "500")
         )
@@ -584,108 +565,6 @@ class PagedBlockMapper:
             non_blocking=non_blocking,
         )
 
-    def _dma_h2d_copy(
-        self,
-        gpu_buffer: torch.Tensor,
-        cpu_cache: torch.Tensor,
-        src_indices: torch.Tensor,
-        copy_count: int,
-        dst_indices: torch.Tensor | None = None,
-    ) -> None:
-        """Batch H2D copy using DMA engine (no SM contention).
-
-        Three steps:
-        1. CPU gather: index_select scattered src blocks into contiguous
-           pinned staging buffer (pure CPU work).
-        2. DMA: async memcpy from pinned CPU to GPU (copy engine, no SMs).
-        3. GPU scatter: index_copy_ to final dst positions in gpu_buffer
-           (only when dst_indices are non-contiguous, i.e. skip case).
-
-        This replaces the UVA batch copy kernel which launched one CUDA thread
-        block per KV block, causing all SMs to stall on PCIe reads and
-        preventing compute kernels on other streams from executing.
-        """
-        _t = self._timing_enabled
-        if _t:
-            import time as _time
-
-        bd = self._blocks_dim
-        staging = self._h2d_pinned_staging
-
-        if bd == 0:
-            _nvtx_g = record_function_or_nullcontext("runkv:dma_h2d:cpu_gather:bd0")
-            _nvtx_g.__enter__()
-            if _t:
-                _tg0 = _time.perf_counter()
-            torch.index_select(cpu_cache, 0, src_indices, out=staging[:copy_count])
-            if _t:
-                self._last_timing["cpu_gather"] = _time.perf_counter() - _tg0
-            _nvtx_g.__exit__(None, None, None)
-            _nvtx_h = record_function_or_nullcontext("runkv:dma_h2d:h2d_scatter:bd0")
-            _nvtx_h.__enter__()
-            if _t:
-                _th0 = _time.perf_counter()
-            if dst_indices is None:
-                gpu_buffer[:copy_count].copy_(staging[:copy_count], non_blocking=True)
-            else:
-                gpu_stg = self._h2d_gpu_staging
-                gpu_stg[:copy_count].copy_(staging[:copy_count], non_blocking=True)
-                self._scatter_indices_gpu[:copy_count].copy_(
-                    dst_indices, non_blocking=True
-                )
-                gpu_buffer.index_copy_(
-                    0,
-                    self._scatter_indices_gpu[:copy_count],
-                    gpu_stg[:copy_count],
-                )
-            if _t:
-                self._last_timing["h2d_scatter"] = _time.perf_counter() - _th0
-            _nvtx_h.__exit__(None, None, None)
-        else:
-            _nvtx_g = record_function_or_nullcontext("runkv:dma_h2d:cpu_gather:bd1")
-            _nvtx_g.__enter__()
-            if _t:
-                _tg0 = _time.perf_counter()
-            outer_size = cpu_cache.shape[0]
-            for outer in range(outer_size):
-                torch.index_select(
-                    cpu_cache[outer],
-                    0,
-                    src_indices,
-                    out=staging[outer, :copy_count],
-                )
-            if _t:
-                self._last_timing["cpu_gather"] = _time.perf_counter() - _tg0
-            _nvtx_g.__exit__(None, None, None)
-            _nvtx_h = record_function_or_nullcontext("runkv:dma_h2d:h2d_scatter:bd1")
-            _nvtx_h.__enter__()
-            if _t:
-                _th0 = _time.perf_counter()
-
-            if dst_indices is None:
-                for outer in range(outer_size):
-                    gpu_buffer[outer, :copy_count].copy_(
-                        staging[outer, :copy_count], non_blocking=True
-                    )
-            else:
-                gpu_stg = self._h2d_gpu_staging
-                for outer in range(outer_size):
-                    gpu_stg[outer, :copy_count].copy_(
-                        staging[outer, :copy_count], non_blocking=True
-                    )
-                self._scatter_indices_gpu[:copy_count].copy_(
-                    dst_indices, non_blocking=True
-                )
-                for outer in range(outer_size):
-                    gpu_buffer[outer].index_copy_(
-                        0,
-                        self._scatter_indices_gpu[:copy_count],
-                        gpu_stg[outer, :copy_count],
-                    )
-            if _t:
-                self._last_timing["h2d_scatter"] = _time.perf_counter() - _th0
-            _nvtx_h.__exit__(None, None, None)
-
     def _assign_slots(self, logical_block_ids: list[int]) -> None:
         """Assign GPU staging slots for the given logical blocks.
 
@@ -703,6 +582,7 @@ class PagedBlockMapper:
                 the configured staging buffer size.
         """
         self.mapping.clear()
+        self._block_dist_step_captured = False
         if len(logical_block_ids) > self.capacity:
             raise RuntimeError(
                 f"This step needs {len(logical_block_ids)} unique blocks but GPU "
@@ -710,17 +590,12 @@ class PagedBlockMapper:
                 f"Options: increase max_staging_blocks, reduce batch size, "
                 f"or reduce max sequence length."
             )
-        for slot, logical_id in enumerate(logical_block_ids):
+        # Sort so that consecutive logical IDs get consecutive GPU slots.
+        # This is critical for multi-segment DMA: a contiguous run of
+        # logical IDs in the CPU cache maps to a contiguous run of slots
+        # in the GPU staging buffer, enabling direct slice copies.
+        for slot, logical_id in enumerate(sorted(logical_block_ids)):
             self.mapping[logical_id] = slot
-
-        # Pre-fill indices for H2D DMA copy
-        num_blocks = len(logical_block_ids)
-        self._current_num_blocks = num_blocks
-        if num_blocks > 0:
-            logical_ids_tensor = torch.tensor(logical_block_ids, dtype=torch.int64)
-            slots_tensor = torch.arange(num_blocks, dtype=torch.int64)
-            self._src_indices_pinned[:num_blocks].copy_(logical_ids_tensor)
-            self._dst_indices_pinned[:num_blocks].copy_(slots_tensor)
 
     def prepare_step(
         self,
@@ -863,11 +738,11 @@ class PagedBlockMapper:
         if not self.mapping:
             if self._timing_enabled:
                 self._last_timing = {
-                    "skip_filter": 0.0,
-                    "cpu_gather": 0.0,
-                    "h2d_dma": 0.0,
+                    "segment_build": 0.0,
+                    "mseg_dma": 0.0,
                     "event": 0.0,
                     "copy_count": 0,
+                    "num_segments": 0,
                 }
             return 0
 
@@ -889,15 +764,7 @@ class PagedBlockMapper:
 
             skip = skip_block_ids or set()
 
-            # Copy all mapped blocks from CPU to GPU staging slots
-            # Use non-blocking copy with dedicated stream for overlap
-            num_blocks = len(self.mapping) - len(skip)
-            with (
-                record_function_or_nullcontext(
-                    f"runkv:h2d_copy:{max(num_blocks, 0)}_blocks"
-                ),
-                torch.cuda.stream(self.load_stream),
-            ):
+            with torch.cuda.stream(self.load_stream):
                 if self._sync_buffer_reuse:
                     prev_layer_idx = layer_idx - self.num_buffers
                     prev_offload_event = (
@@ -912,44 +779,45 @@ class PagedBlockMapper:
                         ):
                             prev_offload_event.wait(self.load_stream)
 
-                # ---- SUB-TIMING: skip_filter ----
-                _nvtx_sf = record_function_or_nullcontext(
-                    f"runkv:load_layer:skip_filter:L{layer_idx}"
-                )
-                _nvtx_sf.__enter__()
+                # ---- Build sorted load_ids and contiguous segments ----
                 if _t:
                     _ts0 = _time.perf_counter()
-                copy_count = 0
                 if skip:
-                    valid_pairs = [
-                        (logical_id, slot)
-                        for logical_id, slot in self.mapping.items()
-                        if logical_id not in skip
-                    ]
-                    copy_count = len(valid_pairs)
-                    if copy_count > 0:
-                        logical_ids, slots = zip(*valid_pairs)
-                        self._src_indices_pinned[:copy_count] = torch.tensor(
-                            logical_ids, dtype=torch.int64
-                        )
-                        self._dst_indices_pinned[:copy_count] = torch.tensor(
-                            slots, dtype=torch.int64
-                        )
+                    load_ids = sorted(lid for lid in self.mapping if lid not in skip)
                 else:
-                    copy_count = len(self.mapping)
-                if _t:
-                    self._last_timing["skip_filter"] = _time.perf_counter() - _ts0
-                _nvtx_sf.__exit__(None, None, None)
+                    load_ids = sorted(self.mapping)
+                copy_count = len(load_ids)
 
-                # ---- Block distribution capture ----
+                # Find contiguous segments in sorted load_ids.
+                # Because _assign_slots sorts logical IDs before assigning
+                # sequential slots, each contiguous source segment maps to a
+                # contiguous destination segment in the GPU buffer.
+                segments: list[tuple[int, int]] = []  # (start, length)
+                if load_ids:
+                    seg_start = load_ids[0]
+                    seg_len = 1
+                    for j in range(1, len(load_ids)):
+                        if load_ids[j] == load_ids[j - 1] + 1:
+                            seg_len += 1
+                        else:
+                            segments.append((seg_start, seg_len))
+                            seg_start = load_ids[j]
+                            seg_len = 1
+                    segments.append((seg_start, seg_len))
+                if _t:
+                    self._last_timing["segment_build"] = _time.perf_counter() - _ts0
+
+                # ---- Block distribution capture (one mid-layer per step) ----
+                _capture_target = self.num_layers // 2 if self.num_layers > 0 else 0
                 if (
                     self._capture_block_dist
+                    and not self._block_dist_step_captured
+                    and layer_idx == _capture_target
                     and len(self._block_dist_records) < self._block_dist_max_records
                 ):
+                    self._block_dist_step_captured = True
                     all_logical_ids = sorted(self.mapping.keys())
                     skip_ids = sorted(skip) if skip else []
-                    load_ids = sorted(lid for lid in all_logical_ids if lid not in skip)
-                    # Record cpu_cache shape for the benchmark
                     cpu_shape = list(cpu_cache.shape)
                     self._block_dist_records.append(
                         {
@@ -959,31 +827,48 @@ class PagedBlockMapper:
                             "load_ids": load_ids,
                             "total_blocks": len(all_logical_ids),
                             "skip_count": len(skip_ids),
-                            "load_count": len(load_ids),
+                            "load_count": copy_count,
+                            "num_segments": len(segments),
                             "cpu_cache_shape": cpu_shape,
                             "cpu_cache_dtype": str(cpu_cache.dtype),
                         }
                     )
 
-                # ---- SUB-TIMING: cpu_gather + h2d_dma ----
+                # ---- Multi-segment DMA: one copy per contiguous segment ----
                 if _t:
                     _tg0 = _time.perf_counter()
-                if copy_count > 0:
+                if segments:
+                    bd = self._blocks_dim
                     with record_function_or_nullcontext(
-                        f"runkv:dma_h2d:L{layer_idx}:{copy_count}_blocks"
+                        f"runkv:mseg_dma:L{layer_idx}"
+                        f":{copy_count}blk:{len(segments)}seg"
                     ):
-                        self._dma_h2d_copy(
-                            gpu_buffer,
-                            cpu_cache,
-                            self._src_indices_pinned[:copy_count],
-                            copy_count,
-                            dst_indices=(
-                                self._dst_indices_pinned[:copy_count] if skip else None
-                            ),
-                        )
+                        if bd == 0:
+                            for src_start, slen in segments:
+                                dst_start = self.mapping[src_start]
+                                gpu_buffer[dst_start : dst_start + slen].copy_(
+                                    cpu_cache[src_start : src_start + slen],
+                                    non_blocking=True,
+                                )
+                        else:
+                            outer_size = cpu_cache.shape[0]
+                            for outer in range(outer_size):
+                                for src_start, slen in segments:
+                                    dst_start = self.mapping[src_start]
+                                    gpu_buffer[
+                                        outer,
+                                        dst_start : dst_start + slen,
+                                    ].copy_(
+                                        cpu_cache[
+                                            outer,
+                                            src_start : src_start + slen,
+                                        ],
+                                        non_blocking=True,
+                                    )
                 if _t:
-                    self._last_timing["h2d_dma"] = _time.perf_counter() - _tg0
+                    self._last_timing["mseg_dma"] = _time.perf_counter() - _tg0
                     self._last_timing["copy_count"] = copy_count
+                    self._last_timing["num_segments"] = len(segments)
 
                 # ---- SUB-TIMING: event ----
                 _nvtx_ev = record_function_or_nullcontext(
@@ -1377,9 +1262,8 @@ class GPUModelRunner(
         self._prehook_t_schedule_io: float = 0.0
         # schedule_io sub-timing accumulators (seconds)
         # -- load_layer_async sub-parts --
-        self._prehook_t_sio_skip_filter: float = 0.0
-        self._prehook_t_sio_cpu_gather: float = 0.0
-        self._prehook_t_sio_h2d_scatter: float = 0.0
+        self._prehook_t_sio_segment_build: float = 0.0
+        self._prehook_t_sio_mseg_dma: float = 0.0
         self._prehook_t_sio_event: float = 0.0
         # -- cpu_fill_h2d_async sub-parts --
         self._prehook_t_sio_cf_prepare: float = 0.0
@@ -3081,9 +2965,8 @@ class GPUModelRunner(
             "misc_ms",
         ]
         sio_sub_fields = [
-            "sio_skip_filter_ms",
-            "sio_cpu_gather_ms",
-            "sio_h2d_scatter_ms",
+            "sio_segment_build_ms",
+            "sio_mseg_dma_ms",
             "sio_event_ms",
             "sio_cf_prepare_ms",
             "sio_cf_gather_ms",
@@ -3443,13 +3326,10 @@ class GPUModelRunner(
                         if _timing:
                             # Collect load_layer_async sub-timings
                             _la = next_mapper._last_timing
-                            self._prehook_t_sio_skip_filter += _la.get(
-                                "skip_filter", 0.0
+                            self._prehook_t_sio_segment_build += _la.get(
+                                "segment_build", 0.0
                             )
-                            self._prehook_t_sio_cpu_gather += _la.get("cpu_gather", 0.0)
-                            self._prehook_t_sio_h2d_scatter += _la.get(
-                                "h2d_scatter", 0.0
-                            )
+                            self._prehook_t_sio_mseg_dma += _la.get("mseg_dma", 0.0)
                             self._prehook_t_sio_event += _la.get("event", 0.0)
                             # Collect cpu_fill sub-timings only when
                             # load_cpu_fill_h2d_async was actually called;
@@ -5511,9 +5391,8 @@ class GPUModelRunner(
                 + self._prehook_t_schedule_io
             )
             _sio_sub_accounted = (
-                self._prehook_t_sio_skip_filter
-                + self._prehook_t_sio_cpu_gather
-                + self._prehook_t_sio_h2d_scatter
+                self._prehook_t_sio_segment_build
+                + self._prehook_t_sio_mseg_dma
                 + self._prehook_t_sio_event
                 + self._prehook_t_sio_cf_prepare
                 + self._prehook_t_sio_cf_gather
@@ -5532,9 +5411,8 @@ class GPUModelRunner(
                     "build_meta_ms": self._prehook_t_build_metadata * 1000,
                     "skip_ids_ms": self._prehook_t_skip_ids * 1000,
                     "schedule_io_ms": self._prehook_t_schedule_io * 1000,
-                    "sio_skip_filter_ms": self._prehook_t_sio_skip_filter * 1000,
-                    "sio_cpu_gather_ms": self._prehook_t_sio_cpu_gather * 1000,
-                    "sio_h2d_scatter_ms": self._prehook_t_sio_h2d_scatter * 1000,
+                    "sio_segment_build_ms": self._prehook_t_sio_segment_build * 1000,
+                    "sio_mseg_dma_ms": self._prehook_t_sio_mseg_dma * 1000,
                     "sio_event_ms": self._prehook_t_sio_event * 1000,
                     "sio_cf_prepare_ms": self._prehook_t_sio_cf_prepare * 1000,
                     "sio_cf_gather_ms": self._prehook_t_sio_cf_gather * 1000,
@@ -5551,9 +5429,8 @@ class GPUModelRunner(
             self._prehook_t_build_metadata = 0.0
             self._prehook_t_skip_ids = 0.0
             self._prehook_t_schedule_io = 0.0
-            self._prehook_t_sio_skip_filter = 0.0
-            self._prehook_t_sio_cpu_gather = 0.0
-            self._prehook_t_sio_h2d_scatter = 0.0
+            self._prehook_t_sio_segment_build = 0.0
+            self._prehook_t_sio_mseg_dma = 0.0
             self._prehook_t_sio_event = 0.0
             self._prehook_t_sio_cf_prepare = 0.0
             self._prehook_t_sio_cf_gather = 0.0

@@ -258,7 +258,9 @@ def bench_multi_segment_dma(
     Each segment copies directly from the contiguous slice of the CPU pinned
     cache to a contiguous region in the GPU buffer. No CPU gather needed.
 
-    Returns avg_total_us.
+    Returns (avg_total_us, avg_launch_us).
+      - total: launch + stream.synchronize (full wall time)
+      - launch: CPU-side time to issue all .copy_() calls (async, non-blocking)
     """
     # Pre-compute destination offsets: segments are packed contiguously
     # in the GPU buffer (slot 0, 1, 2, ...).
@@ -268,44 +270,42 @@ def bench_multi_segment_dma(
         dst_offsets.append(off)
         off += seg.length
 
-    for _ in range(warmup):
-        with torch.cuda.stream(stream):
-            if blocks_dim == 0:
+    def _launch():
+        if blocks_dim == 0:
+            for seg, dst_off in zip(segments, dst_offsets):
+                gpu_buffer[dst_off : dst_off + seg.length].copy_(
+                    cpu_cache[seg.start : seg.start + seg.length],
+                    non_blocking=True,
+                )
+        else:
+            for outer in range(cpu_cache.shape[0]):
                 for seg, dst_off in zip(segments, dst_offsets):
-                    gpu_buffer[dst_off : dst_off + seg.length].copy_(
-                        cpu_cache[seg.start : seg.start + seg.length],
+                    gpu_buffer[outer, dst_off : dst_off + seg.length].copy_(
+                        cpu_cache[outer, seg.start : seg.start + seg.length],
                         non_blocking=True,
                     )
-            else:
-                for outer in range(cpu_cache.shape[0]):
-                    for seg, dst_off in zip(segments, dst_offsets):
-                        gpu_buffer[outer, dst_off : dst_off + seg.length].copy_(
-                            cpu_cache[outer, seg.start : seg.start + seg.length],
-                            non_blocking=True,
-                        )
+
+    for _ in range(warmup):
+        with torch.cuda.stream(stream):
+            _launch()
         stream.synchronize()
 
     total_times = []
+    launch_times = []
     for _ in range(iters):
         t0 = time.perf_counter()
         with torch.cuda.stream(stream):
-            if blocks_dim == 0:
-                for seg, dst_off in zip(segments, dst_offsets):
-                    gpu_buffer[dst_off : dst_off + seg.length].copy_(
-                        cpu_cache[seg.start : seg.start + seg.length],
-                        non_blocking=True,
-                    )
-            else:
-                for outer in range(cpu_cache.shape[0]):
-                    for seg, dst_off in zip(segments, dst_offsets):
-                        gpu_buffer[outer, dst_off : dst_off + seg.length].copy_(
-                            cpu_cache[outer, seg.start : seg.start + seg.length],
-                            non_blocking=True,
-                        )
+            _launch()
+        t_launched = time.perf_counter()
         stream.synchronize()
-        total_times.append((time.perf_counter() - t0) * 1e6)
+        t_end = time.perf_counter()
+        total_times.append((t_end - t0) * 1e6)
+        launch_times.append((t_launched - t0) * 1e6)
 
-    return sum(total_times) / iters
+    return (
+        sum(total_times) / iters,
+        sum(launch_times) / iters,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +378,7 @@ def run_benchmark_for_record(
         stream,
     )
 
-    avg_multi_seg = bench_multi_segment_dma(
+    avg_multi_seg_total, avg_multi_seg_launch = bench_multi_segment_dma(
         cpu_cache,
         gpu_buffer,
         segments,
@@ -397,8 +397,9 @@ def run_benchmark_for_record(
         "seg_lengths": [s.length for s in segments],
         "gather_dma_us": avg_total_gather,
         "gather_only_us": avg_gather_only,
-        "multi_seg_dma_us": avg_multi_seg,
-        "speedup": avg_total_gather / max(avg_multi_seg, 1e-9),
+        "mseg_total_us": avg_multi_seg_total,
+        "mseg_launch_us": avg_multi_seg_launch,
+        "speedup": avg_total_gather / max(avg_multi_seg_total, 1e-9),
     }
 
 
@@ -495,7 +496,7 @@ def main():
     parser.add_argument(
         "--max-records",
         type=int,
-        default=20,
+        default=0,
         help="Max records to benchmark (skip remainder after analysis)",
     )
     parser.add_argument(
@@ -574,17 +575,18 @@ def main():
     bench_records = records
     if layer_filter:
         bench_records = [r for r in records if r["layer_idx"] in layer_filter]
-    bench_records = bench_records[: args.max_records]
+    if args.max_records > 0:
+        bench_records = bench_records[: args.max_records]
 
-    print(f"\n{'=' * 72}")
+    print(f"\n{'=' * 80}")
     print(f"DMA Copy Benchmark  (warmup={args.warmup}, iters={args.iters})")
-    print(f"{'=' * 72}")
+    print(f"{'=' * 80}")
     print(
         f"{'rec':>4s} {'layer':>5s} {'load':>5s} {'skip':>5s} "
         f"{'segs':>5s} {'gather+DMA':>11s} {'gather':>11s} "
-        f"{'multi-seg':>11s} {'speedup':>8s}"
+        f"{'mseg_total':>11s} {'mseg_launch':>12s} {'speedup':>8s}"
     )
-    print("-" * 72)
+    print("-" * 80)
 
     results = []
     for i, rec in enumerate(bench_records):
@@ -597,31 +599,39 @@ def main():
             f"{i:>4d} {res['layer_idx']:>5d} {res['load_count']:>5d} "
             f"{res['skip_count']:>5d} {res['num_segments']:>5d} "
             f"{res['gather_dma_us']:>9.1f}us {res['gather_only_us']:>9.1f}us "
-            f"{res['multi_seg_dma_us']:>9.1f}us {res['speedup']:>7.2f}x"
+            f"{res['mseg_total_us']:>9.1f}us "
+            f"{res['mseg_launch_us']:>10.1f}us {res['speedup']:>7.2f}x"
         )
 
     # Summary
     valid = [r for r in results if not r.get("skipped")]
     if valid:
-        avg_speedup = sum(r["speedup"] for r in valid) / len(valid)
-        avg_gather = sum(r["gather_dma_us"] for r in valid) / len(valid)
-        avg_multi = sum(r["multi_seg_dma_us"] for r in valid) / len(valid)
-        avg_gather_only = sum(r["gather_only_us"] for r in valid) / len(valid)
-        print("-" * 72)
+        n = len(valid)
+        avg_speedup = sum(r["speedup"] for r in valid) / n
+        avg_gather = sum(r["gather_dma_us"] for r in valid) / n
+        avg_multi = sum(r["mseg_total_us"] for r in valid) / n
+        avg_gather_only = sum(r["gather_only_us"] for r in valid) / n
+        avg_launch = sum(r["mseg_launch_us"] for r in valid) / n
+        print("-" * 80)
         print(
             f"{'AVG':>4s} {'':>5s} {'':>5s} {'':>5s} {'':>5s} "
             f"{avg_gather:>9.1f}us {avg_gather_only:>9.1f}us "
-            f"{avg_multi:>9.1f}us {avg_speedup:>7.2f}x"
+            f"{avg_multi:>9.1f}us "
+            f"{avg_launch:>10.1f}us {avg_speedup:>7.2f}x"
         )
         print(
             f"\nConclusion: multi-segment DMA is "
             f"{'FASTER' if avg_speedup > 1.0 else 'SLOWER'} "
-            f"by {avg_speedup:.2f}x on average."
+            f"by {avg_speedup:.2f}x on average (total)."
         )
         print(
-            f"  CPU gather alone takes {avg_gather_only:.1f}us avg "
+            f"  CPU gather (index_select) takes {avg_gather_only:.1f}us avg "
             f"({avg_gather_only / max(avg_gather, 1e-9) * 100:.0f}% of "
             f"gather+DMA)."
+        )
+        print(
+            f"  Multi-seg launch overhead: {avg_launch:.1f}us avg "
+            f"(CPU blocks until all .copy_() calls return)."
         )
 
 
