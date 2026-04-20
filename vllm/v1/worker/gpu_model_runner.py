@@ -183,6 +183,7 @@ from vllm.v1.worker.runkv_debug import (
     runkv_debug_enabled,
     runkv_debug_level,
 )
+from vllm.v1.worker.tightllm_ilp_planner import TightLLMReplayPlanProvider
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
@@ -438,6 +439,8 @@ class PagedBlockMapper:
         # Events to track async transfer completion
         # Maps layer_idx -> event for load completion
         self.load_events: dict[int, torch.cuda.Event] = {}
+        # Maps layer_idx -> event for load start (before DMA)
+        self.load_start_events: dict[int, torch.cuda.Event] = {}
         # Maps layer_idx -> event for offload completion
         self.offload_events: dict[int, torch.cuda.Event] = {}
 
@@ -834,6 +837,11 @@ class PagedBlockMapper:
                         }
                     )
 
+                # ---- Record load_start event before DMA ----
+                load_start_event = torch.cuda.Event(enable_timing=True)
+                load_start_event.record(self.load_stream)
+                self.load_start_events[layer_idx] = load_start_event
+
                 # ---- Multi-segment DMA: one copy per contiguous segment ----
                 if _t:
                     _tg0 = _time.perf_counter()
@@ -908,6 +916,9 @@ class PagedBlockMapper:
 
     def peek_load_ready_event(self, layer_idx: int) -> torch.cuda.Event | None:
         return self.load_events.get(layer_idx)
+
+    def peek_load_start_event(self, layer_idx: int) -> torch.cuda.Event | None:
+        return self.load_start_events.get(layer_idx)
 
     def load_layer(
         self,
@@ -3109,11 +3120,15 @@ class GPUModelRunner(
                         self._dynamic_replay_prehook_logged = True
 
                     current_load_ready_event = mapper.peek_load_ready_event(layer_idx)
+                    current_load_start_event = mapper.peek_load_start_event(layer_idx)
                     current_cpu_fill_ready_event = (
                         manager.peek_cpu_fill_h2d_ready_event(layer_idx)
                     )
                     runtime.set_layer_load_ready_event(
                         layer_idx, current_load_ready_event
+                    )
+                    runtime.set_layer_load_start_event(
+                        layer_idx, current_load_start_event
                     )
                     runtime.set_layer_cpu_fill_ready_event(
                         layer_idx, current_cpu_fill_ready_event
@@ -3164,6 +3179,9 @@ class GPUModelRunner(
                                 if isinstance(
                                     self.replay_plan_provider,
                                     FeedbackReplayPlanProvider,
+                                ) or isinstance(
+                                    self.replay_plan_provider,
+                                    TightLLMReplayPlanProvider,
                                 ):
                                     self.replay_plan_provider.observe_layer_feedback(
                                         layer_idx=layer_idx - 1,
@@ -3262,17 +3280,25 @@ class GPUModelRunner(
                         next_layer_name, next_layer_idx, next_gid = next_layer_info
                         next_mapper = self.paged_block_mappers[next_gid]
                         next_plan = runtime.get_layer_plan(next_layer_idx)
-                        # When the feedback planner is live (not dry-run),
-                        # derive the skip set from the plan so the IO path
-                        # honours the planner's budget allocation.
+                        # When a dynamic planner (feedback or tightllm) is
+                        # live, derive the skip set from the plan so the IO
+                        # path honours the planner's budget allocation.
                         # Otherwise fall back to the static io_prefix_blocks.
+                        _use_plan_skip = False
                         if (
                             isinstance(
                                 self.replay_plan_provider,
                                 FeedbackReplayPlanProvider,
                             )
                             and not self.replay_plan_provider.dry_run
+                            or isinstance(
+                                self.replay_plan_provider,
+                                TightLLMReplayPlanProvider,
+                            )
                         ):
+                            _use_plan_skip = True
+
+                        if _use_plan_skip:
                             next_skip_block_ids = (
                                 manager.compute_skip_block_ids_from_plan(next_plan)
                             )
@@ -3297,9 +3323,14 @@ class GPUModelRunner(
                         if _timing:
                             next_mapper._timing_enabled = True
                             manager._timing_enabled = True
-                        with record_function_or_nullcontext(
-                            "runkv:layer_schedule_next_io:"
-                            f"{next_layer_name}:L{next_layer_idx}"
+                        with (
+                            record_function_or_nullcontext(
+                                f"runkv:prehook:schedule_io:L{layer_idx}"
+                            ),
+                            record_function_or_nullcontext(
+                                "runkv:layer_schedule_next_io:"
+                                f"{next_layer_name}:L{next_layer_idx}"
+                            ),
                         ):
                             next_mapper.load_layer_async(
                                 next_layer_name,
@@ -3318,6 +3349,10 @@ class GPUModelRunner(
                         runtime.set_layer_load_ready_event(
                             next_layer_idx,
                             next_mapper.peek_load_ready_event(next_layer_idx),
+                        )
+                        runtime.set_layer_load_start_event(
+                            next_layer_idx,
+                            next_mapper.peek_load_start_event(next_layer_idx),
                         )
                         runtime.set_layer_cpu_fill_ready_event(
                             next_layer_idx,
@@ -8082,6 +8117,31 @@ class GPUModelRunner(
                     )
                 ),
             )
+        elif planner_mode == "tightllm":
+            profile_path = getattr(
+                self.kv_offload_config, "tightllm_profile_path", None
+            )
+            if not profile_path:
+                raise ValueError(
+                    "layer_recompute_planner='tightllm' requires "
+                    "tightllm_profile_path to be set."
+                )
+            from vllm.v1.profiling.tightllm_offline_profiler import (
+                TightLLMProfileData,
+            )
+
+            profile_data = TightLLMProfileData.load(profile_path)
+            self.replay_plan_provider = TightLLMReplayPlanProvider(
+                profile=profile_data,
+                io_prefix_blocks=normalized_io_prefix,
+                enable_feedback_correction=bool(
+                    getattr(
+                        self.kv_offload_config,
+                        "tightllm_enable_feedback_correction",
+                        False,
+                    )
+                ),
+            )
         else:
             self.replay_plan_provider = StaticReplayPlanProvider(normalized_io_prefix)
 
@@ -8222,13 +8282,17 @@ class GPUModelRunner(
         runtime.set_layer_metadata(layer0_idx, layer0_metadata)
 
         layer0_mapper = self.paged_block_mappers[layer0_gid]
-        # When the feedback planner is live (not dry-run), derive the skip
-        # set from the plan so the IO path honours the planner's budget
-        # allocation.  Otherwise fall back to the static io_prefix_blocks.
+        # When a dynamic planner (feedback / tightllm) is live, derive the
+        # skip set from the plan so the IO path honours the planner's budget.
+        # Otherwise fall back to the static io_prefix_blocks.
+        _use_plan_skip_l0 = False
         if (
             isinstance(self.replay_plan_provider, FeedbackReplayPlanProvider)
             and not self.replay_plan_provider.dry_run
-        ):
+        ) or isinstance(self.replay_plan_provider, TightLLMReplayPlanProvider):
+            _use_plan_skip_l0 = True
+
+        if _use_plan_skip_l0:
             skip_block_ids = (
                 self.layer_recompute_manager.compute_skip_block_ids_from_plan(
                     layer0_plan
@@ -8261,6 +8325,10 @@ class GPUModelRunner(
         runtime.set_layer_load_ready_event(
             layer0_idx,
             layer0_mapper.peek_load_ready_event(layer0_idx),
+        )
+        runtime.set_layer_load_start_event(
+            layer0_idx,
+            layer0_mapper.peek_load_start_event(layer0_idx),
         )
         runtime.set_layer_cpu_fill_ready_event(
             layer0_idx,

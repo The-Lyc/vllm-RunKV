@@ -26,6 +26,7 @@ from itertools import islice
 
 import numpy as np
 import torch
+import torch.cuda.nvtx as _nvtx
 from torch import nn
 from transformers import OPTConfig
 
@@ -418,7 +419,24 @@ class OPTDecoder(nn.Module):
             start=self.start_layer,
         ):
             plan = runtime.get_layer_plan(layer_idx)
+            _nvtx.range_push(f"runkv:layer_compute:L{layer_idx}")
+
+            # Record compute start on the compute stream
+            layer_start_event: torch.cuda.Event | None = None
+            if scheduled_hidden_states.device.type == "cuda":
+                layer_start_event = torch.cuda.Event(enable_timing=True)
+                layer_start_event.record()
+            runtime.set_layer_start_event(layer_idx, layer_start_event)
+
             if plan.replay_token_count == 0:
+                # Record forward start right before layer() — same as
+                # layer_start in the no-replay case (no assembly overhead).
+                fwd_start_event: torch.cuda.Event | None = None
+                if scheduled_hidden_states.device.type == "cuda":
+                    fwd_start_event = torch.cuda.Event(enable_timing=True)
+                    fwd_start_event.record()
+                runtime.set_layer_forward_start_event(layer_idx, fwd_start_event)
+
                 with self._with_runtime_attn_metadata(layer_idx=layer_idx):
                     scheduled_hidden_states = layer(scheduled_hidden_states)
                 replay_hidden_states = None
@@ -460,6 +478,14 @@ class OPTDecoder(nn.Module):
                 combined_hidden_states[replay_indices] = replay_hidden_states
                 combined_hidden_states[scheduled_indices] = scheduled_hidden_states
 
+                # Record forward start AFTER cpu_fill sync + scatter — this
+                # measures pure attention + FFN time without replay assembly.
+                fwd_start_event = None
+                if combined_hidden_states.device.type == "cuda":
+                    fwd_start_event = torch.cuda.Event(enable_timing=True)
+                    fwd_start_event.record()
+                runtime.set_layer_forward_start_event(layer_idx, fwd_start_event)
+
                 with self._with_runtime_attn_metadata(layer_idx=layer_idx):
                     # commit replay version computation to the computing stream
                     combined_hidden_states = layer(combined_hidden_states)
@@ -470,6 +496,7 @@ class OPTDecoder(nn.Module):
                 scheduled_hidden_states = combined_hidden_states.index_select(
                     0, scheduled_indices
                 )
+            _nvtx.range_pop()  # runkv:layer_compute:L{layer_idx}
 
             layer_end_event: torch.cuda.Event | None = None
             if scheduled_hidden_states.device.type == "cuda":

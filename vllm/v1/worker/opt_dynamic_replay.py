@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import statistics as _statistics
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 import torch
+import torch.cuda.nvtx as _nvtx
 
 
 @dataclass
@@ -545,6 +547,15 @@ class FeedbackReplayPlanProvider:
     # that prefill steps (computed_lens == 0) do not seed the budget to 0.
     _budget_seeded: bool = field(init=False, default=False)
 
+    # Imbalance history — accumulated for all layers, for post-run statistics
+    _imbalance_history: list[float] = field(init=False, default_factory=list)
+    # Per-step budget history
+    _budget_history: list[int] = field(init=False, default_factory=list)
+    # Phase-separated imbalance: decode-only vs steps containing prefill
+    _imbalance_decode_only: list[float] = field(init=False, default_factory=list)
+    _imbalance_has_prefill: list[float] = field(init=False, default_factory=list)
+    _current_step_is_decode_only: bool = field(init=False, default=True)
+
     def __post_init__(self) -> None:
         self.static_provider = StaticReplayPlanProvider(
             io_prefix_blocks=list(self.io_prefix_blocks)
@@ -554,6 +565,7 @@ class FeedbackReplayPlanProvider:
         # Step-boundary metadata is still owned by LayerRecomputeManager.
         # The planner only derives compact summaries from it and stores the
         # cross-step controller state that later steps will evolve.
+        _nvtx.range_push("feedback:begin_step")
         self.begin_step_count += 1
         req_ids = tuple(str(req_id) for req_id in metadata.get("req_ids", ()))
         computed_lens = _coerce_int32_array(
@@ -570,9 +582,17 @@ class FeedbackReplayPlanProvider:
         )
         block_size = int(metadata.get("block_size", 0))
         if block_size <= 0:
+            _nvtx.range_pop()
             raise ValueError(
                 "FeedbackReplayPlanProvider.begin_step requires block_size."
             )
+
+        # Phase detection: decode-only if all requests have computed_lens > 0
+        num_reqs = len(computed_lens)
+        if num_reqs > 0:
+            self._current_step_is_decode_only = bool(np.all(computed_lens > 0))
+        else:
+            self._current_step_is_decode_only = True
 
         replayable_blocks_per_req = np.minimum(
             (computed_lens.astype(np.int64) + block_size - 1) // block_size,
@@ -607,8 +627,10 @@ class FeedbackReplayPlanProvider:
                 0, min(cs.global_budget_blocks, total_replayable_blocks)
             )
 
+        self._budget_history.append(cs.global_budget_blocks)
         self.last_feedback_by_layer.clear()
         self._layer_controller_updates.clear()
+        _nvtx.range_pop()  # feedback:begin_step
 
     def observe_layer_feedback(self, layer_idx: int, imbalance_ms: float) -> None:
         """Update the controller state based on the observed layer imbalance.
@@ -624,8 +646,17 @@ class FeedbackReplayPlanProvider:
         In the current (Step 8 / dry-run) phase the updated budget is *not*
         fed back into the actual replay plan; that happens in Step 10.
         """
+        _nvtx.range_push(f"feedback:controller_update:L{layer_idx}")
         self.observe_feedback_count += 1
         imbalance_value = float(imbalance_ms)
+        self._imbalance_history.append(imbalance_value)
+
+        # Route to decode-only or has-prefill bucket
+        if self._current_step_is_decode_only:
+            self._imbalance_decode_only.append(imbalance_value)
+        else:
+            self._imbalance_has_prefill.append(imbalance_value)
+
         layer_key = int(layer_idx)
         self.last_feedback_by_layer[layer_key] = imbalance_value
 
@@ -641,6 +672,7 @@ class FeedbackReplayPlanProvider:
                 action="deadband",
             )
             cs.last_imbalance_ms = imbalance_value
+            _nvtx.range_pop()  # feedback:controller_update
             return
 
         # --- Secant-based gain estimation ---
@@ -701,6 +733,7 @@ class FeedbackReplayPlanProvider:
         cs.last_budget_blocks = budget_before
         cs.last_imbalance_ms = imbalance_value
         cs.global_budget_blocks = new_budget
+        _nvtx.range_pop()  # feedback:controller_update
 
     def get_layer_controller_update(
         self,
@@ -710,6 +743,57 @@ class FeedbackReplayPlanProvider:
         step, or ``None`` if no feedback has been observed for that layer yet.
         """
         return self._layer_controller_updates.get(int(layer_idx))
+
+    @staticmethod
+    def _phase_stats(hist: list[float], label: str) -> dict[str, Any]:
+        """Compute summary stats for a single phase bucket."""
+        if not hist:
+            return {f"{label}_count": 0}
+        abs_hist = [abs(v) for v in hist]
+        return {
+            f"{label}_count": len(hist),
+            f"{label}_mean_ms": _statistics.mean(hist),
+            f"{label}_stdev_ms": (_statistics.stdev(hist) if len(hist) >= 2 else 0.0),
+            f"{label}_abs_mean_ms": _statistics.mean(abs_hist),
+            f"{label}_abs_max_ms": max(abs_hist),
+            f"{label}_median_ms": _statistics.median(hist),
+            f"{label}_p95_ms": sorted(abs_hist)[int(len(abs_hist) * 0.95)],
+            f"{label}_positive_ratio": (sum(1 for v in hist if v > 0) / len(hist)),
+        }
+
+    def get_imbalance_stats(self) -> dict[str, Any]:
+        """Return summary statistics of accumulated imbalance observations.
+
+        Designed to be called once after inference completes.
+        Includes overall stats plus decode-only and has-prefill breakdowns.
+        """
+        hist = self._imbalance_history
+        if not hist:
+            return {"count": 0}
+        abs_hist = [abs(v) for v in hist]
+        result: dict[str, Any] = {
+            "provider": "FeedbackReplayPlanProvider",
+            "count": len(hist),
+            "mean_ms": _statistics.mean(hist),
+            "stdev_ms": _statistics.stdev(hist) if len(hist) >= 2 else 0.0,
+            "abs_mean_ms": _statistics.mean(abs_hist),
+            "abs_max_ms": max(abs_hist),
+            "median_ms": _statistics.median(hist),
+            "p95_ms": sorted(abs_hist)[int(len(abs_hist) * 0.95)],
+            "positive_ratio": sum(1 for v in hist if v > 0) / len(hist),
+            "budget_mean": (
+                _statistics.mean(self._budget_history) if self._budget_history else 0.0
+            ),
+            "budget_stdev": (
+                _statistics.stdev(self._budget_history)
+                if len(self._budget_history) >= 2
+                else 0.0
+            ),
+        }
+        # Phase breakdowns
+        result.update(self._phase_stats(self._imbalance_decode_only, "decode"))
+        result.update(self._phase_stats(self._imbalance_has_prefill, "prefill"))
+        return result
 
     def get_debug_snapshot(self) -> dict[str, Any]:
         step_summary = None
@@ -912,16 +996,22 @@ class OPTDynamicReplayRuntime:
     _per_layer_attn_metadata: list[dict[str, Any] | None] = field(init=False)
     _step_anchor_event: torch.cuda.Event | None = field(init=False, default=None)
     _layer_end_events: list[torch.cuda.Event | None] = field(init=False)
+    _layer_start_events: list[torch.cuda.Event | None] = field(init=False)
     _layer_load_ready_events: list[torch.cuda.Event | None] = field(init=False)
+    _layer_load_start_events: list[torch.cuda.Event | None] = field(init=False)
     _layer_cpu_fill_ready_events: list[torch.cuda.Event | None] = field(init=False)
+    _layer_forward_start_events: list[torch.cuda.Event | None] = field(init=False)
     _layer_imbalance_ms: list[float | None] = field(init=False)
 
     def __post_init__(self) -> None:
         self._layer_plans = [None] * self.num_layers
         self._per_layer_attn_metadata = [None] * self.num_layers
         self._layer_end_events = [None] * self.num_layers
+        self._layer_start_events = [None] * self.num_layers
         self._layer_load_ready_events = [None] * self.num_layers
+        self._layer_load_start_events = [None] * self.num_layers
         self._layer_cpu_fill_ready_events = [None] * self.num_layers
+        self._layer_forward_start_events = [None] * self.num_layers
         self._layer_imbalance_ms = [None] * self.num_layers
 
     def get_layer_plan(self, layer_idx: int) -> LayerReplayPlan:
@@ -958,6 +1048,18 @@ class OPTDynamicReplayRuntime:
     def get_layer_end_event(self, layer_idx: int) -> torch.cuda.Event | None:
         return self._layer_end_events[layer_idx]
 
+    def set_layer_start_event(
+        self,
+        layer_idx: int,
+        event: torch.cuda.Event | None,
+    ) -> None:
+        # Records the exact point where this layer's forward begins on the
+        # compute stream (just before layer(hidden_states)).
+        self._layer_start_events[layer_idx] = event
+
+    def get_layer_start_event(self, layer_idx: int) -> torch.cuda.Event | None:
+        return self._layer_start_events[layer_idx]
+
     def set_step_anchor_event(self, event: torch.cuda.Event | None) -> None:
         # Common time base for cross-stream timing. Later event timestamps are
         # converted into absolute times by measuring against this anchor.
@@ -977,6 +1079,17 @@ class OPTDynamicReplayRuntime:
     def get_layer_load_ready_event(self, layer_idx: int) -> torch.cuda.Event | None:
         return self._layer_load_ready_events[layer_idx]
 
+    def set_layer_load_start_event(
+        self,
+        layer_idx: int,
+        event: torch.cuda.Event | None,
+    ) -> None:
+        # Records the start of H2D DMA for this layer on load_stream.
+        self._layer_load_start_events[layer_idx] = event
+
+    def get_layer_load_start_event(self, layer_idx: int) -> torch.cuda.Event | None:
+        return self._layer_load_start_events[layer_idx]
+
     def set_layer_cpu_fill_ready_event(
         self,
         layer_idx: int,
@@ -991,6 +1104,20 @@ class OPTDynamicReplayRuntime:
         layer_idx: int,
     ) -> torch.cuda.Event | None:
         return self._layer_cpu_fill_ready_events[layer_idx]
+
+    def set_layer_forward_start_event(
+        self,
+        layer_idx: int,
+        event: torch.cuda.Event | None,
+    ) -> None:
+        # Records the point right before layer(hidden_states) on the compute
+        # stream — after cpu_fill sync and tensor scatter, so it measures
+        # pure attention + FFN time (unlike layer_start which includes
+        # replay assembly overhead).
+        self._layer_forward_start_events[layer_idx] = event
+
+    def get_layer_forward_start_event(self, layer_idx: int) -> torch.cuda.Event | None:
+        return self._layer_forward_start_events[layer_idx]
 
     def set_layer_imbalance_ms(
         self, layer_idx: int, imbalance_ms: float | None
