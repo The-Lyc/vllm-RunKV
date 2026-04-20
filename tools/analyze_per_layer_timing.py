@@ -401,6 +401,63 @@ def collect_compute_and_io_events(
     return {k: dict(v) for k, v in result.items()}
 
 
+def collect_per_step_layer_timing(
+    flat: list[dict],
+    skip_steps: int = 1,
+) -> dict[str, dict[int, dict[int, float]]]:
+    """Collect per-step × per-layer timing for compute, IO, and imbalance.
+
+    Returns ``{metric: {step: {layer_idx: value_ms}}}``.
+
+    Metrics:
+      - ``compute_dur``: compute_end[L] - compute_end[L-1]  (layer GPU time)
+      - ``io_dur``: load_ready[L] - load_start[L]  (H2D transfer duration)
+      - ``imbalance``: imbalance_ms from JSONL
+      - ``compute_end``: raw compute_end_ms_from_anchor
+      - ``load_ready``: raw load_ready_ms_from_anchor
+    """
+    by_step: dict[int, list[dict]] = defaultdict(list)
+    for r in flat:
+        step = r.get("step", 0)
+        if step >= skip_steps:
+            by_step[step].append(r)
+
+    result: dict[str, dict[int, dict[int, float]]] = {
+        "compute_dur": defaultdict(dict),
+        "io_dur": defaultdict(dict),
+        "imbalance": defaultdict(dict),
+        "compute_end": defaultdict(dict),
+        "load_ready": defaultdict(dict),
+    }
+
+    for step, records in sorted(by_step.items()):
+        layers_s = sorted(records, key=lambda x: x.get("layer_idx", 0))
+        prev_end: float | None = None
+        for lr in layers_s:
+            li = lr.get("layer_idx")
+            if li is None:
+                continue
+            ce = lr.get("compute_end_ms_from_anchor")
+            if ce is not None:
+                result["compute_end"][step][li] = ce
+                if prev_end is not None:
+                    result["compute_dur"][step][li] = ce - prev_end
+                prev_end = ce
+
+            ls = lr.get("load_start_ms_from_anchor")
+            lready = lr.get("load_ready_ms_from_anchor")
+            if lready is not None:
+                result["load_ready"][step][li] = lready
+            if ls is not None and lready is not None:
+                result["io_dur"][step][li] = lready - ls
+
+            imb = lr.get("imbalance_ms")
+            if imb is not None:
+                result["imbalance"][step][li] = float(imb)
+
+    return {k: dict(v) for k, v in result.items()}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Per-layer H2D DMA timing from CUPTI + compute_end anchor correlation
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2054,6 +2111,192 @@ def plot_clean_compute(
     print(f"  [plot] {out}")
 
 
+def plot_per_step_layer_lines(
+    runkv_psl: dict[str, dict[int, dict[int, float]]],
+    tightllm_psl: dict[str, dict[int, dict[int, float]]],
+    out_dir: Path,
+) -> None:
+    """Plot per-step × per-layer line charts for compute, IO, and imbalance.
+
+    For each metric, produces one figure per method (RunKV / TightLLM) with
+    x-axis = step, y-axis = time (ms), and one line per layer.  Also produces
+    a combined heatmap view.
+    """
+    if not HAS_MPL:
+        return
+
+    metrics_info = [
+        ("compute_dur", "Compute duration (ms)", "compute_end[L]−compute_end[L−1]"),
+        ("io_dur", "IO duration (ms)", "load_ready[L]−load_start[L]"),
+        ("imbalance", "Imbalance (ms)", "compute_end[L]−load_ready[L+1]"),
+    ]
+
+    for metric, ylabel, description in metrics_info:
+        for label, psl, cmap_base in [
+            ("RunKV", runkv_psl, "Blues"),
+            ("TightLLM", tightllm_psl, "Oranges"),
+        ]:
+            data = psl.get(metric, {})
+            if not data:
+                continue
+
+            steps = sorted(data.keys())
+            all_layers = sorted({l for step_data in data.values() for l in step_data})
+            if not steps or not all_layers:
+                continue
+
+            # Build 2D array: rows = layers, cols = steps
+            import numpy as _np
+
+            mat = _np.full((len(all_layers), len(steps)), _np.nan)
+            for si, step in enumerate(steps):
+                for li, layer in enumerate(all_layers):
+                    v = data.get(step, {}).get(layer)
+                    if v is not None:
+                        mat[li, si] = v
+
+            # ── Line chart: one line per layer ─────────────────────────
+            fig, ax = plt.subplots(figsize=(16, 6))
+            cmap = plt.get_cmap("tab20" if len(all_layers) <= 20 else "viridis")
+            for li, layer in enumerate(all_layers):
+                color = cmap(li / max(len(all_layers) - 1, 1))
+                vals = mat[li, :]
+                # Only plot if we have some non-nan values
+                valid = ~_np.isnan(vals)
+                if valid.any():
+                    ax.plot(
+                        _np.array(steps)[valid],
+                        vals[valid],
+                        color=color,
+                        lw=0.8,
+                        alpha=0.7,
+                        label=f"L{layer}" if len(all_layers) <= 32 else None,
+                    )
+
+            ax.set_xlabel("Step")
+            ax.set_ylabel(ylabel)
+            ax.set_title(f"{label}: {description} per step per layer")
+            if len(all_layers) <= 32:
+                ax.legend(
+                    fontsize=6,
+                    ncol=min(4, (len(all_layers) + 7) // 8),
+                    loc="upper right",
+                )
+            ax.grid(True, alpha=0.3)
+            if metric == "imbalance":
+                ax.axhline(0, color="k", lw=0.8, ls="--")
+            fig.tight_layout()
+            tag = label.lower().replace(" ", "_")
+            out = out_dir / f"step_layer_{metric}_{tag}.png"
+            fig.savefig(out, dpi=150)
+            plt.close(fig)
+            print(f"  [plot] {out}")
+
+            # ── Heatmap: x=step, y=layer ──────────────────────────────
+            fig, ax = plt.subplots(figsize=(16, max(4, len(all_layers) * 0.25)))
+            if metric == "imbalance":
+                # Diverging colormap centered at 0
+                abs_max = _np.nanmax(_np.abs(mat)) if not _np.all(_np.isnan(mat)) else 1
+                im = ax.imshow(
+                    mat,
+                    aspect="auto",
+                    cmap="RdBu_r",
+                    vmin=-abs_max,
+                    vmax=abs_max,
+                    interpolation="nearest",
+                )
+            else:
+                im = ax.imshow(
+                    mat,
+                    aspect="auto",
+                    cmap=cmap_base,
+                    interpolation="nearest",
+                )
+            cbar = fig.colorbar(im, ax=ax, shrink=0.8)
+            cbar.set_label(ylabel, fontsize=9)
+
+            # Tick labels
+            n_steps = len(steps)
+            if n_steps > 40:
+                step_ticks = list(range(0, n_steps, max(1, n_steps // 20)))
+            else:
+                step_ticks = list(range(n_steps))
+            ax.set_xticks(step_ticks)
+            ax.set_xticklabels(
+                [str(steps[i]) for i in step_ticks], fontsize=7, rotation=45
+            )
+            ax.set_yticks(range(len(all_layers)))
+            ax.set_yticklabels([f"L{l}" for l in all_layers], fontsize=7)
+            ax.set_xlabel("Step")
+            ax.set_ylabel("Layer")
+            ax.set_title(f"{label}: {description} heatmap (step × layer)")
+            fig.tight_layout()
+            out = out_dir / f"step_layer_{metric}_{tag}_heatmap.png"
+            fig.savefig(out, dpi=150)
+            plt.close(fig)
+            print(f"  [plot] {out}")
+
+        # ── Combined overlay: RunKV vs TightLLM mean ± std per step ──
+        r_data = runkv_psl.get(metric, {})
+        t_data = tightllm_psl.get(metric, {})
+        if not r_data and not t_data:
+            continue
+
+        fig, ax = plt.subplots(figsize=(16, 5))
+        for data, lbl, color in [
+            (r_data, "RunKV", "#4C72B0"),
+            (t_data, "TightLLM", "#DD8452"),
+        ]:
+            if not data:
+                continue
+            import numpy as _np
+
+            steps_s = sorted(data.keys())
+            means = []
+            stds = []
+            for step in steps_s:
+                vals = [v for v in data[step].values() if v == v]
+                if vals:
+                    means.append(sum(vals) / len(vals))
+                    stds.append(
+                        (sum((x - means[-1]) ** 2 for x in vals) / len(vals)) ** 0.5
+                    )
+                else:
+                    means.append(float("nan"))
+                    stds.append(0)
+            means_a = _np.array(means)
+            stds_a = _np.array(stds)
+            valid = ~_np.isnan(means_a)
+            steps_a = _np.array(steps_s)
+            ax.plot(
+                steps_a[valid],
+                means_a[valid],
+                color=color,
+                lw=1.5,
+                label=f"{lbl} mean",
+            )
+            ax.fill_between(
+                steps_a[valid],
+                (means_a - stds_a)[valid],
+                (means_a + stds_a)[valid],
+                color=color,
+                alpha=0.15,
+            )
+
+        ax.set_xlabel("Step")
+        ax.set_ylabel(ylabel)
+        ax.set_title(f"{description}: cross-layer mean ± std per step")
+        if metric == "imbalance":
+            ax.axhline(0, color="k", lw=0.8, ls="--")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        out = out_dir / f"step_layer_{metric}_combined.png"
+        fig.savefig(out, dpi=150)
+        plt.close(fig)
+        print(f"  [plot] {out}")
+
+
 def plot_layer_timeline(
     runkv_deltas: dict[int, list[float]],
     tightllm_deltas: dict[int, list[float]],
@@ -2424,10 +2667,21 @@ def main() -> None:
     summary_path = rpt.save()
     print(f"\n[done] {summary_path}")
 
+    # ── Collect per-step × per-layer timing ──────────────────────────────────
+    runkv_psl = collect_per_step_layer_timing(runkv_flat, skip)
+    tightllm_psl = collect_per_step_layer_timing(tightllm_flat, skip)
+    print(
+        f"  runkv    per-step-layer metrics : {list(k for k, v in runkv_psl.items() if v)}"
+    )
+    print(
+        f"  tightllm per-step-layer metrics : {list(k for k, v in tightllm_psl.items() if v)}"
+    )
+
     plot_imbalance(runkv_imb, tightllm_imb, out_dir)
     plot_compute_vs_io(runkv_ev, tightllm_ev, out_dir)
     plot_replay_tokens(runkv_rs, tightllm_rs, runkv_deltas, tightllm_deltas, out_dir)
     plot_clean_compute(runkv_kt, tightllm_kt, out_dir)
+    plot_per_step_layer_lines(runkv_psl, tightllm_psl, out_dir)
     plot_layer_timeline(
         runkv_deltas,
         tightllm_deltas,
