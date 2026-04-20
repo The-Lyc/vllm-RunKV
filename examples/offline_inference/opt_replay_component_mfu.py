@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
     parser.add_argument(
         "--planner",
-        choices=["static", "feedback"],
+        choices=["static", "feedback", "tightllm"],
         default="feedback",
         help="Replay planner to use when layer recompute is enabled.",
     )
@@ -51,14 +51,28 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--tightllm-profile-path",
+        default=None,
+        help="Path to TightLLM offline profile JSON (required for --planner tightllm).",
+    )
+    parser.add_argument(
+        "--tightllm-feedback-correction",
+        action="store_true",
+        help="Enable additive feedback correction on top of TightLLM ILP prediction.",
+    )
+    parser.add_argument(
         "--output-dir",
-        default="/tmp/opt_component_mfu",
-        help="Deprecated; JSONL trace emission is disabled.",
+        default=None,
+        help=(
+            "Directory to write per-step JSONL trace files "
+            "(opt_component_mfu_<prefix>_<tag>.jsonl and .flat.jsonl). "
+            "If omitted, no JSONL is emitted."
+        ),
     )
     parser.add_argument(
         "--run-tag",
         default=None,
-        help="Deprecated; JSONL trace emission is disabled.",
+        help="Tag appended to JSONL output filenames. Defaults to timestamp.",
     )
     parser.add_argument(
         "--disable-opt-component-mfu-profiling",
@@ -148,6 +162,8 @@ def make_kv_offload_config(
     num_device_buffers: int,
     planner: str,
     planner_dry_run: bool,
+    tightllm_profile_path: str | None = None,
+    tightllm_feedback_correction: bool = False,
 ) -> dict:
     config = {
         "enabled": True,
@@ -165,6 +181,13 @@ def make_kv_offload_config(
         config["layer_recompute_io_prefix_blocks"] = [int(setting)]
         config["layer_recompute_planner"] = planner
         config["layer_recompute_planner_dry_run"] = planner_dry_run
+        if planner == "tightllm":
+            if not tightllm_profile_path:
+                raise ValueError(
+                    "--tightllm-profile-path is required when --planner=tightllm"
+                )
+            config["tightllm_profile_path"] = tightllm_profile_path
+            config["tightllm_enable_feedback_correction"] = tightllm_feedback_correction
     return config
 
 
@@ -266,8 +289,26 @@ def main() -> None:
 
     mfu_profiler_enabled = not args.disable_opt_component_mfu_profiling
 
+    # Resolve run tag once for the whole invocation (consistent across settings)
+    if args.run_tag:
+        _run_tag = args.run_tag
+    else:
+        from datetime import datetime
+
+        _run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     for setting in parse_prefix_settings(args.prefix_blocks):
         prompts = build_prompts(args.num_prompts, args.prompt_words)
+
+        # Build per-setting JSONL output path if --output-dir was given
+        if mfu_profiler_enabled and args.output_dir:
+            os.makedirs(args.output_dir, exist_ok=True)
+            _mfu_out = os.path.join(
+                args.output_dir,
+                f"opt_component_mfu_{setting}_{_run_tag}.jsonl",
+            )
+        else:
+            _mfu_out = None
 
         with nvtx_range("build_engine", color="purple"):
             engine = build_engine(
@@ -283,9 +324,11 @@ def main() -> None:
                     num_device_buffers=args.num_device_buffers,
                     planner=args.planner,
                     planner_dry_run=args.planner_dry_run,
+                    tightllm_profile_path=args.tightllm_profile_path,
+                    tightllm_feedback_correction=args.tightllm_feedback_correction,
                 ),
                 enable_opt_component_mfu_profiling=mfu_profiler_enabled,
-                opt_component_mfu_output_path=None,
+                opt_component_mfu_output_path=_mfu_out,
                 opt_component_mfu_peak_tflops=args.peak_tflops,
                 max_num_seqs=max(args.num_prompts, 1),
             )
@@ -297,14 +340,34 @@ def main() -> None:
             enable_profiling=args.profile,
         )
 
+        # ---- Collect imbalance statistics from the replay plan provider ----
+        try:
+            model_runner = engine.model_executor.driver_worker.worker.model_runner
+            provider = getattr(model_runner, "replay_plan_provider", None)
+            if provider is not None and hasattr(provider, "get_imbalance_stats"):
+                stats = provider.get_imbalance_stats()
+                if stats and stats.get("count", 0) > 0:
+                    print(f"\n  Imbalance stats ({stats.get('provider', '?')}):")
+                    for k, v in stats.items():
+                        if isinstance(v, float):
+                            print(f"    {k}: {v:.4f}")
+                        else:
+                            print(f"    {k}: {v}")
+        except Exception as e:
+            print(f"  Warning: could not collect imbalance stats: {e}")
+
         del engine
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     print("\nOPT replay run finished.")
-    print("Per-step JSONL and flat JSONL trace emission is disabled.")
-    print("Inspect the Nsight Systems report and NVTX ranges instead.")
+    if mfu_profiler_enabled and args.output_dir:
+        print(
+            f"JSONL traces written to: {args.output_dir}/opt_component_mfu_*_{_run_tag}.jsonl"
+        )
+    else:
+        print("JSONL trace emission disabled (pass --output-dir to enable).")
 
 
 if __name__ == "__main__":

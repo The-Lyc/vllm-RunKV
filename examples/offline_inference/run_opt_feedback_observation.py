@@ -26,19 +26,23 @@ def _model_tag(model: str) -> str:
 def main() -> None:
     root_dir = Path(__file__).resolve().parents[2]
     python_bin = os.environ.get("PYTHON_BIN", sys.executable)
-    model = os.environ.get("MODEL", "/home/lyc/hf_models/opt-2.7b")
+    model = os.environ.get("MODEL", "/home/lyc/hf_models/opt-2.7b-8k")
     output_dir = os.environ.get(
         "OUTPUT_DIR",
         "/home/lyc/inference/vllm/exp_results/opt_feedback_observation",
     )
     prefix_blocks = os.environ.get("PREFIX_BLOCKS", "1000")
-    num_prompts = os.environ.get("NUM_PROMPTS", "4")
-    prompt_words = os.environ.get("PROMPT_WORDS", "2000")
+    num_prompts = os.environ.get("NUM_PROMPTS", "32")
+    prompt_words = os.environ.get("PROMPT_WORDS", "4000")
     max_tokens = os.environ.get("MAX_TOKENS", "32")
     gpu_memory_fraction = os.environ.get("GPU_MEMORY_FRACTION", "0.9")
     num_device_buffers = os.environ.get("NUM_DEVICE_BUFFERS", "3")
     planner = os.environ.get("PLANNER", "feedback")
     dry_run = os.environ.get("DRY_RUN", "1") == "1"
+    tightllm_profile_path = os.environ.get("TIGHTLLM_PROFILE_PATH", "")
+    tightllm_feedback_correction = (
+        os.environ.get("TIGHTLLM_FEEDBACK_CORRECTION", "0") == "1"
+    )
     enable_nvtx = os.environ.get("ENABLE_NVTX", "1") == "1"
     enable_layerwise_nvtx = os.environ.get("ENABLE_LAYERWISE_NVTX", "0") == "1"
     enable_opt_component_mfu = (
@@ -104,6 +108,10 @@ def main() -> None:
     ]
     if dry_run:
         cmd.append("--planner-dry-run")
+    if tightllm_profile_path:
+        cmd.extend(["--tightllm-profile-path", tightllm_profile_path])
+    if tightllm_feedback_correction:
+        cmd.append("--tightllm-feedback-correction")
     if not enable_opt_component_mfu:
         cmd.append("--disable-opt-component-mfu-profiling")
     if not enable_nvtx:
@@ -117,6 +125,9 @@ def main() -> None:
     print(f"  model: {model}")
     print(f"  planner: {planner}")
     print(f"  planner_dry_run: {int(dry_run)}")
+    if planner == "tightllm":
+        print(f"  tightllm_profile: {tightllm_profile_path}")
+        print(f"  tightllm_feedback_correction: {int(tightllm_feedback_correction)}")
     print(f"  opt_component_mfu: {int(enable_opt_component_mfu)}")
     print(f"  nvtx_scopes: {int(enable_nvtx)}")
     print(f"  layerwise_nvtx: {int(enable_layerwise_nvtx)}")
