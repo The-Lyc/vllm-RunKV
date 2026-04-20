@@ -2006,14 +2006,14 @@ class EngineArgs:
     @staticmethod
     def _validate_runkv_layer_recompute_planner(
         raw_value: str,
-    ) -> Literal["static", "feedback"]:
-        allowed = ("static", "feedback")
+    ) -> Literal["static", "feedback", "tightllm"]:
+        allowed = ("static", "feedback", "tightllm")
         if raw_value not in allowed:
             raise ValueError(
                 "Invalid --runkv-layer-recompute-planner: "
                 f"expected one of {allowed}, got '{raw_value}'."
             )
-        return cast(Literal["static", "feedback"], raw_value)
+        return cast(Literal["static", "feedback", "tightllm"], raw_value)
 
     def _check_feature_supported(self, model_config: ModelConfig):
         """Raise an error if the feature is not supported."""

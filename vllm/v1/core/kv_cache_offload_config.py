@@ -57,7 +57,17 @@ class RunKVOffloadConfig:
     )
 
     # Planner mode for dynamic replay. "static" preserves the current behavior.
-    layer_recompute_planner: Literal["static", "feedback"] = "static"
+    # "tightllm" uses an offline-profiled ILP solver (TightLLM, Hu et al. 2025).
+    layer_recompute_planner: Literal["static", "feedback", "tightllm"] = "static"
 
     # When enabled, planner state may update but must not change execution.
     layer_recompute_planner_dry_run: bool = False
+
+    # --- TightLLM planner settings ---
+    # Path to offline profile JSON produced by tightllm_offline_profiler.
+    # Required when layer_recompute_planner == "tightllm".
+    tightllm_profile_path: str | None = None
+
+    # When True, the ILP prediction is refined by a small additive correction
+    # derived from the runtime imbalance signal (compute vs DMA).
+    tightllm_enable_feedback_correction: bool = False
