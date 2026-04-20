@@ -101,9 +101,46 @@ class OPTComponentMFUStepProfiler:
         if self._dynamic_replay_runtime is not None:
             torch.cuda.synchronize()
 
+        if self.output_path is not None:
+            self._write_step_record()
+
         self._layer_imbalance_ms.clear()
         self._layer_controller_updates.clear()
         self._dynamic_replay_runtime = None
+
+    def _write_step_record(self) -> None:
+        """Write one JSONL line (step record) and one flat line per layer."""
+        import json
+
+        layer_records = self._build_layer_records()
+
+        step_record: dict[str, Any] = {
+            "step": self.step_idx,
+            "rank": self.rank,
+            "model_name": self.model_name,
+            "num_reqs": self.num_reqs,
+            "total_scheduled_tokens": self.total_scheduled_tokens,
+            "layers": layer_records,
+        }
+
+        assert self.output_path is not None
+        # Main JSONL: one line per step (nested layers list)
+        with open(self.output_path, "a") as f:
+            f.write(json.dumps(step_record) + "\n")
+
+        # Flat JSONL: one line per (step, layer) — easier for per-layer analysis
+        flat_path = self.output_path.with_suffix("").with_suffix(".flat.jsonl")
+        with open(flat_path, "a") as f:
+            for lr in layer_records:
+                flat_rec = {
+                    "step": self.step_idx,
+                    "rank": self.rank,
+                    "model_name": self.model_name,
+                    "num_reqs": self.num_reqs,
+                    "total_scheduled_tokens": self.total_scheduled_tokens,
+                    **lr,
+                }
+                f.write(json.dumps(flat_rec) + "\n")
 
     def _build_layer_records(self) -> list[dict[str, Any]]:
         per_layer: dict[int, dict[str, Any]] = {}
@@ -118,34 +155,68 @@ class OPTComponentMFUStepProfiler:
                 replay_token_count = None
                 num_actual_tokens = None
                 num_tokens = None
+                cpu_fill_token_count = None
+                gpu_reuse_token_count = None
                 if plan is not None:
                     replay_ratio, replay_token_count, num_actual_tokens = (
                         _replay_stats_from_plan(plan)
                     )
                     num_tokens = int(plan.scheduled_token_count)
+                    cpu_fill_token_count = int(plan.cpu_fill_token_count)
+                    gpu_reuse_token_count = int(plan.gpu_reuse_token_count)
 
                 layer_entry: dict[str, Any] = {
                     "layer_idx": layer_idx,
                     "next_layer_idx": layer_idx + 1,
+                    "compute_start_ms_from_anchor": None,
+                    "forward_start_ms_from_anchor": None,
                     "compute_end_ms_from_anchor": None,
+                    "load_start_ms_from_anchor": None,
                     "load_ready_ms_from_anchor": None,
+                    "kv_ready_ms_from_anchor": None,
+                    "hs_ready_ms_from_anchor": None,
                     "imbalance_ms": runtime.get_layer_imbalance_ms(layer_idx),
                     # Feedback controller budget update for this layer.
                     # None when planner != "feedback" or no feedback observed.
                     "controller_update": self._layer_controller_updates.get(layer_idx),
                     "replay_ratio": replay_ratio,
                     "replay_token_count": replay_token_count,
+                    "cpu_fill_token_count": cpu_fill_token_count,
+                    "gpu_reuse_token_count": gpu_reuse_token_count,
                     "num_actual_tokens": num_actual_tokens,
                     "num_tokens": num_tokens,
                 }
                 per_layer[layer_idx] = layer_entry
 
-                # compute_end from layer_end_event (on compute stream)
                 if step_anchor is not None:
+                    # compute_start from layer_start_event (on compute stream)
+                    compute_start = runtime.get_layer_start_event(layer_idx)
+                    if compute_start is not None:
+                        layer_entry["compute_start_ms_from_anchor"] = float(
+                            step_anchor.elapsed_time(compute_start)
+                        )
+
+                    # forward_start: right before layer() call, after
+                    # cpu_fill sync and tensor scatter (on compute stream)
+                    forward_start = runtime.get_layer_forward_start_event(layer_idx)
+                    if forward_start is not None:
+                        layer_entry["forward_start_ms_from_anchor"] = float(
+                            step_anchor.elapsed_time(forward_start)
+                        )
+
+                    # compute_end from layer_end_event (on compute stream)
                     compute_end = runtime.get_layer_end_event(layer_idx)
                     if compute_end is not None:
                         layer_entry["compute_end_ms_from_anchor"] = float(
                             step_anchor.elapsed_time(compute_end)
+                        )
+
+                # load_start and load_ready for this layer (on load stream)
+                if step_anchor is not None:
+                    load_start = runtime.get_layer_load_start_event(layer_idx)
+                    if load_start is not None:
+                        layer_entry["load_start_ms_from_anchor"] = float(
+                            step_anchor.elapsed_time(load_start)
                         )
 
                 # load_ready for the *next* layer (on load stream)
@@ -157,6 +228,16 @@ class OPTComponentMFUStepProfiler:
                 if step_anchor is not None:
                     load_ready = runtime.get_layer_load_ready_event(next_layer_idx)
                     hs_ready = runtime.get_layer_cpu_fill_ready_event(next_layer_idx)
+                    # Record separate KV-DMA and HS-DMA ready timestamps
+                    if load_ready is not None:
+                        layer_entry["kv_ready_ms_from_anchor"] = float(
+                            step_anchor.elapsed_time(load_ready)
+                        )
+                    if hs_ready is not None:
+                        layer_entry["hs_ready_ms_from_anchor"] = float(
+                            step_anchor.elapsed_time(hs_ready)
+                        )
+                    # Combined: whichever finishes last
                     final_ready = hs_ready or load_ready
                     if final_ready is not None:
                         layer_entry["load_ready_ms_from_anchor"] = float(
