@@ -117,6 +117,12 @@ class EngineCore:
         vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
         self.collective_rpc("initialize_cache", args=(num_gpu_blocks, num_cpu_blocks))
 
+        # RunKV: propagate GPU staging capacity to scheduler via config.
+        staging_blocks_list = self.collective_rpc("get_staging_blocks")
+        positive = [b for b in staging_blocks_list if b > 0]
+        if positive:
+            vllm_config.cache_config.num_staging_blocks = min(positive)
+
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
         # Setup scheduler.

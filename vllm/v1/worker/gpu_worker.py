@@ -180,6 +180,10 @@ class Worker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
+    def get_staging_blocks(self) -> int:
+        """Return per-buffer staging capacity (blocks). 0 if not RunKV."""
+        return getattr(self.model_runner, "_staging_blocks_per_buffer", 0)
+
     def init_device(self):
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.

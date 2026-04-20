@@ -128,6 +128,9 @@ class CacheConfig:
     """The number of blocks to allocate for GPU memory."""
     num_cpu_blocks: int | None = field(default=None, init=False)
     """The number of blocks to allocate for CPU memory."""
+    num_staging_blocks: int | None = field(default=None, init=False)
+    """RunKV only: max blocks per GPU staging buffer. Scheduler uses this
+    to limit unique blocks per step and avoid GPU staging overflow."""
 
     kv_sharing_fast_prefill: bool = False
     """This feature is work in progress and no prefill optimization takes place
@@ -184,6 +187,7 @@ class CacheConfig:
             # Post-init/derived counters
             "num_gpu_blocks",
             "num_cpu_blocks",
+            "num_staging_blocks",
             # WIP feature toggle not impacting compiled graph shape
             "kv_sharing_fast_prefill",
         }

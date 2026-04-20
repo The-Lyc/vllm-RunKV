@@ -106,6 +106,10 @@ class WorkerBase:
         """Initialize the KV cache with the given size in blocks."""
         raise NotImplementedError
 
+    def get_staging_blocks(self) -> int:
+        """Return per-buffer staging capacity (blocks). 0 if not RunKV."""
+        return 0
+
     def reset_mm_cache(self) -> None:
         reset_fn = getattr(self.model_runner, "reset_mm_cache", None)
         if callable(reset_fn):

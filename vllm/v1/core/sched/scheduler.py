@@ -98,6 +98,8 @@ class Scheduler(SchedulerInterface):
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
         self.max_num_scheduled_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_model_len = vllm_config.model_config.max_model_len
+        # RunKV: GPU staging buffer capacity (blocks). None = no limit.
+        self.max_staging_blocks: int | None = self.cache_config.num_staging_blocks
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events
@@ -244,6 +246,9 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        # RunKV: track estimated unique blocks to stay within GPU staging.
+        staging_block_budget = self.max_staging_blocks  # None = unlimited
+        num_scheduled_blocks: dict[str, int] = {}  # req_id -> est. blocks
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         encoder_compute_budget = self.max_num_encoder_input_tokens
@@ -323,6 +328,18 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            # RunKV: skip this request if it would exceed GPU staging
+            # capacity.  Unlike CPU-block preempt we do NOT free its blocks
+            # -- the KV data stays in CPU back store so it can resume
+            # immediately once staging budget is available.
+            if staging_block_budget is not None:
+                req_blocks = (
+                    request.num_computed_tokens + num_new_tokens + self.block_size - 1
+                ) // self.block_size
+                if req_blocks > staging_block_budget:
+                    req_index += 1
+                    continue
+
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
@@ -365,6 +382,12 @@ class Scheduler(SchedulerInterface):
                                     for i in preempted_encoder_inputs
                                 )
                                 encoder_compute_budget += num_embeds_to_restore
+                            # Restore staging budget for skipped request.
+                            if staging_block_budget is not None:
+                                skipped_blocks = num_scheduled_blocks.pop(
+                                    preempted_req.request_id, 0
+                                )
+                                staging_block_budget += skipped_blocks
                             req_index -= 1
                     else:
                         preempted_req = self.running.pop()
@@ -384,6 +407,13 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
+            # Track staging block usage.
+            if staging_block_budget is not None:
+                req_blocks = (
+                    request.num_computed_tokens + num_new_tokens + self.block_size - 1
+                ) // self.block_size
+                num_scheduled_blocks[request.request_id] = req_blocks
+                staging_block_budget -= req_blocks
             req_index += 1
 
             # Speculative decode related.
@@ -585,6 +615,14 @@ class Scheduler(SchedulerInterface):
                     else 0
                 )
 
+                # RunKV: check staging budget before allocating.
+                if staging_block_budget is not None:
+                    req_blocks = (
+                        num_computed_tokens + num_new_tokens + self.block_size - 1
+                    ) // self.block_size
+                    if req_blocks > staging_block_budget:
+                        break
+
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -642,6 +680,13 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                # Track staging block usage.
+                if staging_block_budget is not None:
+                    req_blocks = (
+                        num_computed_tokens + num_new_tokens + self.block_size - 1
+                    ) // self.block_size
+                    num_scheduled_blocks[request.request_id] = req_blocks
+                    staging_block_budget -= req_blocks
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
