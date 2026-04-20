@@ -24,7 +24,6 @@ reuses the existing budget allocator and plan builder infrastructure.
 
 from __future__ import annotations
 
-import math
 import statistics
 from dataclasses import dataclass, field
 from typing import Any
@@ -272,9 +271,7 @@ class TightLLMReplayPlanProvider:
         # Phase detection: decode-only if all requests have computed_lens > 0
         # (i.e. no fresh prefill requests in this batch)
         if num_reqs > 0:
-            self._current_step_is_decode_only = bool(
-                np.all(computed_lens > 0)
-            )
+            self._current_step_is_decode_only = bool(np.all(computed_lens > 0))
         else:
             self._current_step_is_decode_only = True
 
@@ -342,9 +339,7 @@ class TightLLMReplayPlanProvider:
             )
         _nvtx.range_pop()  # tightllm:begin_step
 
-    def observe_layer_feedback(
-        self, layer_idx: int, imbalance_ms: float
-    ) -> None:
+    def observe_layer_feedback(self, layer_idx: int, imbalance_ms: float) -> None:
         """Record runtime imbalance and optionally apply additive correction.
 
         imbalance_ms > 0  → transfer is slower → should increase replay
@@ -455,16 +450,12 @@ class TightLLMReplayPlanProvider:
         return {
             f"{label}_count": len(hist),
             f"{label}_mean_ms": statistics.mean(hist),
-            f"{label}_stdev_ms": (
-                statistics.stdev(hist) if len(hist) >= 2 else 0.0
-            ),
+            f"{label}_stdev_ms": (statistics.stdev(hist) if len(hist) >= 2 else 0.0),
             f"{label}_abs_mean_ms": statistics.mean(abs_hist),
             f"{label}_abs_max_ms": max(abs_hist),
             f"{label}_median_ms": statistics.median(hist),
             f"{label}_p95_ms": sorted(abs_hist)[int(len(abs_hist) * 0.95)],
-            f"{label}_positive_ratio": (
-                sum(1 for v in hist if v > 0) / len(hist)
-            ),
+            f"{label}_positive_ratio": (sum(1 for v in hist if v > 0) / len(hist)),
         }
 
     def get_imbalance_stats(self) -> dict[str, Any]:
@@ -488,9 +479,7 @@ class TightLLMReplayPlanProvider:
             "p95_ms": sorted(abs_hist)[int(len(abs_hist) * 0.95)],
             "positive_ratio": sum(1 for v in hist if v > 0) / len(hist),
             "budget_mean": (
-                statistics.mean(self._budget_history)
-                if self._budget_history
-                else 0.0
+                statistics.mean(self._budget_history) if self._budget_history else 0.0
             ),
             "budget_stdev": (
                 statistics.stdev(self._budget_history)

@@ -24,10 +24,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import torch
@@ -121,7 +119,9 @@ class TightLLMProfileData:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         data = {
-            "mfu_attn_by_seqlen": {str(k): v for k, v in self.mfu_attn_by_seqlen.items()},
+            "mfu_attn_by_seqlen": {
+                str(k): v for k, v in self.mfu_attn_by_seqlen.items()
+            },
             "mfu_ffn_by_seqlen": {str(k): v for k, v in self.mfu_ffn_by_seqlen.items()},
             "pcie_bandwidth_h2d": self.pcie_bandwidth_h2d,
             "gpu_peak_flops": self.gpu_peak_flops,
@@ -142,7 +142,9 @@ class TightLLMProfileData:
         with open(path) as f:
             data = json.load(f)
         return cls(
-            mfu_attn_by_seqlen={int(k): v for k, v in data["mfu_attn_by_seqlen"].items()},
+            mfu_attn_by_seqlen={
+                int(k): v for k, v in data["mfu_attn_by_seqlen"].items()
+            },
             mfu_ffn_by_seqlen={int(k): v for k, v in data["mfu_ffn_by_seqlen"].items()},
             pcie_bandwidth_h2d=data["pcie_bandwidth_h2d"],
             gpu_peak_flops=data["gpu_peak_flops"],
@@ -254,7 +256,9 @@ def profile_mfu_attn(
             continue
         try:
             x = torch.randn(1, seq_len, hidden_size, device=device, dtype=dtype)
-            w_qkv = torch.randn(hidden_size, 3 * hidden_size, device=device, dtype=dtype)
+            w_qkv = torch.randn(
+                hidden_size, 3 * hidden_size, device=device, dtype=dtype
+            )
             w_out = torch.randn(hidden_size, hidden_size, device=device, dtype=dtype)
 
             def _run():
@@ -264,8 +268,8 @@ def profile_mfu_attn(
                 k = k.view(1, seq_len, num_heads, head_dim).transpose(1, 2)
                 v = v.view(1, seq_len, num_heads, head_dim).transpose(1, 2)
                 attn_out = F.scaled_dot_product_attention(q, k, v)
-                attn_out = attn_out.transpose(1, 2).contiguous().view(
-                    1, seq_len, hidden_size
+                attn_out = (
+                    attn_out.transpose(1, 2).contiguous().view(1, seq_len, hidden_size)
                 )
                 return torch.matmul(attn_out, w_out)
 
@@ -302,7 +306,9 @@ def profile_mfu_attn(
             torch.cuda.empty_cache()
 
         except torch.cuda.OutOfMemoryError:
-            logger.warning("OOM at seq_len=%d during attention profiling, skipping.", seq_len)
+            logger.warning(
+                "OOM at seq_len=%d during attention profiling, skipping.", seq_len
+            )
             torch.cuda.empty_cache()
             break
 
