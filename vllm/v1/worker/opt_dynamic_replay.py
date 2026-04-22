@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 import statistics as _statistics
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -1002,6 +1003,15 @@ class OPTDynamicReplayRuntime:
     _layer_cpu_fill_ready_events: list[torch.cuda.Event | None] = field(init=False)
     _layer_forward_start_events: list[torch.cuda.Event | None] = field(init=False)
     _layer_imbalance_ms: list[float | None] = field(init=False)
+    _qkv_end_events: list[torch.cuda.Event | None] = field(init=False)
+    _speculative_plans: list[LayerReplayPlan | None] = field(init=False)
+    _speculative_metadata: list[dict[str, Any] | None] = field(init=False)
+    _speculative_skip_ids: list[set[int] | None] = field(init=False)
+    _layer_skip_ids: list[set[int] | None] = field(init=False)
+    _last_observe_action: str | None = field(init=False, default=None)
+    _builder_fn: Callable[..., None] | None = field(init=False, default=None)
+    _builder_executor: ThreadPoolExecutor = field(init=False)
+    _speculative_futures: dict[int, Future] = field(init=False)
 
     def __post_init__(self) -> None:
         self._layer_plans = [None] * self.num_layers
@@ -1013,6 +1023,131 @@ class OPTDynamicReplayRuntime:
         self._layer_cpu_fill_ready_events = [None] * self.num_layers
         self._layer_forward_start_events = [None] * self.num_layers
         self._layer_imbalance_ms = [None] * self.num_layers
+        self._qkv_end_events = [None] * self.num_layers
+        self._speculative_plans = [None] * self.num_layers
+        self._speculative_metadata = [None] * self.num_layers
+        self._speculative_skip_ids = [None] * self.num_layers
+        self._layer_skip_ids = [None] * self.num_layers
+        self._speculative_futures = {}
+        self._builder_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="runkv-spec-builder",
+        )
+
+    def close(self) -> None:
+        """Shutdown the background builder thread pool gracefully."""
+        self._builder_executor.shutdown(wait=False, cancel_futures=True)
+
+    # ---- qkv_end_event ----
+
+    def set_qkv_end_event(self, layer_idx: int, event: torch.cuda.Event | None) -> None:
+        self._qkv_end_events[layer_idx] = event
+
+    def get_qkv_end_event(self, layer_idx: int) -> torch.cuda.Event | None:
+        return self._qkv_end_events[layer_idx]
+
+    # ---- per-layer skip_ids (for steady-state reuse) ----
+
+    def set_layer_skip_ids(self, layer_idx: int, skip_ids: set[int] | None) -> None:
+        self._layer_skip_ids[layer_idx] = skip_ids
+
+    def get_layer_skip_ids(self, layer_idx: int) -> set[int] | None:
+        return self._layer_skip_ids[layer_idx]
+
+    # ---- speculative plan/metadata/skip_ids storage ----
+
+    def set_speculative(
+        self,
+        layer_idx: int,
+        plan: LayerReplayPlan,
+    ) -> None:
+        """Called from builder thread to store the speculative plan.
+        Only the plan is stored; metadata and H2D transfers are performed
+        on the main thread after pop_speculative().
+        """
+        self._speculative_plans[layer_idx] = plan
+
+    def pop_speculative(
+        self,
+        layer_idx: int,
+        timeout_ms: float = 50.0,
+    ) -> LayerReplayPlan | None:
+        """Block until the speculative future completes (expected: instant),
+        then pop and return the speculative plan, or None if nothing was
+        submitted for this layer.
+        """
+        fut = self._speculative_futures.pop(layer_idx, None)
+        if fut is not None:
+            try:
+                fut.result(timeout=timeout_ms / 1000.0)
+            except TimeoutError:
+                fut.result()  # unbounded fallback
+        plan = self._speculative_plans[layer_idx]
+        self._speculative_plans[layer_idx] = None
+        self._speculative_metadata[layer_idx] = None
+        self._speculative_skip_ids[layer_idx] = None
+        return plan
+
+    def clear_speculative(self, layer_idx: int) -> None:
+        """Discard a pending speculative future (steady-state path).
+        Non-blocking: cancels and forgets without waiting.
+        """
+        fut = self._speculative_futures.pop(layer_idx, None)
+        if fut is not None:
+            fut.cancel()
+        self._speculative_plans[layer_idx] = None
+        self._speculative_metadata[layer_idx] = None
+        self._speculative_skip_ids[layer_idx] = None
+
+    # ---- deadband / steady-state cache ----
+
+    def note_observe_action(self, action: str | None) -> None:
+        prev = self._last_observe_action
+        self._last_observe_action = action
+        # Promote to "stable" once we see two consecutive deadband observations.
+        # After two deadband steps, plan(L-1).kv_replay_start ==
+        # plan(L).kv_replay_start,
+        # so gpu_reuse_slice_per_req is identical across layers and plan reuse is safe.
+        if (
+            action == "deadband"
+            and prev == "deadband"
+            or action == "deadband"
+            and prev == "stable"
+        ):
+            self._last_observe_action = "stable"
+
+    def last_observed_stable(self) -> bool:
+        """True when plans have converged: safe to reuse plan(L) as plan(L+1)."""
+        # TEMP DIAGNOSTIC: force non-steady path to isolate whether the
+        # assertion "Expected N replay tokens but assembled M" is caused by
+        # steady-state reuse of plan(L) as plan(L+1).
+        return False
+
+    def last_observed_in_deadband(self) -> bool:
+        return self._last_observe_action in ("deadband", "stable")
+
+    # ---- speculative builder ----
+
+    def bind_speculative_builder(self, builder_fn: Callable[..., None]) -> None:
+        self._builder_fn = builder_fn
+
+    def submit_speculative_build(
+        self, target_layer_idx: int, current_plan: LayerReplayPlan
+    ) -> None:
+        """Submit a non-blocking speculative build for *target_layer_idx*."""
+        assert self._builder_fn is not None, (
+            "bind_speculative_builder() must be called "
+            "before submit_speculative_build()"
+        )
+        future = self._builder_executor.submit(
+            self._builder_fn,
+            target_layer_idx,
+            current_plan,
+            self,
+        )
+        self._speculative_futures[target_layer_idx] = future
+
+    # ---- layer plan ----
 
     def get_layer_plan(self, layer_idx: int) -> LayerReplayPlan:
         plan = self._layer_plans[layer_idx]

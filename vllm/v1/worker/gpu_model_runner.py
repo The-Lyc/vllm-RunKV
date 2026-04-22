@@ -3134,6 +3134,16 @@ class GPUModelRunner(
                         layer_idx, current_cpu_fill_ready_event
                     )
 
+                    # Record QKV-end event on the compute stream.
+                    # pre_hook fires after QKV proj has been launched but
+                    # before FlashAttn starts, so this event signals when
+                    # the QKV kernel finishes on GPU — used as the new
+                    # imbalance reference point (§ Phase 1).
+                    if self.device.type == "cuda":
+                        _qkv_end_ev = torch.cuda.Event(enable_timing=True)
+                        _qkv_end_ev.record()  # default = compute stream
+                        runtime.set_qkv_end_event(layer_idx, _qkv_end_ev)
+
                     # ---- TIMING: sync_wait ----
                     if _timing:
                         _t0 = _time.perf_counter()
@@ -3153,9 +3163,9 @@ class GPUModelRunner(
                     if _timing:
                         _t0 = _time.perf_counter()
                     if layer_idx > 0 and self.device.type == "cuda":
-                        prev_end_event = runtime.get_layer_end_event(layer_idx - 1)
+                        qkv_end_event = runtime.get_qkv_end_event(layer_idx)
                         step_anchor_event = runtime.get_step_anchor_event()
-                        if prev_end_event is not None and step_anchor_event is not None:
+                        if qkv_end_event is not None and step_anchor_event is not None:
                             final_ready_event = (
                                 current_cpu_fill_ready_event or current_load_ready_event
                             )
@@ -3164,28 +3174,41 @@ class GPUModelRunner(
                                 # same load stream. If CPU-fill exists, its event is
                                 # recorded after the KV load on that same stream and
                                 # therefore already represents the final ready point.
-                                prev_end_event.synchronize()
+                                # New reference point: QKV-end(L) instead of
+                                # layer_end(L-1), giving IO ~1.5ms extra overlap.
+                                qkv_end_event.synchronize()
                                 final_ready_event.synchronize()
-                                end_ms = float(
-                                    step_anchor_event.elapsed_time(prev_end_event)
+                                qkv_ms = float(
+                                    step_anchor_event.elapsed_time(qkv_end_event)
                                 )
                                 ready_ms = float(
                                     step_anchor_event.elapsed_time(final_ready_event)
                                 )
-                                imbalance_ms = ready_ms - end_ms
-                                runtime.set_layer_imbalance_ms(
-                                    layer_idx - 1, imbalance_ms
-                                )
+                                imbalance_ms = ready_ms - qkv_ms
+                                runtime.set_layer_imbalance_ms(layer_idx, imbalance_ms)
+                                if isinstance(
+                                    self.replay_plan_provider,
+                                    (
+                                        FeedbackReplayPlanProvider,
+                                        TightLLMReplayPlanProvider,
+                                    ),
+                                ):
+                                    self.replay_plan_provider.observe_layer_feedback(
+                                        layer_idx=layer_idx,
+                                        imbalance_ms=imbalance_ms,
+                                    )
+                                # Cache the observe action for steady-state branch.
                                 if isinstance(
                                     self.replay_plan_provider,
                                     FeedbackReplayPlanProvider,
-                                ) or isinstance(
-                                    self.replay_plan_provider,
-                                    TightLLMReplayPlanProvider,
                                 ):
-                                    self.replay_plan_provider.observe_layer_feedback(
-                                        layer_idx=layer_idx - 1,
-                                        imbalance_ms=imbalance_ms,
+                                    _ctrl_upd_ss = self.replay_plan_provider.get_layer_controller_update(
+                                        layer_idx
+                                    )
+                                    runtime.note_observe_action(
+                                        _ctrl_upd_ss.action
+                                        if _ctrl_upd_ss is not None
+                                        else None
                                     )
                                 additional_kwargs = (
                                     forward_context.additional_kwargs or {}
@@ -3198,7 +3221,7 @@ class GPUModelRunner(
                                     OPTComponentMFUStepProfiler,
                                 ):
                                     opt_component_profiler.set_layer_imbalance_ms(
-                                        layer_idx - 1, imbalance_ms
+                                        layer_idx, imbalance_ms
                                     )
                                     # Forward the controller's per-layer
                                     # budget update to the profiler so it
@@ -3208,11 +3231,12 @@ class GPUModelRunner(
                                         FeedbackReplayPlanProvider,
                                     ):
                                         _ctrl_upd = self.replay_plan_provider.get_layer_controller_update(
-                                            layer_idx - 1
+                                            layer_idx
                                         )
                                         if _ctrl_upd is not None:
-                                            opt_component_profiler.set_layer_controller_update(
-                                                layer_idx - 1,
+                                            _profiler = opt_component_profiler
+                                            _profiler.set_layer_controller_update(
+                                                layer_idx,
                                                 _ctrl_upd.to_dict(),
                                             )
                     if _timing:
@@ -3221,97 +3245,127 @@ class GPUModelRunner(
 
                     next_layer_info = self._get_next_layer_info(layer_idx)
 
-                    # ---- TIMING: build_plan ----
+                    # ---- TIMING: build_plan / build_metadata / skip_ids ----
+                    # Two-branch: steady-state reuses current-layer plan/meta/skip
+                    # (zero CPU cost); non-steady-state consumes the speculative
+                    # result built off-critical-path after the previous layer.
                     _nvtx_plan = record_function_or_nullcontext(
                         f"runkv:prehook:build_plan:L{layer_idx}"
                     )
                     _nvtx_plan.__enter__()
                     if _timing:
                         _t0 = _time.perf_counter()
+
+                    next_plan: LayerReplayPlan | None = None
+                    next_metadata: AttnMetadataDict | None = None
+                    next_skip_block_ids: set[int] | None = None
+
                     if next_layer_info is not None:
                         next_layer_name, next_layer_idx, next_gid = next_layer_info
-                        next_plan = self._build_dynamic_layer_plan(
-                            layer_idx=next_layer_idx,
-                            gid=next_gid,
-                            num_reqs=self._lr_num_reqs,
-                            num_scheduled_tokens_np=self._lr_num_scheduled_tokens_np,
-                            prev_layer_plan=current_plan,
-                        )
+                        next_mapper = self.paged_block_mappers[next_gid]
+
+                        if runtime.last_observed_stable():
+                            # True steady-state: two consecutive deadband
+                            # observations guarantee plan(L-1).kv_replay_start
+                            # == plan(L).kv_replay_start, so gpu_reuse_slice
+                            # offsets in plan(L) are valid against replay(L)
+                            # and plan reuse is safe.
+                            next_plan = runtime.get_layer_plan(layer_idx)
+                            next_metadata = runtime.get_layer_metadata(layer_idx)
+                            next_skip_block_ids = runtime.get_layer_skip_ids(layer_idx)
+                            # Discard the pending spec future — it won't be used.
+                            runtime.clear_speculative(next_layer_idx)
+                        else:
+                            # Non-stable: spec plan was built off-critical-path
+                            # at end of layer(L-1). Metadata and H2D transfers
+                            # are completed here on the main thread.
+                            spec_plan = runtime.pop_speculative(next_layer_idx)
+                            if spec_plan is not None:
+                                next_plan = spec_plan
+                            else:
+                                # Defensive fallback: bootstrap or builder error.
+                                if not getattr(
+                                    self,
+                                    "_dynamic_replay_spec_fallback_logged",
+                                    False,
+                                ):
+                                    logger.warning(
+                                        "RunKV dynamic replay: spec(L%d) missing at "
+                                        "pre_hook(L%d); falling back to synchronous "
+                                        "build.",
+                                        next_layer_idx,
+                                        layer_idx,
+                                    )
+                                    self._dynamic_replay_spec_fallback_logged = True
+                                next_plan = self._build_dynamic_layer_plan(
+                                    layer_idx=next_layer_idx,
+                                    gid=next_gid,
+                                    num_reqs=self._lr_num_reqs,
+                                    num_scheduled_tokens_np=(
+                                        self._lr_num_scheduled_tokens_np
+                                    ),
+                                    prev_layer_plan=current_plan,
+                                )
+                            # Metadata + H2D always on main thread.
+                            assert next_plan is not None
+                            next_metadata = self._build_layer_attn_metadata(
+                                layer_idx=next_layer_idx,
+                                plan=next_plan,
+                                prev_plan=current_plan,
+                                prev_metadata=current_metadata,
+                                base_seq_lens=self.seq_lens.cpu,
+                                base_max_seq_len=(
+                                    int(np.max(self.seq_lens.np[: self._lr_num_reqs]))
+                                    if self._lr_num_reqs > 0
+                                    else 0
+                                ),
+                                block_table_tensor=self.paged_block_tables[next_gid],
+                                num_reqs=self._lr_num_reqs,
+                            )
+                            _use_plan_skip_fb = (
+                                isinstance(
+                                    self.replay_plan_provider,
+                                    FeedbackReplayPlanProvider,
+                                )
+                                and not self.replay_plan_provider.dry_run
+                            ) or isinstance(
+                                self.replay_plan_provider,
+                                TightLLMReplayPlanProvider,
+                            )
+                            if _use_plan_skip_fb:
+                                next_skip_block_ids = (
+                                    manager.compute_skip_block_ids_from_plan(next_plan)
+                                )
+                            else:
+                                next_skip_block_ids = manager.compute_skip_block_ids_for_layer(
+                                    layer_idx=next_layer_idx,
+                                    gid=next_gid,
+                                    mapper=next_mapper,
+                                    dirty_blocks=(self.paged_dirty_blocks[next_gid]),
+                                    io_prefix_blocks=(
+                                        self.kv_offload_config.layer_recompute_io_prefix_blocks
+                                    ),
+                                )
+
+                        # Store plan + metadata + skip_ids for this next layer,
+                        # and cache skip_ids so a later steady-state branch can
+                        # reuse them.
+                        assert next_plan is not None and next_metadata is not None
                         runtime.set_layer_plan(next_layer_idx, next_plan)
+                        runtime.set_layer_metadata(next_layer_idx, next_metadata)
+                        runtime.set_layer_skip_ids(next_layer_idx, next_skip_block_ids)
+
                     if _timing:
                         self._prehook_t_build_plan += _time.perf_counter() - _t0
                     _nvtx_plan.__exit__(None, None, None)
 
-                    # ---- TIMING: build_metadata ----
-                    _nvtx_meta = record_function_or_nullcontext(
-                        f"runkv:prehook:build_metadata:L{layer_idx}"
-                    )
-                    _nvtx_meta.__enter__()
-                    if _timing:
-                        _t0 = _time.perf_counter()
-                    if next_layer_info is not None:
-                        next_metadata = self._build_layer_attn_metadata(
-                            layer_idx=next_layer_idx,
-                            plan=next_plan,
-                            prev_plan=current_plan,
-                            prev_metadata=current_metadata,
-                            base_seq_lens=self.seq_lens.cpu,
-                            base_max_seq_len=(
-                                int(np.max(self.seq_lens.np[: self._lr_num_reqs]))
-                                if self._lr_num_reqs > 0
-                                else 0
-                            ),
-                            block_table_tensor=self.paged_block_tables[next_gid],
-                            num_reqs=self._lr_num_reqs,
-                        )
-                        runtime.set_layer_metadata(next_layer_idx, next_metadata)
-                    if _timing:
-                        self._prehook_t_build_metadata += _time.perf_counter() - _t0
-                    _nvtx_meta.__exit__(None, None, None)
-
-                    # ---- TIMING: skip_ids ----
+                    # ---- TIMING: skip_ids ---- (retained for timing parity)
                     _nvtx_skip = record_function_or_nullcontext(
                         f"runkv:prehook:skip_ids:L{layer_idx}"
                     )
                     _nvtx_skip.__enter__()
                     if _timing:
                         _t0 = _time.perf_counter()
-                    if next_layer_info is not None:
-                        next_layer_name, next_layer_idx, next_gid = next_layer_info
-                        next_mapper = self.paged_block_mappers[next_gid]
-                        next_plan = runtime.get_layer_plan(next_layer_idx)
-                        # When a dynamic planner (feedback or tightllm) is
-                        # live, derive the skip set from the plan so the IO
-                        # path honours the planner's budget allocation.
-                        # Otherwise fall back to the static io_prefix_blocks.
-                        _use_plan_skip = False
-                        if (
-                            isinstance(
-                                self.replay_plan_provider,
-                                FeedbackReplayPlanProvider,
-                            )
-                            and not self.replay_plan_provider.dry_run
-                            or isinstance(
-                                self.replay_plan_provider,
-                                TightLLMReplayPlanProvider,
-                            )
-                        ):
-                            _use_plan_skip = True
-
-                        if _use_plan_skip:
-                            next_skip_block_ids = (
-                                manager.compute_skip_block_ids_from_plan(next_plan)
-                            )
-                        else:
-                            next_skip_block_ids = manager.compute_skip_block_ids_for_layer(
-                                layer_idx=next_layer_idx,
-                                gid=next_gid,
-                                mapper=next_mapper,
-                                dirty_blocks=(self.paged_dirty_blocks[next_gid]),
-                                io_prefix_blocks=(
-                                    self.kv_offload_config.layer_recompute_io_prefix_blocks
-                                ),
-                            )
                     if _timing:
                         self._prehook_t_skip_ids += _time.perf_counter() - _t0
                     _nvtx_skip.__exit__(None, None, None)
@@ -3320,6 +3374,7 @@ class GPUModelRunner(
                     if _timing:
                         _t0 = _time.perf_counter()
                     if next_layer_info is not None:
+                        assert next_plan is not None
                         if _timing:
                             next_mapper._timing_enabled = True
                             manager._timing_enabled = True
@@ -8194,6 +8249,56 @@ class GPUModelRunner(
             == "prev_layer_output_dynamic"
         )
 
+    def _build_speculative_for_layer_impl(
+        self,
+        target_layer_idx: int,
+        current_plan: LayerReplayPlan,
+        runtime: OPTDynamicReplayRuntime,
+        *,
+        num_reqs: int,
+        num_scheduled_tokens_np: np.ndarray,
+    ) -> None:
+        """Worker-thread implementation for speculative plan building.
+
+        Runs in the single-worker ThreadPoolExecutor owned by *runtime*.
+        Builds ONLY the LayerReplayPlan for *target_layer_idx* (pure CPU work)
+        and stores it via runtime.set_speculative().
+
+        Metadata construction and H2D transfers are intentionally left to the
+        main thread (after pop_speculative) so that CUDA stream ownership is
+        never ambiguous.
+
+        Thread-safety: reads only step-level read-only fields
+        (_runkv_layer_info, input_batch, paged_block_tables, etc.) —
+        no concurrent writes from the main thread during a step.
+        """
+        with record_function_or_nullcontext(
+            f"runkv:speculative_build:L{target_layer_idx}"
+        ):
+            # TEMP DIAGNOSTIC: do NOT swallow builder errors — re-raise so any
+            # silent failure that would have left spec(L) missing surfaces
+            # immediately in the worker thread instead of causing the main
+            # thread to later assemble the wrong number of replay tokens.
+            target_gid: int | None = None
+            for _lname, _lidx, _lgid in self._runkv_layer_info:
+                if _lidx == target_layer_idx:
+                    target_gid = _lgid
+                    break
+            if target_gid is None:
+                raise AssertionError(
+                    f"RunKV speculative build: L{target_layer_idx} is not a "
+                    "registered RunKV layer."
+                )
+
+            spec_plan = self._build_dynamic_layer_plan(
+                layer_idx=target_layer_idx,
+                gid=target_gid,
+                num_reqs=num_reqs,
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
+                prev_layer_plan=current_plan,
+            )
+            runtime.set_speculative(target_layer_idx, spec_plan)
+
     def _build_dynamic_layer_plan(
         self,
         *,
@@ -8351,6 +8456,33 @@ class GPUModelRunner(
                 int(layer0_plan.scheduled_token_count),
             )
             self._dynamic_replay_runtime_logged = True
+
+        # ---- Bind speculative builder callback ----
+        runtime.bind_speculative_builder(
+            functools.partial(
+                self._build_speculative_for_layer_impl,
+                num_reqs=num_reqs,
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
+            )
+        )
+
+        # ---- Cache layer-0 skip_ids for steady-state reuse ----
+        runtime.set_layer_skip_ids(layer0_idx, skip_block_ids)
+
+        # ---- Bootstrap spec(1) for pre_hook(0) non-steady branch ----
+        # pre_hook(0) has never called observe_feedback, so
+        # last_observed_in_deadband() == False → it will walk the
+        # non-steady branch and pop_speculative(layer1_idx).
+        if len(self._runkv_layer_info) >= 2:
+            _layer1_name, layer1_idx, _layer1_gid = self._runkv_layer_info[1]
+            runtime.submit_speculative_build(
+                target_layer_idx=layer1_idx,
+                current_plan=layer0_plan,
+            )
+            logger.debug(
+                "RunKV dynamic replay: submitted bootstrap spec build for L%d.",
+                layer1_idx,
+            )
 
         return runtime
 

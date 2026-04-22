@@ -506,6 +506,15 @@ class OPTDecoder(nn.Module):
                 layer_end_event.record()
             runtime.set_layer_end_event(layer_idx, layer_end_event)
 
+            # ---- Speculative build for L+2 — non-blocking ----
+            # plan(L+1) was written by pre_hook(L) before GPU layer(L) started,
+            # so it is already available here as the correct prev_layer_plan.
+            if layer_idx + 2 < self.end_layer:
+                runtime.submit_speculative_build(
+                    target_layer_idx=layer_idx + 2,
+                    current_plan=runtime.get_layer_plan(layer_idx + 1),
+                )
+
             runtime.capture_scheduled_layer_input(
                 target_layer_idx=layer_idx + 1,
                 hidden_states=scheduled_hidden_states,
