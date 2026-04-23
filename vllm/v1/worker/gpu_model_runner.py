@@ -173,6 +173,7 @@ from vllm.v1.worker.opt_dynamic_replay import (
     OPTDynamicReplayRuntime,
     ReplayPlanProvider,
     StaticReplayPlanProvider,
+    build_stable_successor_plan,
 )
 from vllm.v1.worker.runkv_debug import (
     DebugWriter,
@@ -1297,6 +1298,9 @@ class GPUModelRunner(
         self._runkv_debug_level = runkv_debug_level()
         self._runkv_debug_writer: DebugWriter | None = None
         self._runkv_debug_step_counter: int = 0
+        # Forward-pass counter for dynamic-replay diagnostic logs. Incremented
+        # at the first layer's pre_hook each forward, regardless of debug mode.
+        self._dynamic_replay_step_id: int = -1
         # Per-step state stashed by _prepare_inputs for hooks to consume
         self._debug_step_record: StepRecord | None = None
         self._debug_req_indices_np: np.ndarray | None = None
@@ -3101,6 +3105,8 @@ class GPUModelRunner(
 
                     current_plan = runtime.get_layer_plan(layer_idx)
                     current_metadata = runtime.get_layer_metadata(layer_idx)
+                    if layer_idx == 0:
+                        self._dynamic_replay_step_id += 1
                     if not getattr(
                         self,
                         "_dynamic_replay_prehook_logged",
@@ -3264,15 +3270,74 @@ class GPUModelRunner(
                         next_layer_name, next_layer_idx, next_gid = next_layer_info
                         next_mapper = self.paged_block_mappers[next_gid]
 
-                        if runtime.last_observed_stable():
-                            # True steady-state: two consecutive deadband
-                            # observations guarantee plan(L-1).kv_replay_start
-                            # == plan(L).kv_replay_start, so gpu_reuse_slice
-                            # offsets in plan(L) are valid against replay(L)
-                            # and plan reuse is safe.
-                            next_plan = runtime.get_layer_plan(layer_idx)
-                            next_metadata = runtime.get_layer_metadata(layer_idx)
-                            next_skip_block_ids = runtime.get_layer_skip_ids(layer_idx)
+                        # Stable reuse requires the *structural* invariant
+                        # plan(L-1).replay_token_count == plan(L).replay_token_count
+                        # so that plan(L).gpu_reuse_slice (bounded by plan(L-1)
+                        # replay length at build time) is valid when consumed
+                        # against replay(L). Two consecutive deadband actions
+                        # only imply feedback-target stability, NOT replay-len
+                        # stability — verify explicitly here and downgrade to
+                        # the spec path if the invariant does not hold.
+                        _stable_reuse_ok = False
+                        if runtime.last_observed_stable() and layer_idx > 0:
+                            _prev_plan = runtime.current_layer_plan(layer_idx - 1)
+                            _curr_plan = runtime.current_layer_plan(layer_idx)
+                            if (
+                                _prev_plan is not None
+                                and _curr_plan is not None
+                                and _prev_plan.replay_token_count
+                                == _curr_plan.replay_token_count
+                            ):
+                                _stable_reuse_ok = True
+                            else:
+                                logger.info(
+                                    "RunKV dynamic replay[step=%d]: stable-branch "
+                                    "invariant violated at pre_hook(L%d) -> "
+                                    "plan(L%d); plan(L%d).replay_token_count=%s "
+                                    "vs plan(L%d).replay_token_count=%s. Falling "
+                                    "back to spec plan.",
+                                    self._dynamic_replay_step_id,
+                                    layer_idx,
+                                    next_layer_idx,
+                                    layer_idx - 1,
+                                    None if _prev_plan is None else _prev_plan.replay_token_count,
+                                    layer_idx,
+                                    None if _curr_plan is None else _curr_plan.replay_token_count,
+                                )
+
+                        if _stable_reuse_ok:
+                            # Steady-state successor plan: reuse replay(L)
+                            # entirely via GPU for layer (L+1), skip CPU-fill
+                            # H2D. Construct a fresh plan whose gpu_reuse
+                            # slice spans all of replay(L) and cpu_fill is
+                            # empty — this is cheap (no per-token loops) and
+                            # preserves all shape-related fields.
+                            # logger.info(
+                            #     "RunKV dynamic replay[step=%d]: steady-state plan "
+                            #     "reuse plan(L%d) -> plan(L%d) at pre_hook(L%d).",
+                            #     self._dynamic_replay_step_id,
+                            #     layer_idx,
+                            #     next_layer_idx,
+                            #     layer_idx,
+                            # )
+                            next_plan = build_stable_successor_plan(current_plan)
+                            next_metadata = self._build_layer_attn_metadata(
+                                layer_idx=next_layer_idx,
+                                plan=next_plan,
+                                prev_plan=current_plan,
+                                prev_metadata=current_metadata,
+                                base_seq_lens=self.seq_lens.cpu,
+                                base_max_seq_len=(
+                                    int(np.max(self.seq_lens.np[: self._lr_num_reqs]))
+                                    if self._lr_num_reqs > 0
+                                    else 0
+                                ),
+                                block_table_tensor=self.paged_block_tables[next_gid],
+                                num_reqs=self._lr_num_reqs,
+                            )
+                            next_skip_block_ids = (
+                                manager.compute_skip_block_ids_from_plan(next_plan)
+                            )
                             # Discard the pending spec future — it won't be used.
                             runtime.clear_speculative(next_layer_idx)
                         else:

@@ -425,6 +425,64 @@ def compute_layer_replay_plan_for_layer(
     )
 
 
+def build_stable_successor_plan(prev_plan: LayerReplayPlan) -> LayerReplayPlan:
+    """Build plan(L+1) for the steady-state branch.
+
+    Semantics: when feedback/replay are fully stable we want the prefetch
+    plan for the next layer to reuse replay(L) entirely via GPU and skip the
+    CPU-fill H2D altogether. That is *not* the same as reusing prev_plan as-is
+    — we must:
+
+      * move the cpu-fill segment of prev_plan into gpu-reuse (cpu_fill = 0,
+        gpu_reuse = full replay_token_count of prev_plan);
+      * recompute gpu_reuse_slice_per_req to point at per-request contiguous
+        segments of replay(L) (the "prev" for layer L+1 is now prev_plan
+        itself);
+      * reuse replay/scheduled/slot-mapping geometry, which is identical by
+        construction (same token set, same scheduled tail).
+    """
+    replay_lens_per_req = (
+        prev_plan.computed_lens_per_req.astype(np.int64)
+        - prev_plan.kv_replay_start_per_req.astype(np.int64)
+    ).astype(np.int32)
+
+    # Per-request [start, end) relative to replay(L).
+    cu = np.concatenate(
+        ([0], np.cumsum(replay_lens_per_req.astype(np.int64)))
+    ).astype(np.int64)
+    gpu_reuse_slice_per_req: list[tuple[int, int]] = [
+        (int(cu[i]), int(cu[i + 1])) for i in range(replay_lens_per_req.shape[0])
+    ]
+
+    empty_i32 = np.empty(0, dtype=np.int32)
+
+    return LayerReplayPlan(
+        kv_replay_start_per_req=prev_plan.kv_replay_start_per_req,
+        computed_lens_per_req=prev_plan.computed_lens_per_req,
+        # For layer (L+1), the "previous layer" is L itself whose KV on GPU
+        # starts at prev_plan.kv_replay_start_per_req.
+        prev_gpu_start_per_req=prev_plan.kv_replay_start_per_req,
+        replay_blocks_per_req=prev_plan.replay_blocks_per_req,
+        replay_block_count=prev_plan.replay_block_count,
+        skip_logical_block_ids=prev_plan.skip_logical_block_ids,
+        per_req_replay_block_ranges=prev_plan.per_req_replay_block_ranges,
+        cpu_fill_token_count=0,
+        gpu_reuse_token_count=int(prev_plan.replay_token_count),
+        replay_token_count=int(prev_plan.replay_token_count),
+        scheduled_token_count=int(prev_plan.scheduled_token_count),
+        num_actual_tokens=int(prev_plan.num_actual_tokens),
+        max_query_len=int(prev_plan.max_query_len),
+        query_start_loc=prev_plan.query_start_loc,
+        slot_mapping=prev_plan.slot_mapping,
+        combined_replay_indices=prev_plan.combined_replay_indices,
+        combined_scheduled_indices=prev_plan.combined_scheduled_indices,
+        cpu_fill_positions=empty_i32,
+        cpu_fill_logical_ids=empty_i32,
+        cpu_fill_block_offsets=empty_i32,
+        gpu_reuse_slice_per_req=gpu_reuse_slice_per_req,
+    )
+
+
 def _allocate_budget_to_requests(
     budget_blocks: int,
     replayable_blocks_per_req: np.ndarray,
@@ -514,14 +572,14 @@ class FeedbackReplayPlanProvider:
     # --- Controller hyperparameters ---
     # Imbalance values within [-deadband_ms, +deadband_ms] are considered
     # balanced and do not trigger a budget update.
-    deadband_ms: float = 0.5
+    deadband_ms: float = 0.25
     # Multiplicative damping factor applied to the raw Newton step before
     # clipping.  Values in (0, 1) make the controller more conservative;
     # 1.0 means no damping.
-    damping: float = 0.3
+    damping: float = 0.6
     # Maximum absolute budget change (in blocks) per single layer update.
     # Prevents the controller from making excessively large jumps.
-    max_step_blocks: int = 4
+    max_step_blocks: int = 10
     # Fallback value of d(imbalance_ms)/d(budget_blocks) used when no
     # secant-based gain estimate is available yet.  Negative because
     # increasing budget adds compute time and thus *decreases* imbalance.
@@ -1118,10 +1176,7 @@ class OPTDynamicReplayRuntime:
 
     def last_observed_stable(self) -> bool:
         """True when plans have converged: safe to reuse plan(L) as plan(L+1)."""
-        # TEMP DIAGNOSTIC: force non-steady path to isolate whether the
-        # assertion "Expected N replay tokens but assembled M" is caused by
-        # steady-state reuse of plan(L) as plan(L+1).
-        return False
+        return self._last_observe_action == "stable"
 
     def last_observed_in_deadband(self) -> bool:
         return self._last_observe_action in ("deadband", "stable")
