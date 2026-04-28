@@ -3216,6 +3216,20 @@ class GPUModelRunner(
                                         if _ctrl_upd_ss is not None
                                         else None
                                     )
+                                    # When the state-machine controller is
+                                    # active, also propagate the Δbudget-
+                                    # driven plan_change_hint down to the
+                                    # runtime so the next pre_hook's gating
+                                    # can consume it in place of the legacy
+                                    # ``last_observed_stable()`` heuristic.
+                                    if (
+                                        _ctrl_upd_ss is not None
+                                        and _ctrl_upd_ss.plan_change_hint is not None
+                                    ):
+                                        runtime.note_plan_change_hint(
+                                            _ctrl_upd_ss.plan_change_hint,
+                                            _ctrl_upd_ss.sm_state,
+                                        )
                                 additional_kwargs = (
                                     forward_context.additional_kwargs or {}
                                 )
@@ -3278,8 +3292,46 @@ class GPUModelRunner(
                         # only imply feedback-target stability, NOT replay-len
                         # stability — verify explicitly here and downgrade to
                         # the spec path if the invariant does not hold.
+                        # Two gating paths co-exist during the v1 migration:
+                        #  - Legacy: ``runtime.last_observed_stable()`` — two
+                        #    consecutive deadband observations promote the
+                        #    pre_hook to the stable-successor branch.
+                        #  - State-machine: per design §8.2.1, true steady
+                        #    state requires *both* a small Δbudget and a
+                        #    deadband-met imbalance.  The Δbudget-driven hint
+                        #    alone is insufficient because TRANSIT freezes
+                        #    budget (Δ=0 → "unchanged") even when imbalance
+                        #    is large — those layers are not steady and must
+                        #    not enter the stable-successor branch.  Gate on:
+                        #      hint ∈ {"unchanged", "small_delta"}  AND
+                        #      |imbalance(L)| < deadband_ms
+                        # Regardless of the gating signal, plan reuse still
+                        # requires the structural invariant
+                        #   plan(L-1).replay_token_count == plan(L).replay_token_count
+                        # so that plan(L).gpu_reuse_slice (bounded by plan(L-1)
+                        # replay length at build time) is valid when consumed
+                        # against replay(L).
                         _stable_reuse_ok = False
-                        if runtime.last_observed_stable() and layer_idx > 0:
+                        _sm_hint = runtime.get_last_plan_change_hint()
+                        if _sm_hint is not None:
+                            _hint_ok = _sm_hint in ("unchanged", "small_delta")
+                            _last_y = runtime.get_layer_imbalance_ms(layer_idx)
+                            _deadband_ms = (
+                                self.replay_plan_provider.gating_deadband_ms
+                                if isinstance(
+                                    self.replay_plan_provider,
+                                    FeedbackReplayPlanProvider,
+                                )
+                                else 0.0
+                            )
+                            _imb_ok = (
+                                _last_y is not None
+                                and abs(_last_y) < _deadband_ms
+                            )
+                            _gate_ok = _hint_ok and _imb_ok
+                        else:
+                            _gate_ok = runtime.last_observed_stable()
+                        if _gate_ok and layer_idx > 0:
                             _prev_plan = runtime.current_layer_plan(layer_idx - 1)
                             _curr_plan = runtime.current_layer_plan(layer_idx)
                             if (
@@ -8233,6 +8285,13 @@ class GPUModelRunner(
                     getattr(
                         self.kv_offload_config,
                         "layer_recompute_planner_dry_run",
+                        False,
+                    )
+                ),
+                use_state_machine=bool(
+                    getattr(
+                        self.kv_offload_config,
+                        "layer_recompute_use_state_machine",
                         False,
                     )
                 ),

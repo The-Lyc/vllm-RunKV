@@ -13,6 +13,12 @@ import numpy as np
 import torch
 import torch.cuda.nvtx as _nvtx
 
+from vllm.v1.worker.imbalance_controller import (
+    ImbalanceController,
+    ImbalanceControllerConfig,
+    SMState,
+)
+
 
 @dataclass
 class LayerReplayPlan:
@@ -121,6 +127,12 @@ class FeedbackControllerLayerUpdate:
     raw_delta: float | None = None
     clipped_delta: float | None = None
     action: str = "deadband"
+    # --- State-machine controller fields (None when legacy Newton path) ---
+    sm_state: str | None = None
+    window_mean_ms: float | None = None
+    window_stdev_ms: float | None = None
+    old_baseline_ms: float | None = None
+    plan_change_hint: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -131,6 +143,11 @@ class FeedbackControllerLayerUpdate:
             "raw_delta": self.raw_delta,
             "clipped_delta": self.clipped_delta,
             "action": self.action,
+            "sm_state": self.sm_state,
+            "window_mean_ms": self.window_mean_ms,
+            "window_stdev_ms": self.window_stdev_ms,
+            "old_baseline_ms": self.old_baseline_ms,
+            "plan_change_hint": self.plan_change_hint,
         }
 
 
@@ -585,10 +602,20 @@ class FeedbackReplayPlanProvider:
     # increasing budget adds compute time and thus *decreases* imbalance.
     default_gain: float = -0.1
 
+    # When True, route observe_layer_feedback through the state-machine
+    # controller (ImbalanceController) instead of the legacy Newton secant
+    # update.  See docs/design/imbalance_state_machine_controller.md.
+    use_state_machine: bool = False
+    # Optional custom SM controller config.  When None and
+    # use_state_machine is True, defaults from ImbalanceControllerConfig
+    # are used.
+    state_machine_config: ImbalanceControllerConfig | None = None
+
     static_provider: StaticReplayPlanProvider = field(init=False)
     controller_state: FeedbackPlannerControllerState = field(
         init=False, default_factory=FeedbackPlannerControllerState
     )
+    _sm_controller: ImbalanceController | None = field(init=False, default=None)
     current_step_summary: FeedbackPlannerStepSummary | None = field(
         init=False, default=None
     )
@@ -619,6 +646,21 @@ class FeedbackReplayPlanProvider:
         self.static_provider = StaticReplayPlanProvider(
             io_prefix_blocks=list(self.io_prefix_blocks)
         )
+        if self.use_state_machine:
+            cfg = self.state_machine_config or ImbalanceControllerConfig()
+            self._sm_controller = ImbalanceController(config=cfg)
+
+    @property
+    def gating_deadband_ms(self) -> float:
+        """Deadband threshold used by the pre_hook to gate stable-branch reuse.
+
+        When the state-machine controller is active its own ``deadband_ms`` is
+        the authoritative steady-state criterion; otherwise fall back to the
+        legacy Newton controller's ``deadband_ms``.
+        """
+        if self._sm_controller is not None:
+            return float(self._sm_controller.config.deadband_ms)
+        return float(self.deadband_ms)
 
     def begin_step(self, **metadata: Any) -> None:
         # Step-boundary metadata is still owned by LayerRecomputeManager.
@@ -721,6 +763,40 @@ class FeedbackReplayPlanProvider:
 
         cs = self.controller_state
         budget_before = cs.global_budget_blocks
+
+        # --- State-machine controller path ---
+        if self._sm_controller is not None:
+            decision = self._sm_controller.observe(
+                imbalance_ms=imbalance_value,
+                current_budget=budget_before,
+            )
+            new_budget = budget_before + int(decision.delta_budget)
+            max_budget = (
+                self.current_step_summary.total_replayable_blocks
+                if self.current_step_summary is not None
+                else budget_before
+            )
+            new_budget = max(0, min(new_budget, max_budget))
+            clipped_delta = float(new_budget - budget_before)
+            self._layer_controller_updates[layer_key] = FeedbackControllerLayerUpdate(
+                budget_before=budget_before,
+                budget_after=new_budget,
+                imbalance_ms=imbalance_value,
+                gain_used=decision.gain_used,
+                raw_delta=float(decision.delta_budget),
+                clipped_delta=clipped_delta,
+                action=("deadband" if decision.delta_budget == 0 else "update"),
+                sm_state=decision.state.value,
+                window_mean_ms=decision.window_mean_ms,
+                window_stdev_ms=decision.window_stdev_ms,
+                old_baseline_ms=decision.old_baseline_ms,
+                plan_change_hint=decision.plan_change_hint,
+            )
+            cs.last_budget_blocks = budget_before
+            cs.last_imbalance_ms = imbalance_value
+            cs.global_budget_blocks = new_budget
+            _nvtx.range_pop()
+            return
 
         # --- Deadband: don't react to small imbalance ---
         if abs(imbalance_value) < self.deadband_ms:
@@ -1067,6 +1143,9 @@ class OPTDynamicReplayRuntime:
     _speculative_skip_ids: list[set[int] | None] = field(init=False)
     _layer_skip_ids: list[set[int] | None] = field(init=False)
     _last_observe_action: str | None = field(init=False, default=None)
+    # State-machine gating signals (None when legacy path is in use).
+    _last_plan_change_hint: str | None = field(init=False, default=None)
+    _last_sm_state: str | None = field(init=False, default=None)
     _builder_fn: Callable[..., None] | None = field(init=False, default=None)
     _builder_executor: ThreadPoolExecutor = field(init=False)
     _speculative_futures: dict[int, Future] = field(init=False)
@@ -1180,6 +1259,29 @@ class OPTDynamicReplayRuntime:
 
     def last_observed_in_deadband(self) -> bool:
         return self._last_observe_action in ("deadband", "stable")
+
+    # ---- state-machine hint cache ----
+
+    def note_plan_change_hint(self, hint: str | None, sm_state: str | None = None) -> None:
+        """Cache the state-machine's plan-change hint for the last observed layer.
+
+        Called from the provider after each ``observe_layer_feedback``.  The
+        pre_hook for layer (L+1) reads the most recent hint via
+        :meth:`get_last_plan_change_hint` to decide whether to reuse,
+        lightly rebuild, or fully rebuild plan(L+1).
+        """
+        self._last_plan_change_hint = hint
+        self._last_sm_state = sm_state
+
+    def get_last_plan_change_hint(self) -> str | None:
+        return self._last_plan_change_hint
+
+    def get_last_sm_state(self) -> str | None:
+        return self._last_sm_state
+
+    def use_sm_gating(self) -> bool:
+        """True when the state-machine controller is producing hints."""
+        return self._last_plan_change_hint is not None
 
     # ---- speculative builder ----
 

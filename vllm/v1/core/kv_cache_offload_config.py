@@ -71,3 +71,12 @@ class RunKVOffloadConfig:
     # When True, the ILP prediction is refined by a small additive correction
     # derived from the runtime imbalance signal (compute vs DMA).
     tightllm_enable_feedback_correction: bool = False
+
+    # --- Feedback planner: state-machine controller ---
+    # When True, FeedbackReplayPlanProvider uses the three-state
+    # imbalance controller (STEADY / TRANSIT / TRACKING) described in
+    # docs/design/imbalance_state_machine_controller.md instead of the
+    # legacy per-layer Newton secant update.  Plan-reuse gating on the
+    # pre_hook switches from the `last_observed_stable()` heuristic to a
+    # Δbudget-driven hint (unchanged / small_delta / significant_delta).
+    layer_recompute_use_state_machine: bool = False

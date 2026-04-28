@@ -603,6 +603,7 @@ class EngineArgs:
     ] = "io_hidden_states"
     runkv_layer_recompute_planner: Literal["static", "feedback"] = "static"
     runkv_layer_recompute_planner_dry_run: bool = False
+    runkv_layer_recompute_use_state_machine: bool = False
 
     # RunKV layer-wise KV cache offload configuration
     kv_offload_config: RunKVOffloadConfig | dict[str, Any] | None = None
@@ -1961,6 +1962,9 @@ class EngineArgs:
             ),
             layer_recompute_planner_dry_run=(
                 self.runkv_layer_recompute_planner_dry_run
+            ),
+            layer_recompute_use_state_machine=(
+                self.runkv_layer_recompute_use_state_machine
             ),
         )
 
