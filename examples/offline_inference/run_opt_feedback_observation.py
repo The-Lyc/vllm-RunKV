@@ -39,6 +39,7 @@ def main() -> None:
     num_device_buffers = os.environ.get("NUM_DEVICE_BUFFERS", "3")
     planner = os.environ.get("PLANNER", "feedback")
     dry_run = os.environ.get("DRY_RUN", "1") == "1"
+    use_state_machine = os.environ.get("USE_STATE_MACHINE", "0") == "1"
     tightllm_profile_path = os.environ.get("TIGHTLLM_PROFILE_PATH", "")
     tightllm_feedback_correction = (
         os.environ.get("TIGHTLLM_FEEDBACK_CORRECTION", "0") == "1"
@@ -108,6 +109,8 @@ def main() -> None:
     ]
     if dry_run:
         cmd.append("--planner-dry-run")
+    if use_state_machine:
+        cmd.append("--use-state-machine")
     if tightllm_profile_path:
         cmd.extend(["--tightllm-profile-path", tightllm_profile_path])
     if tightllm_feedback_correction:
@@ -125,6 +128,7 @@ def main() -> None:
     print(f"  model: {model}")
     print(f"  planner: {planner}")
     print(f"  planner_dry_run: {int(dry_run)}")
+    print(f"  use_state_machine: {int(use_state_machine)}")
     if planner == "tightllm":
         print(f"  tightllm_profile: {tightllm_profile_path}")
         print(f"  tightllm_feedback_correction: {int(tightllm_feedback_correction)}")
@@ -166,6 +170,30 @@ def main() -> None:
         print(f"  {nsys_stem}.qdstrm")
     print("Main JSONL: one line per step")
     print("Flat JSONL: one line per (step, layer)")
+
+    # Write manifest if requested (for automation scripts)
+    manifest_file = os.environ.get("MANIFEST_FILE", "")
+    if manifest_file:
+        import json as _json
+        _manifest = {
+            "run_tag": run_tag,
+            "output_dir": str(Path(output_dir).resolve()),
+            "prefix_blocks": prefix_blocks,
+            "planner": planner,
+            "model": model,
+            "nsys_report": str(Path(nsys_stem + ".nsys-rep").resolve())
+            if enable_nsys
+            else None,
+            "mfu_jsonl_glob": str(
+                Path(output_dir) / f"opt_component_mfu_*_{run_tag}.jsonl"
+            ),
+            "mfu_flat_jsonl_glob": str(
+                Path(output_dir) / f"opt_component_mfu_*_{run_tag}.flat.jsonl"
+            ),
+        }
+        Path(manifest_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(manifest_file).write_text(_json.dumps(_manifest, indent=2) + "\n")
+        print(f"\nManifest written to: {manifest_file}")
 
 
 if __name__ == "__main__":

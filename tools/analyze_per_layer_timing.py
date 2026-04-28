@@ -2255,8 +2255,9 @@ def plot_per_step_layer_lines(
             means = []
             stds = []
             for step in steps_s:
-                vals = [v for v in data[step].values() if v == v]
-                if vals:
+                raw = [v for v in data[step].values() if v == v]
+                if raw:
+                    vals = [abs(v) for v in raw] if metric == "imbalance" else raw
                     means.append(sum(vals) / len(vals))
                     stds.append(
                         (sum((x - means[-1]) ** 2 for x in vals) / len(vals)) ** 0.5
@@ -2284,8 +2285,8 @@ def plot_per_step_layer_lines(
             )
 
         ax.set_xlabel("Step")
-        ax.set_ylabel(ylabel)
-        ax.set_title(f"{description}: cross-layer mean ± std per step")
+        ax.set_ylabel("|Imbalance| (ms)" if metric == "imbalance" else ylabel)
+        ax.set_title(f"{'|Imbalance|' if metric == 'imbalance' else description}: cross-layer mean ± std per step")
         if metric == "imbalance":
             ax.axhline(0, color="k", lw=0.8, ls="--")
         ax.legend()
@@ -2489,6 +2490,22 @@ def _glob_expand(paths: list[str]) -> list[str]:
     return sorted(out)
 
 
+def _extract_run_timestamp(paths: list[str]) -> str | None:
+    """Extract YYYYMMDD_HHMM tag from filenames that contain _YYYYMMDD_HHMMSS.
+
+    Example: opt_component_mfu_1000_20260420_101617.flat.jsonl → '20260420_1016'
+    Returns None if no matching timestamp is found in any of the given paths.
+    """
+    _ts_re = re.compile(r"_(\d{8})_(\d{6})")
+    for p in paths:
+        m = _ts_re.search(Path(p).name)
+        if m:
+            date_part = m.group(1)       # e.g. '20260420'
+            time_part = m.group(2)[:4]   # e.g. '1016' (drop seconds)
+            return f"{date_part}_{time_part}"
+    return None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Per-layer compute vs IO timing analysis")
     ap.add_argument("--runkv-mfu", nargs="*", default=[])
@@ -2511,7 +2528,19 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    out_dir = Path(args.output_dir)
+    # Derive a timestamp-based subdirectory from input filenames.
+    # Priority: runkv_mfu paths → runkv_sqlite → tightllm_mfu → tightllm_sqlite
+    _candidate_paths = (
+        list(args.runkv_mfu or [])
+        + ([args.runkv_sqlite] if args.runkv_sqlite else [])
+        + list(args.tightllm_mfu or [])
+        + ([args.tightllm_sqlite] if args.tightllm_sqlite else [])
+    )
+    _ts_tag = _extract_run_timestamp(_glob_expand(_candidate_paths) or _candidate_paths)
+    out_dir = Path(args.output_dir) / _ts_tag if _ts_tag else Path(args.output_dir)
+    if _ts_tag:
+        print(f"  [info] output sub-directory: {_ts_tag}")
+
     rpt = Report(out_dir)
     rpt.h1("Per-Layer Compute vs IO Timing Analysis")
     skip = args.skip_warmup_steps

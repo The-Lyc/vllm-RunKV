@@ -215,6 +215,30 @@ def main() -> None:
         print("Open with:  nsys-ui " + nsys_stem + ".nsys-rep")
     print("Done.")
 
+    # Write manifest if requested (for automation scripts)
+    manifest_file = os.environ.get("MANIFEST_FILE", "")
+    if manifest_file:
+        import json as _json
+        _manifest = {
+            "run_tag": run_tag,
+            "output_dir": str(Path(output_dir).resolve()),
+            "prefix_blocks": prefix_blocks,
+            "planner": "tightllm",
+            "model": model,
+            "nsys_report": str(Path(nsys_stem + ".nsys-rep").resolve())
+            if enable_nsys
+            else None,
+            "mfu_jsonl_glob": str(
+                Path(output_dir) / f"opt_component_mfu_*_{run_tag}.jsonl"
+            ),
+            "mfu_flat_jsonl_glob": str(
+                Path(output_dir) / f"opt_component_mfu_*_{run_tag}.flat.jsonl"
+            ),
+        }
+        Path(manifest_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(manifest_file).write_text(_json.dumps(_manifest, indent=2) + "\n")
+        print(f"\nManifest written to: {manifest_file}")
+
 
 if __name__ == "__main__":
     main()

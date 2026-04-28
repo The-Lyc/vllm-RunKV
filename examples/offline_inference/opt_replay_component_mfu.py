@@ -51,6 +51,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--use-state-machine",
+        action="store_true",
+        help=(
+            "Route feedback planner through the three-state imbalance "
+            "controller (STEADY/TRANSIT/TRACKING) instead of the legacy "
+            "Newton secant update. Also enables Delta-budget-driven plan "
+            "reuse gating in pre_hook."
+        ),
+    )
+    parser.add_argument(
         "--tightllm-profile-path",
         default=None,
         help="Path to TightLLM offline profile JSON (required for --planner tightllm).",
@@ -162,6 +172,7 @@ def make_kv_offload_config(
     num_device_buffers: int,
     planner: str,
     planner_dry_run: bool,
+    use_state_machine: bool = False,
     tightllm_profile_path: str | None = None,
     tightllm_feedback_correction: bool = False,
 ) -> dict:
@@ -181,6 +192,7 @@ def make_kv_offload_config(
         config["layer_recompute_io_prefix_blocks"] = [int(setting)]
         config["layer_recompute_planner"] = planner
         config["layer_recompute_planner_dry_run"] = planner_dry_run
+        config["layer_recompute_use_state_machine"] = use_state_machine
         if planner == "tightllm":
             if not tightllm_profile_path:
                 raise ValueError(
@@ -324,6 +336,7 @@ def main() -> None:
                     num_device_buffers=args.num_device_buffers,
                     planner=args.planner,
                     planner_dry_run=args.planner_dry_run,
+                    use_state_machine=args.use_state_machine,
                     tightllm_profile_path=args.tightllm_profile_path,
                     tightllm_feedback_correction=args.tightllm_feedback_correction,
                 ),
