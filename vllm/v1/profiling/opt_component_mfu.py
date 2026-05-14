@@ -23,12 +23,39 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 OPT_COMPONENT_MFU_PROFILER_KEY = "opt_component_mfu_profiler"
+_OPT_COMPONENT_MFU_RESOURCE_CONTEXT: dict[str, Any] | None = None
+_INLINE_PRESSURE_INJECTOR: Any | None = None
 
 
 def get_opt_component_mfu_profiler() -> OPTComponentMFUStepProfiler | None:
     if not is_forward_context_available():
         return None
     return get_forward_context().additional_kwargs.get(OPT_COMPONENT_MFU_PROFILER_KEY)
+
+
+def set_opt_component_mfu_resource_context(context: dict[str, Any] | None) -> None:
+    global _OPT_COMPONENT_MFU_RESOURCE_CONTEXT
+    _OPT_COMPONENT_MFU_RESOURCE_CONTEXT = dict(context) if context is not None else None
+
+
+def get_opt_component_mfu_resource_context() -> dict[str, Any] | None:
+    if _OPT_COMPONENT_MFU_RESOURCE_CONTEXT is None:
+        return None
+    return dict(_OPT_COMPONENT_MFU_RESOURCE_CONTEXT)
+
+
+def set_inline_pressure_injector(injector: Any | None) -> None:
+    """Register (or clear) the per-layer pressure injector used by the RunKV
+    pre_hook. The injector must expose ``inject_pre_prefetch_io(layer_idx)``
+    and ``inject_pre_attention_sm(layer_idx)``; both calls are no-ops when the
+    pressure kind doesn't match.
+    """
+    global _INLINE_PRESSURE_INJECTOR
+    _INLINE_PRESSURE_INJECTOR = injector
+
+
+def get_inline_pressure_injector() -> Any | None:
+    return _INLINE_PRESSURE_INJECTOR
 
 
 class OPTComponentMFUStepProfiler:
@@ -41,6 +68,8 @@ class OPTComponentMFUStepProfiler:
         model_name: str,
         total_scheduled_tokens: int,
         num_reqs: int,
+        step_record_buffer: list[dict[str, Any]] | None = None,
+        flat_record_buffer: list[dict[str, Any]] | None = None,
     ) -> None:
         self.output_path = (
             Path(output_path).expanduser() if output_path is not None else None
@@ -57,6 +86,11 @@ class OPTComponentMFUStepProfiler:
         # planner provider.  Only populated when planner == "feedback".
         self._layer_controller_updates: dict[int, dict[str, Any]] = {}
         self._dynamic_replay_runtime: OPTDynamicReplayRuntime | None = None
+        # Buffer references owned by the model runner; per-step records are
+        # appended here in finish_step() and flushed to disk once at process
+        # exit. Keeps file IO out of the per-step critical path.
+        self._step_record_buffer = step_record_buffer
+        self._flat_record_buffer = flat_record_buffer
 
     def attach_dynamic_replay_runtime(
         self,
@@ -101,16 +135,20 @@ class OPTComponentMFUStepProfiler:
         if self._dynamic_replay_runtime is not None:
             torch.cuda.synchronize()
 
-        if self.output_path is not None:
-            self._write_step_record()
+        if self.output_path is not None and self._step_record_buffer is not None:
+            self._buffer_step_record()
 
         self._layer_imbalance_ms.clear()
         self._layer_controller_updates.clear()
         self._dynamic_replay_runtime = None
 
-    def _write_step_record(self) -> None:
-        """Write one JSONL line (step record) and one flat line per layer."""
-        import json
+    def _buffer_step_record(self) -> None:
+        """Build per-step + per-(step, layer) records and append to in-memory
+        buffers owned by the model runner. Writing to disk is deferred until
+        the inference loop ends (atexit flush on the model runner).
+        """
+        assert self._step_record_buffer is not None
+        assert self._flat_record_buffer is not None
 
         layer_records = self._build_layer_records()
 
@@ -122,25 +160,23 @@ class OPTComponentMFUStepProfiler:
             "total_scheduled_tokens": self.total_scheduled_tokens,
             "layers": layer_records,
         }
+        resource_context = get_opt_component_mfu_resource_context()
+        if resource_context is not None:
+            step_record.update(resource_context)
+        self._step_record_buffer.append(step_record)
 
-        assert self.output_path is not None
-        # Main JSONL: one line per step (nested layers list)
-        with open(self.output_path, "a") as f:
-            f.write(json.dumps(step_record) + "\n")
-
-        # Flat JSONL: one line per (step, layer) — easier for per-layer analysis
-        flat_path = self.output_path.with_suffix("").with_suffix(".flat.jsonl")
-        with open(flat_path, "a") as f:
-            for lr in layer_records:
-                flat_rec = {
-                    "step": self.step_idx,
-                    "rank": self.rank,
-                    "model_name": self.model_name,
-                    "num_reqs": self.num_reqs,
-                    "total_scheduled_tokens": self.total_scheduled_tokens,
-                    **lr,
-                }
-                f.write(json.dumps(flat_rec) + "\n")
+        for lr in layer_records:
+            flat_rec: dict[str, Any] = {
+                "step": self.step_idx,
+                "rank": self.rank,
+                "model_name": self.model_name,
+                "num_reqs": self.num_reqs,
+                "total_scheduled_tokens": self.total_scheduled_tokens,
+                **lr,
+            }
+            if resource_context is not None:
+                flat_rec.update(resource_context)
+            self._flat_record_buffer.append(flat_rec)
 
     def _build_layer_records(self) -> list[dict[str, Any]]:
         per_layer: dict[int, dict[str, Any]] = {}
@@ -165,6 +201,33 @@ class OPTComponentMFUStepProfiler:
                     cpu_fill_token_count = int(plan.cpu_fill_token_count)
                     gpu_reuse_token_count = int(plan.gpu_reuse_token_count)
 
+                direct_h2d_kv_token_count = (
+                    runtime.get_layer_direct_h2d_kv_token_count(layer_idx)
+                )
+                load_layer_block_count = runtime.get_layer_load_block_count(
+                    layer_idx
+                )
+                # "History" = tokens whose KV existed before this step and is
+                # consumed by attention at this layer: those H2D'd directly +
+                # those reconstructed via qkv_proj (cpu_fill + gpu_reuse).
+                # scheduled tokens are excluded — they would always be computed.
+                if (
+                    direct_h2d_kv_token_count is not None
+                    and replay_token_count is not None
+                ):
+                    history_token_count = (
+                        direct_h2d_kv_token_count + replay_token_count
+                    )
+                    if history_token_count > 0:
+                        kv_replay_fraction = (
+                            replay_token_count / history_token_count
+                        )
+                    else:
+                        kv_replay_fraction = 0.0
+                else:
+                    history_token_count = None
+                    kv_replay_fraction = None
+
                 layer_entry: dict[str, Any] = {
                     "layer_idx": layer_idx,
                     "next_layer_idx": layer_idx + 1,
@@ -175,6 +238,7 @@ class OPTComponentMFUStepProfiler:
                     "load_ready_ms_from_anchor": None,
                     "kv_ready_ms_from_anchor": None,
                     "hs_ready_ms_from_anchor": None,
+                    "cpu_fill_start_ms_from_anchor": None,
                     "imbalance_ms": runtime.get_layer_imbalance_ms(layer_idx),
                     # Feedback controller budget update for this layer.
                     # None when planner != "feedback" or no feedback observed.
@@ -183,6 +247,10 @@ class OPTComponentMFUStepProfiler:
                     "replay_token_count": replay_token_count,
                     "cpu_fill_token_count": cpu_fill_token_count,
                     "gpu_reuse_token_count": gpu_reuse_token_count,
+                    "direct_h2d_kv_token_count": direct_h2d_kv_token_count,
+                    "load_layer_block_count": load_layer_block_count,
+                    "history_token_count": history_token_count,
+                    "kv_replay_fraction": kv_replay_fraction,
                     "num_actual_tokens": num_actual_tokens,
                     "num_tokens": num_tokens,
                 }
@@ -228,6 +296,9 @@ class OPTComponentMFUStepProfiler:
                 if step_anchor is not None:
                     load_ready = runtime.get_layer_load_ready_event(next_layer_idx)
                     hs_ready = runtime.get_layer_cpu_fill_ready_event(next_layer_idx)
+                    cpu_fill_start = runtime.get_layer_cpu_fill_start_event(
+                        next_layer_idx
+                    )
                     # Record separate KV-DMA and HS-DMA ready timestamps
                     if load_ready is not None:
                         layer_entry["kv_ready_ms_from_anchor"] = float(
@@ -236,6 +307,10 @@ class OPTComponentMFUStepProfiler:
                     if hs_ready is not None:
                         layer_entry["hs_ready_ms_from_anchor"] = float(
                             step_anchor.elapsed_time(hs_ready)
+                        )
+                    if cpu_fill_start is not None:
+                        layer_entry["cpu_fill_start_ms_from_anchor"] = float(
+                            step_anchor.elapsed_time(cpu_fill_start)
                         )
                     # Combined: whichever finishes last
                     final_ready = hs_ready or load_ready

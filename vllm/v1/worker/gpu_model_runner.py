@@ -146,6 +146,7 @@ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.profiling.opt_component_mfu import (
     OPT_COMPONENT_MFU_PROFILER_KEY,
     OPTComponentMFUStepProfiler,
+    get_inline_pressure_injector,
 )
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
@@ -445,6 +446,11 @@ class PagedBlockMapper:
         self.load_start_events: dict[int, torch.cuda.Event] = {}
         # Maps layer_idx -> event for offload completion
         self.offload_events: dict[int, torch.cuda.Event] = {}
+        # Maps layer_idx -> number of blocks actually enqueued for H2D by
+        # load_layer_async this step (= |mapping| - |skip_block_ids|).
+        # Independent of the plan/valid-len derived direct_h2d_kv_token_count,
+        # so the two can be cross-checked downstream.
+        self.layer_load_block_count: dict[int, int] = {}
 
         # Track total number of layers (set during first step)
         self.num_layers: int = 0
@@ -749,6 +755,7 @@ class PagedBlockMapper:
                     "copy_count": 0,
                     "num_segments": 0,
                 }
+            self.layer_load_block_count[layer_idx] = 0
             return 0
 
         _t = self._timing_enabled
@@ -792,6 +799,10 @@ class PagedBlockMapper:
                 else:
                     load_ids = sorted(self.mapping)
                 copy_count = len(load_ids)
+                # Stash unconditionally (independent of _timing_enabled) so
+                # downstream profilers can cross-check direct_h2d_kv_token_count
+                # derived from plan + valid_lens against the DMA enqueue count.
+                self.layer_load_block_count[layer_idx] = copy_count
 
                 # Find contiguous segments in sorted load_ids.
                 # Because _assign_slots sorts logical IDs before assigning
@@ -921,6 +932,9 @@ class PagedBlockMapper:
 
     def peek_load_start_event(self, layer_idx: int) -> torch.cuda.Event | None:
         return self.load_start_events.get(layer_idx)
+
+    def peek_layer_load_block_count(self, layer_idx: int) -> int | None:
+        return self.layer_load_block_count.get(layer_idx)
 
     def load_layer(
         self,
@@ -1130,6 +1144,17 @@ class GPUModelRunner(
                 "profiling/logging will be disabled for model_type=%s.",
                 getattr(self.model_config.hf_config, "model_type", None),
             )
+        # All step + flat records kept in memory; flushed to JSONL once on
+        # process exit so per-step file IO doesn't sit in the forward path.
+        # Mirrors the _prehook_timing_records / _flush_prehook_timing pattern
+        # below (registered in the same constructor scope).
+        self._opt_component_mfu_step_records: list[dict[str, Any]] = []
+        self._opt_component_mfu_flat_records: list[dict[str, Any]] = []
+        self._opt_component_mfu_flushed: bool = False
+        if self._opt_component_log_enabled:
+            import atexit
+
+            atexit.register(self._flush_opt_component_mfu)
 
         # offloading parameters
         self.kv_offload_config = vllm_config.kv_offload_config
@@ -1283,6 +1308,26 @@ class GPUModelRunner(
         self._prehook_t_sio_cf_gather: float = 0.0
         self._prehook_t_sio_cf_pin: float = 0.0
         self._prehook_t_sio_cf_h2d: float = 0.0
+        # build_plan branch sub-timing
+        self._prehook_t_bp_gate: float = 0.0
+        self._prehook_t_bp_steady_plan: float = 0.0
+        self._prehook_t_bp_pop_spec: float = 0.0
+        self._prehook_t_bp_fallback: float = 0.0
+        self._prehook_t_bp_meta: float = 0.0
+        self._prehook_t_bp_skip: float = 0.0
+        self._prehook_t_bp_promote: float = 0.0
+        self._prehook_t_bp_runtime_set: float = 0.0
+        # _build_layer_attn_metadata internal sub-timing
+        self._prehook_t_mb_reuse_check: float = 0.0
+        self._prehook_t_mb_cpu_prep: float = 0.0
+        self._prehook_t_mb_common_meta: float = 0.0
+        self._prehook_t_mb_builder: float = 0.0
+        # branch / hit counters
+        self._prehook_n_steady_branch: int = 0
+        self._prehook_n_nonsteady_branch: int = 0
+        self._prehook_n_meta_reuse_hit: int = 0
+        self._prehook_n_meta_reuse_miss: int = 0
+        self._prehook_n_spec_fallback: int = 0
         self._prehook_t_total: float = 0.0
         self._prehook_layer_count: int = 0
         # All step records kept in memory; flushed to file at shutdown.
@@ -3019,6 +3064,93 @@ class GPUModelRunner(
                     f"{s / max(sum_sio, 1e-12) * 100:>7.1f}%\n"
                 )
 
+            bp_sub_fields = [
+                "bp_gate_ms",
+                "bp_steady_plan_ms",
+                "bp_pop_spec_ms",
+                "bp_fallback_ms",
+                "bp_meta_ms",
+                "bp_skip_ms",
+                "bp_promote_ms",
+                "bp_runtime_set_ms",
+            ]
+            mb_sub_fields = [
+                "mb_reuse_check_ms",
+                "mb_cpu_prep_ms",
+                "mb_common_meta_ms",
+                "mb_builder_ms",
+            ]
+            sum_bp = sum(
+                r.get("build_plan_ms", 0.0) for r in self._prehook_timing_records
+            )
+            f.write(f"\n--- build_plan breakdown (total {sum_bp:.3f} ms) ---\n")
+            f.write(
+                f"{'  sub-segment':<24} {'sum_ms':>10} {'avg_ms':>10} {'pct_bp':>8}\n"
+            )
+            f.write("-" * 56 + "\n")
+            for field in bp_sub_fields:
+                s = sum(r.get(field, 0.0) for r in self._prehook_timing_records)
+                label = field.replace("_ms", "")
+                f.write(
+                    f"  {label:<22} {s:>10.3f} {s / max(n, 1):>10.3f} "
+                    f"{s / max(sum_bp, 1e-12) * 100:>7.1f}%\n"
+                )
+
+            sum_mb = sum(
+                r.get("bp_meta_ms", 0.0) for r in self._prehook_timing_records
+            )
+            f.write(
+                f"\n--- _build_layer_attn_metadata breakdown "
+                f"(within bp_meta total {sum_mb:.3f} ms) ---\n"
+            )
+            f.write(
+                f"{'  sub-segment':<24} {'sum_ms':>10} {'avg_ms':>10} {'pct_mb':>8}\n"
+            )
+            f.write("-" * 56 + "\n")
+            for field in mb_sub_fields:
+                s = sum(r.get(field, 0.0) for r in self._prehook_timing_records)
+                label = field.replace("_ms", "")
+                f.write(
+                    f"  {label:<22} {s:>10.3f} {s / max(n, 1):>10.3f} "
+                    f"{s / max(sum_mb, 1e-12) * 100:>7.1f}%\n"
+                )
+
+            n_steady = sum(
+                r.get("n_steady", 0) for r in self._prehook_timing_records
+            )
+            n_nonsteady = sum(
+                r.get("n_nonsteady", 0) for r in self._prehook_timing_records
+            )
+            n_meta_hit = sum(
+                r.get("n_meta_hit", 0) for r in self._prehook_timing_records
+            )
+            n_meta_miss = sum(
+                r.get("n_meta_miss", 0) for r in self._prehook_timing_records
+            )
+            n_spec_fb = sum(
+                r.get("n_spec_fallback", 0) for r in self._prehook_timing_records
+            )
+            n_branches = max(n_steady + n_nonsteady, 1)
+            n_meta_total = max(n_meta_hit + n_meta_miss, 1)
+            f.write("\n--- branch / reuse counters ---\n")
+            f.write(
+                f"  steady       : {n_steady:>10d}  "
+                f"({n_steady / n_branches * 100:>5.1f}%)\n"
+            )
+            f.write(
+                f"  nonsteady    : {n_nonsteady:>10d}  "
+                f"({n_nonsteady / n_branches * 100:>5.1f}%)\n"
+            )
+            f.write(
+                f"  meta reuse hit : {n_meta_hit:>8d}  "
+                f"({n_meta_hit / n_meta_total * 100:>5.1f}%)\n"
+            )
+            f.write(
+                f"  meta reuse miss: {n_meta_miss:>8d}  "
+                f"({n_meta_miss / n_meta_total * 100:>5.1f}%)\n"
+            )
+            f.write(f"  spec_fallback: {n_spec_fb:>10d}\n")
+
         logger.info(
             "pre_hook timing written: %s (%d steps), summary: %s",
             path,
@@ -3104,6 +3236,16 @@ class GPUModelRunner(
 
                         _t_hook_start = _time.perf_counter()
 
+                    # Record qkv_end(L) as the first thing in the pre_hook —
+                    # the hook fires between qkv_proj and the Attention call,
+                    # so an event recorded here on the compute stream marks
+                    # the exact end of qkv_proj(L). This is the compute-end
+                    # anchor used by the imbalance computation below.
+                    if self.device.type == "cuda":
+                        _qkv_end_event = torch.cuda.Event(enable_timing=True)
+                        _qkv_end_event.record()
+                        runtime.set_qkv_end_event(layer_idx, _qkv_end_event)
+
                     current_plan = runtime.get_layer_plan(layer_idx)
                     current_metadata = runtime.get_layer_metadata(layer_idx)
                     if layer_idx == 0:
@@ -3131,6 +3273,12 @@ class GPUModelRunner(
                     current_cpu_fill_ready_event = (
                         manager.peek_cpu_fill_h2d_ready_event(layer_idx)
                     )
+                    current_cpu_fill_start_event = (
+                        manager.peek_cpu_fill_h2d_start_event(layer_idx)
+                    )
+                    current_load_block_count = mapper.peek_layer_load_block_count(
+                        layer_idx
+                    )
                     runtime.set_layer_load_ready_event(
                         layer_idx, current_load_ready_event
                     )
@@ -3140,16 +3288,22 @@ class GPUModelRunner(
                     runtime.set_layer_cpu_fill_ready_event(
                         layer_idx, current_cpu_fill_ready_event
                     )
+                    runtime.set_layer_cpu_fill_start_event(
+                        layer_idx, current_cpu_fill_start_event
+                    )
+                    runtime.set_layer_load_block_count(
+                        layer_idx, current_load_block_count
+                    )
 
-                    # Record QKV-end event on the compute stream.
-                    # pre_hook fires after QKV proj has been launched but
-                    # before FlashAttn starts, so this event signals when
-                    # the QKV kernel finishes on GPU — used as the new
-                    # imbalance reference point (§ Phase 1).
-                    if self.device.type == "cuda":
-                        _qkv_end_ev = torch.cuda.Event(enable_timing=True)
-                        _qkv_end_ev.record()  # default = compute stream
-                        runtime.set_qkv_end_event(layer_idx, _qkv_end_ev)
+                    # Imbalance reference: qkv_end(L). Pre_hook(L) fires
+                    # between qkv_proj(L) and the Attention call, so the
+                    # event recorded above marks the exact end of qkv_proj
+                    # on the compute stream. With the indices HtoD lifted
+                    # out of the forward path (promote_plan_indices_to_device
+                    # in pre_hook(L-1)), qkv_proj(L) is no longer artificially
+                    # delayed by residual H2D contention, so qkv_end(L)
+                    # provides a tighter compute-end bound than layer_end
+                    # (L-1) for the IO/compute overlap window.
 
                     # ---- TIMING: sync_wait ----
                     if _timing:
@@ -3172,26 +3326,31 @@ class GPUModelRunner(
                     if layer_idx > 0 and self.device.type == "cuda":
                         qkv_end_event = runtime.get_qkv_end_event(layer_idx)
                         step_anchor_event = runtime.get_step_anchor_event()
-                        if qkv_end_event is not None and step_anchor_event is not None:
+                        if (
+                            qkv_end_event is not None
+                            and step_anchor_event is not None
+                        ):
                             final_ready_event = (
-                                current_cpu_fill_ready_event or current_load_ready_event
+                                current_load_ready_event or current_cpu_fill_ready_event
                             )
                             if final_ready_event is not None:
-                                # KV load and optional CPU-fill H2D now share the
-                                # same load stream. If CPU-fill exists, its event is
-                                # recorded after the KV load on that same stream and
-                                # therefore already represents the final ready point.
-                                # New reference point: QKV-end(L) instead of
-                                # layer_end(L-1), giving IO ~1.5ms extra overlap.
+                                # KV load and optional CPU-fill H2D share the
+                                # same load stream. If KV load exists, its
+                                # event is recorded after the CPU-fill on
+                                # that same stream and already represents
+                                # the final ready point. Compute-end anchor
+                                # is qkv_proj(L)'s end on the compute stream.
                                 qkv_end_event.synchronize()
                                 final_ready_event.synchronize()
-                                qkv_ms = float(
-                                    step_anchor_event.elapsed_time(qkv_end_event)
+                                compute_end_ms = float(
+                                    step_anchor_event.elapsed_time(
+                                        qkv_end_event
+                                    )
                                 )
                                 ready_ms = float(
                                     step_anchor_event.elapsed_time(final_ready_event)
                                 )
-                                imbalance_ms = ready_ms - qkv_ms
+                                imbalance_ms = ready_ms - compute_end_ms
                                 runtime.set_layer_imbalance_ms(layer_idx, imbalance_ms)
                                 if isinstance(
                                     self.replay_plan_provider,
@@ -3285,14 +3444,6 @@ class GPUModelRunner(
                         next_layer_name, next_layer_idx, next_gid = next_layer_info
                         next_mapper = self.paged_block_mappers[next_gid]
 
-                        # Stable reuse requires the *structural* invariant
-                        # plan(L-1).replay_token_count == plan(L).replay_token_count
-                        # so that plan(L).gpu_reuse_slice (bounded by plan(L-1)
-                        # replay length at build time) is valid when consumed
-                        # against replay(L). Two consecutive deadband actions
-                        # only imply feedback-target stability, NOT replay-len
-                        # stability — verify explicitly here and downgrade to
-                        # the spec path if the invariant does not hold.
                         # Two gating paths co-exist during the v1 migration:
                         #  - Legacy: ``runtime.last_observed_stable()`` — two
                         #    consecutive deadband observations promote the
@@ -3306,13 +3457,18 @@ class GPUModelRunner(
                         #    not enter the stable-successor branch.  Gate on:
                         #      hint ∈ {"unchanged", "small_delta"}  AND
                         #      |imbalance(L)| < deadband_ms
-                        # Regardless of the gating signal, plan reuse still
-                        # requires the structural invariant
-                        #   plan(L-1).replay_token_count == plan(L).replay_token_count
-                        # so that plan(L).gpu_reuse_slice (bounded by plan(L-1)
-                        # replay length at build time) is valid when consumed
-                        # against replay(L).
-                        _stable_reuse_ok = False
+                        #
+                        # No structural invariant on plan(L-1) vs plan(L) is
+                        # required: ``build_stable_successor_plan(plan(L))``
+                        # constructs plan(L+1) entirely from plan(L) (its
+                        # gpu_reuse_slice is bounded by plan(L).replay_token
+                        # _count, which exactly matches the length of
+                        # replay(L)'s hidden states it will consume). Small
+                        # block-level fluctuations of replay length across
+                        # consecutive layers are therefore fine in stable
+                        # state.
+                        if _timing:
+                            _bp_ts = _time.perf_counter()
                         _sm_hint = runtime.get_last_plan_change_hint()
                         if _sm_hint is not None:
                             _hint_ok = _sm_hint in ("unchanged", "small_delta")
@@ -3332,31 +3488,11 @@ class GPUModelRunner(
                             _gate_ok = _hint_ok and _imb_ok
                         else:
                             _gate_ok = runtime.last_observed_stable()
-                        if _gate_ok and layer_idx > 0:
-                            _prev_plan = runtime.current_layer_plan(layer_idx - 1)
-                            _curr_plan = runtime.current_layer_plan(layer_idx)
-                            if (
-                                _prev_plan is not None
-                                and _curr_plan is not None
-                                and _prev_plan.replay_token_count
-                                == _curr_plan.replay_token_count
-                            ):
-                                _stable_reuse_ok = True
-                            else:
-                                logger.info(
-                                    "RunKV dynamic replay[step=%d]: stable-branch "
-                                    "invariant violated at pre_hook(L%d) -> "
-                                    "plan(L%d); plan(L%d).replay_token_count=%s "
-                                    "vs plan(L%d).replay_token_count=%s. Falling "
-                                    "back to spec plan.",
-                                    self._dynamic_replay_step_id,
-                                    layer_idx,
-                                    next_layer_idx,
-                                    layer_idx - 1,
-                                    None if _prev_plan is None else _prev_plan.replay_token_count,
-                                    layer_idx,
-                                    None if _curr_plan is None else _curr_plan.replay_token_count,
-                                )
+                        _stable_reuse_ok = _gate_ok and layer_idx > 0
+                        if _timing:
+                            self._prehook_t_bp_gate += (
+                                _time.perf_counter() - _bp_ts
+                            )
 
                         if _stable_reuse_ok:
                             # Steady-state successor plan: reuse replay(L)
@@ -3373,7 +3509,15 @@ class GPUModelRunner(
                             #     next_layer_idx,
                             #     layer_idx,
                             # )
+                            if _timing:
+                                self._prehook_n_steady_branch += 1
+                                _bp_ts = _time.perf_counter()
                             next_plan = build_stable_successor_plan(current_plan)
+                            if _timing:
+                                self._prehook_t_bp_steady_plan += (
+                                    _time.perf_counter() - _bp_ts
+                                )
+                                _bp_ts = _time.perf_counter()
                             next_metadata = self._build_layer_attn_metadata(
                                 layer_idx=next_layer_idx,
                                 plan=next_plan,
@@ -3388,16 +3532,32 @@ class GPUModelRunner(
                                 block_table_tensor=self.paged_block_tables[next_gid],
                                 num_reqs=self._lr_num_reqs,
                             )
+                            if _timing:
+                                self._prehook_t_bp_meta += (
+                                    _time.perf_counter() - _bp_ts
+                                )
+                                _bp_ts = _time.perf_counter()
                             next_skip_block_ids = (
                                 manager.compute_skip_block_ids_from_plan(next_plan)
                             )
+                            if _timing:
+                                self._prehook_t_bp_skip += (
+                                    _time.perf_counter() - _bp_ts
+                                )
                             # Discard the pending spec future — it won't be used.
                             runtime.clear_speculative(next_layer_idx)
                         else:
                             # Non-stable: spec plan was built off-critical-path
                             # at end of layer(L-1). Metadata and H2D transfers
                             # are completed here on the main thread.
+                            if _timing:
+                                self._prehook_n_nonsteady_branch += 1
+                                _bp_ts = _time.perf_counter()
                             spec_plan = runtime.pop_speculative(next_layer_idx)
+                            if _timing:
+                                self._prehook_t_bp_pop_spec += (
+                                    _time.perf_counter() - _bp_ts
+                                )
                             if spec_plan is not None:
                                 next_plan = spec_plan
                             else:
@@ -3415,6 +3575,9 @@ class GPUModelRunner(
                                         layer_idx,
                                     )
                                     self._dynamic_replay_spec_fallback_logged = True
+                                if _timing:
+                                    self._prehook_n_spec_fallback += 1
+                                    _bp_ts = _time.perf_counter()
                                 next_plan = self._build_dynamic_layer_plan(
                                     layer_idx=next_layer_idx,
                                     gid=next_gid,
@@ -3424,8 +3587,14 @@ class GPUModelRunner(
                                     ),
                                     prev_layer_plan=current_plan,
                                 )
+                                if _timing:
+                                    self._prehook_t_bp_fallback += (
+                                        _time.perf_counter() - _bp_ts
+                                    )
                             # Metadata + H2D always on main thread.
                             assert next_plan is not None
+                            if _timing:
+                                _bp_ts = _time.perf_counter()
                             next_metadata = self._build_layer_attn_metadata(
                                 layer_idx=next_layer_idx,
                                 plan=next_plan,
@@ -3440,6 +3609,11 @@ class GPUModelRunner(
                                 block_table_tensor=self.paged_block_tables[next_gid],
                                 num_reqs=self._lr_num_reqs,
                             )
+                            if _timing:
+                                self._prehook_t_bp_meta += (
+                                    _time.perf_counter() - _bp_ts
+                                )
+                                _bp_ts = _time.perf_counter()
                             _use_plan_skip_fb = (
                                 isinstance(
                                     self.replay_plan_provider,
@@ -3464,14 +3638,49 @@ class GPUModelRunner(
                                         self.kv_offload_config.layer_recompute_io_prefix_blocks
                                     ),
                                 )
+                            if _timing:
+                                self._prehook_t_bp_skip += (
+                                    _time.perf_counter() - _bp_ts
+                                )
 
                         # Store plan + metadata + skip_ids for this next layer,
                         # and cache skip_ids so a later steady-state branch can
                         # reuse them.
                         assert next_plan is not None and next_metadata is not None
+                        # Promote the scatter indices to GPU here — before the
+                        # schedule_io segment queues prefetch(L+1) — so the
+                        # small HtoD slips into the empty H2D engine FIFO ahead
+                        # of the big prefetch. forward path then consumes the
+                        # device-resident tensors directly without re-issuing
+                        # `.to()` and stalling behind prefetch.
+                        if _timing:
+                            _bp_ts = _time.perf_counter()
+                        if self.device.type == "cuda":
+                            promote_plan_indices_to_device(next_plan, self.device)
+                        if _timing:
+                            self._prehook_t_bp_promote += (
+                                _time.perf_counter() - _bp_ts
+                            )
+                            _bp_ts = _time.perf_counter()
                         runtime.set_layer_plan(next_layer_idx, next_plan)
                         runtime.set_layer_metadata(next_layer_idx, next_metadata)
                         runtime.set_layer_skip_ids(next_layer_idx, next_skip_block_ids)
+                        # Independent of plan re-use fast paths: derive the
+                        # valid-token count for the directly-H2D'd KV bucket
+                        # from the current mapper + skip ids each pre_hook.
+                        direct_h2d_kv_count = (
+                            manager.compute_direct_h2d_kv_token_count(
+                                mapper=next_mapper,
+                                skip_block_ids=next_skip_block_ids or set(),
+                            )
+                        )
+                        runtime.set_layer_direct_h2d_kv_token_count(
+                            next_layer_idx, direct_h2d_kv_count
+                        )
+                        if _timing:
+                            self._prehook_t_bp_runtime_set += (
+                                _time.perf_counter() - _bp_ts
+                            )
 
                     if _timing:
                         self._prehook_t_build_plan += _time.perf_counter() - _t0
@@ -3505,11 +3714,14 @@ class GPUModelRunner(
                                 f"{next_layer_name}:L{next_layer_idx}"
                             ),
                         ):
-                            next_mapper.load_layer_async(
-                                next_layer_name,
-                                next_layer_idx,
-                                skip_block_ids=next_skip_block_ids,
-                            )
+                            # Submit cpu_fill (small hidden-state H2D) BEFORE
+                            # the KV prefetch (large H2D). The two transfers
+                            # share a single physical copy engine on most
+                            # GPUs, so whichever is enqueued first wins the
+                            # FIFO. cpu_fill is on the critical path of next
+                            # layer's qkv_proj (its bytes feed combined_
+                            # hidden_states[replay_indices]); KV prefetch is
+                            # only consumed by FlashAttn which sits later.
                             if next_plan.cpu_fill_token_count > 0:
                                 manager.load_cpu_fill_h2d_async(
                                     layer_idx=next_layer_idx,
@@ -3519,6 +3731,24 @@ class GPUModelRunner(
                                         next_plan.cpu_fill_block_offsets
                                     ),
                                 )
+                            # Inline IO pressure: submit on a dedicated
+                            # pressure stream BEFORE the layer's KV prefetch.
+                            # Both end up in the shared HtoD copy-engine FIFO
+                            # in submission order, so the pressure copies
+                            # queue ahead of prefetch and contend for
+                            # bandwidth without altering load_stream's own
+                            # submission order. No-op when injector is None
+                            # or kind!=io.
+                            _inline_injector = get_inline_pressure_injector()
+                            if _inline_injector is not None:
+                                _inline_injector.inject_pre_prefetch_io(
+                                    next_layer_idx
+                                )
+                            next_mapper.load_layer_async(
+                                next_layer_name,
+                                next_layer_idx,
+                                skip_block_ids=next_skip_block_ids,
+                            )
                         runtime.set_layer_load_ready_event(
                             next_layer_idx,
                             next_mapper.peek_load_ready_event(next_layer_idx),
@@ -3530,6 +3760,14 @@ class GPUModelRunner(
                         runtime.set_layer_cpu_fill_ready_event(
                             next_layer_idx,
                             manager.peek_cpu_fill_h2d_ready_event(next_layer_idx),
+                        )
+                        runtime.set_layer_cpu_fill_start_event(
+                            next_layer_idx,
+                            manager.peek_cpu_fill_h2d_start_event(next_layer_idx),
+                        )
+                        runtime.set_layer_load_block_count(
+                            next_layer_idx,
+                            next_mapper.peek_layer_load_block_count(next_layer_idx),
                         )
                         if _timing:
                             # Collect load_layer_async sub-timings
@@ -3573,6 +3811,16 @@ class GPUModelRunner(
                         # misc = total - sum of measured segments
                         # (computed at log time, not accumulated per layer)
                         self._prehook_layer_count += 1
+
+                    # Inline SM pressure: submit a fixed-cost matmul block on
+                    # the *current* (default/compute) stream right before FA(L)
+                    # is launched. Stream-internal ordering keeps the matmul
+                    # ahead of FA so its compute time directly substitutes for
+                    # SM availability — no cross-stream sync needed. No-op when
+                    # injector is None or kind!=sm.
+                    _inline_injector = get_inline_pressure_injector()
+                    if _inline_injector is not None:
+                        _inline_injector.inject_pre_attention_sm(layer_idx)
 
                     self._push_runkv_attention_nvtx_range(
                         layer_name=layer_name,
@@ -3995,15 +4243,25 @@ class GPUModelRunner(
         block_table_tensor: torch.Tensor,
         num_reqs: int,
     ) -> AttnMetadataDict:
-        if (
+        _mb_timing = self._prehook_timing_enabled
+        if _mb_timing:
+            _mb_ts = time.perf_counter()
+        _hit = (
             prev_metadata is not None
             and prev_plan is not None
             and plan.num_actual_tokens == prev_plan.num_actual_tokens
             and plan.max_query_len == prev_plan.max_query_len
             and torch.equal(plan.query_start_loc, prev_plan.query_start_loc)
             and torch.equal(plan.slot_mapping, prev_plan.slot_mapping)
-        ):
+        )
+        if _mb_timing:
+            self._prehook_t_mb_reuse_check += time.perf_counter() - _mb_ts
+        if _hit:
+            if _mb_timing:
+                self._prehook_n_meta_reuse_hit += 1
             return prev_metadata
+        if _mb_timing:
+            self._prehook_n_meta_reuse_miss += 1
 
         if base_seq_lens.ndim != 1:
             raise ValueError(
@@ -4015,12 +4273,17 @@ class GPUModelRunner(
                 f"{num_reqs}."
             )
 
+        if _mb_timing:
+            _mb_ts = time.perf_counter()
         query_start_loc_cpu = plan.query_start_loc[: num_reqs + 1]
         if query_start_loc_cpu.device.type != "cpu":
             query_start_loc_cpu = query_start_loc_cpu.cpu()
         seq_lens_cpu = base_seq_lens[:num_reqs]
         if seq_lens_cpu.device.type != "cpu":
             seq_lens_cpu = seq_lens_cpu.cpu()
+        if _mb_timing:
+            self._prehook_t_mb_cpu_prep += time.perf_counter() - _mb_ts
+            _mb_ts = time.perf_counter()
 
         common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=query_start_loc_cpu.to(self.device, non_blocking=True),
@@ -4039,14 +4302,20 @@ class GPUModelRunner(
             slot_mapping=plan.slot_mapping.to(self.device, non_blocking=True),
             causal=True,
         )
+        if _mb_timing:
+            self._prehook_t_mb_common_meta += time.perf_counter() - _mb_ts
 
         attn_metadata: AttnMetadataDict = {}
         for attn_group in self.attn_groups[0]:
             builder = attn_group.get_metadata_builder()
+            if _mb_timing:
+                _mb_ts = time.perf_counter()
             attn_metadata_i = builder.build(
                 common_prefix_len=0,
                 common_attn_metadata=common_attn_metadata,
             )
+            if _mb_timing:
+                self._prehook_t_mb_builder += time.perf_counter() - _mb_ts
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = attn_metadata_i
 
@@ -5382,9 +5651,47 @@ class GPUModelRunner(
             model_name=self.model_config.model,
             total_scheduled_tokens=num_scheduled_tokens,
             num_reqs=num_reqs,
+            step_record_buffer=self._opt_component_mfu_step_records,
+            flat_record_buffer=self._opt_component_mfu_flat_records,
         )
         self._opt_component_mfu_step += 1
         return profiler
+
+    def _flush_opt_component_mfu(self) -> None:
+        """Persist all buffered OPT-component-MFU records to disk.
+
+        Called via atexit (registered in __init__) so per-step writes don't
+        sit on the forward path. Idempotent under repeated invocation.
+        """
+        if self._opt_component_mfu_flushed:
+            return
+        self._opt_component_mfu_flushed = True
+
+        output_path = self._get_opt_component_mfu_output_path()
+        if not output_path:
+            # Nothing was buffered (no output path configured).
+            self._opt_component_mfu_step_records.clear()
+            self._opt_component_mfu_flat_records.clear()
+            return
+
+        import json
+
+        output_path_expanded = os.path.expanduser(output_path)
+        os.makedirs(os.path.dirname(output_path_expanded) or ".", exist_ok=True)
+        stem, _ = os.path.splitext(output_path_expanded)
+        flat_path = f"{stem}.flat.jsonl"
+
+        if self._opt_component_mfu_step_records:
+            with open(output_path_expanded, "a") as f:
+                for rec in self._opt_component_mfu_step_records:
+                    f.write(json.dumps(rec) + "\n")
+        if self._opt_component_mfu_flat_records:
+            with open(flat_path, "a") as f:
+                for rec in self._opt_component_mfu_flat_records:
+                    f.write(json.dumps(rec) + "\n")
+
+        self._opt_component_mfu_step_records.clear()
+        self._opt_component_mfu_flat_records.clear()
 
     @torch.inference_mode()
     def execute_model(
@@ -5628,6 +5935,23 @@ class GPUModelRunner(
                     "sio_cf_h2d_ms": self._prehook_t_sio_cf_h2d * 1000,
                     "sio_misc_ms": _sio_misc * 1000,
                     "misc_ms": _misc * 1000,
+                    "bp_gate_ms": self._prehook_t_bp_gate * 1000,
+                    "bp_steady_plan_ms": self._prehook_t_bp_steady_plan * 1000,
+                    "bp_pop_spec_ms": self._prehook_t_bp_pop_spec * 1000,
+                    "bp_fallback_ms": self._prehook_t_bp_fallback * 1000,
+                    "bp_meta_ms": self._prehook_t_bp_meta * 1000,
+                    "bp_skip_ms": self._prehook_t_bp_skip * 1000,
+                    "bp_promote_ms": self._prehook_t_bp_promote * 1000,
+                    "bp_runtime_set_ms": self._prehook_t_bp_runtime_set * 1000,
+                    "mb_reuse_check_ms": self._prehook_t_mb_reuse_check * 1000,
+                    "mb_cpu_prep_ms": self._prehook_t_mb_cpu_prep * 1000,
+                    "mb_common_meta_ms": self._prehook_t_mb_common_meta * 1000,
+                    "mb_builder_ms": self._prehook_t_mb_builder * 1000,
+                    "n_steady": self._prehook_n_steady_branch,
+                    "n_nonsteady": self._prehook_n_nonsteady_branch,
+                    "n_meta_hit": self._prehook_n_meta_reuse_hit,
+                    "n_meta_miss": self._prehook_n_meta_reuse_miss,
+                    "n_spec_fallback": self._prehook_n_spec_fallback,
                 }
             )
             # Reset per-step accumulators
@@ -5644,6 +5968,23 @@ class GPUModelRunner(
             self._prehook_t_sio_cf_gather = 0.0
             self._prehook_t_sio_cf_pin = 0.0
             self._prehook_t_sio_cf_h2d = 0.0
+            self._prehook_t_bp_gate = 0.0
+            self._prehook_t_bp_steady_plan = 0.0
+            self._prehook_t_bp_pop_spec = 0.0
+            self._prehook_t_bp_fallback = 0.0
+            self._prehook_t_bp_meta = 0.0
+            self._prehook_t_bp_skip = 0.0
+            self._prehook_t_bp_promote = 0.0
+            self._prehook_t_bp_runtime_set = 0.0
+            self._prehook_t_mb_reuse_check = 0.0
+            self._prehook_t_mb_cpu_prep = 0.0
+            self._prehook_t_mb_common_meta = 0.0
+            self._prehook_t_mb_builder = 0.0
+            self._prehook_n_steady_branch = 0
+            self._prehook_n_nonsteady_branch = 0
+            self._prehook_n_meta_reuse_hit = 0
+            self._prehook_n_meta_reuse_miss = 0
+            self._prehook_n_spec_fallback = 0
             self._prehook_t_total = 0.0
             self._prehook_layer_count = 0
 
@@ -8496,6 +8837,8 @@ class GPUModelRunner(
             num_scheduled_tokens_np=num_scheduled_tokens_np,
             prev_layer_plan=None,
         )
+        if self.device.type == "cuda":
+            promote_plan_indices_to_device(layer0_plan, self.device)
         runtime.set_layer_plan(layer0_idx, layer0_plan)
         layer0_metadata = self._build_layer_attn_metadata(
             layer_idx=layer0_idx,
@@ -8540,11 +8883,9 @@ class GPUModelRunner(
                     ),
                 )
             )
-        layer0_mapper.load_layer_async(
-            layer0_name,
-            layer0_idx,
-            skip_block_ids=skip_block_ids,
-        )
+        # cpu_fill (small, on-critical-path) submitted before KV prefetch
+        # (large) so it wins the shared copy-engine FIFO; see schedule_io
+        # comment in _runkv_pre_hook.
         if layer0_plan.cpu_fill_token_count > 0:
             self.layer_recompute_manager.load_cpu_fill_h2d_async(
                 layer_idx=layer0_idx,
@@ -8552,6 +8893,11 @@ class GPUModelRunner(
                 cpu_fill_logical_ids=layer0_plan.cpu_fill_logical_ids,
                 cpu_fill_block_offsets=layer0_plan.cpu_fill_block_offsets,
             )
+        layer0_mapper.load_layer_async(
+            layer0_name,
+            layer0_idx,
+            skip_block_ids=skip_block_ids,
+        )
         runtime.set_layer_load_ready_event(
             layer0_idx,
             layer0_mapper.peek_load_ready_event(layer0_idx),
@@ -8563,6 +8909,23 @@ class GPUModelRunner(
         runtime.set_layer_cpu_fill_ready_event(
             layer0_idx,
             self.layer_recompute_manager.peek_cpu_fill_h2d_ready_event(layer0_idx),
+        )
+        runtime.set_layer_cpu_fill_start_event(
+            layer0_idx,
+            self.layer_recompute_manager.peek_cpu_fill_h2d_start_event(layer0_idx),
+        )
+        direct_h2d_kv_count_l0 = (
+            self.layer_recompute_manager.compute_direct_h2d_kv_token_count(
+                mapper=layer0_mapper,
+                skip_block_ids=skip_block_ids,
+            )
+        )
+        runtime.set_layer_direct_h2d_kv_token_count(
+            layer0_idx, direct_h2d_kv_count_l0
+        )
+        runtime.set_layer_load_block_count(
+            layer0_idx,
+            layer0_mapper.peek_layer_load_block_count(layer0_idx),
         )
         if not getattr(
             self,
