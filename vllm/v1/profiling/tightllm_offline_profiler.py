@@ -167,28 +167,55 @@ def profile_gpu_peak_flops(
     device: torch.device,
     dtype: torch.dtype = torch.float16,
 ) -> float:
-    """Benchmark GPU peak FLOPS via large matmuls."""
-    M = N = K = 4096
-    a = torch.randn(M, K, device=device, dtype=dtype)
-    b = torch.randn(K, N, device=device, dtype=dtype)
+    """Benchmark GPU peak FLOPS by scanning several matmul shapes.
 
-    # Warmup
-    for _ in range(10):
-        torch.mm(a, b)
-    torch.cuda.synchronize()
+    A single fixed shape (e.g. 4096³) frequently underestimates peak —
+    cuBLAS picks different kernels for different shapes, and some
+    workload-relevant shapes (rectangular FFN GEMMs, FP16-accumulate
+    paths used by FlashAttention) routinely beat a square 4096³
+    measurement.  We scan several square + rectangular shapes and
+    return the maximum achieved FLOPS.
+    """
+    shapes: list[tuple[int, int, int]] = [
+        (2048, 2048, 2048),
+        (4096, 4096, 4096),
+        (8192, 8192, 8192),
+        (4096, 8192, 4096),
+        (8192, 4096, 8192),
+        (2048, 8192, 2048),
+    ]
 
-    iters = 50
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        torch.mm(a, b)
-    end.record()
-    torch.cuda.synchronize()
+    best = 0.0
+    for M, N, K in shapes:
+        try:
+            a = torch.randn(M, K, device=device, dtype=dtype)
+            b = torch.randn(K, N, device=device, dtype=dtype)
 
-    elapsed_s = start.elapsed_time(end) / 1000.0
-    flops = 2 * M * N * K * iters
-    return flops / elapsed_s
+            for _ in range(10):
+                torch.mm(a, b)
+            torch.cuda.synchronize()
+
+            iters = 50
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(iters):
+                torch.mm(a, b)
+            end.record()
+            torch.cuda.synchronize()
+
+            elapsed_s = start.elapsed_time(end) / 1000.0
+            flops = 2 * M * N * K * iters / elapsed_s
+            if flops > best:
+                best = flops
+
+            del a, b
+            torch.cuda.empty_cache()
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            continue
+
+    return best
 
 
 def profile_pcie_bandwidth(
@@ -244,10 +271,15 @@ def profile_mfu_attn(
     seq_lengths: list[int],
     dtype: torch.dtype = torch.float16,
 ) -> dict[int, float]:
-    """Profile attention MFU at discrete sequence lengths.
+    """Profile attention MFU at discrete sequence lengths (prefill-style, MHA).
 
-    Runs a QKV-projection → scaled-dot-product-attention → output-projection
-    micro-benchmark and computes MFU = actual_FLOPS / peak_FLOPS.
+    Matches TightLLM (Hu et al., IEEE TC 2025) §IV-B / Fig. 7: the curve
+    is measured by running a *prefill* self-attention pass of length L
+    (q.len = kv.len = L) and dividing the theoretical FLOPs by wall time.
+    This is the only interpretation consistent with Fig. 7's FFN curve
+    rising with sequence length.
+
+    Assumes MHA (num_kv_heads == num_heads).
     """
     mfu_by_seqlen: dict[int, float] = {}
 
@@ -263,22 +295,26 @@ def profile_mfu_attn(
 
             def _run():
                 qkv = torch.matmul(x, w_qkv)
-                q, k, v = qkv.chunk(3, dim=-1)
-                q = q.view(1, seq_len, num_heads, head_dim).transpose(1, 2)
-                k = k.view(1, seq_len, num_heads, head_dim).transpose(1, 2)
-                v = v.view(1, seq_len, num_heads, head_dim).transpose(1, 2)
+                q_part, k_part, v_part = qkv.split(hidden_size, dim=-1)
+                q = q_part.view(1, seq_len, num_heads, head_dim).transpose(1, 2)
+                k = k_part.view(1, seq_len, num_heads, head_dim).transpose(1, 2)
+                v = v_part.view(1, seq_len, num_heads, head_dim).transpose(1, 2)
+                # Full L² attention (no causal mask): keeps the work done by
+                # the kernel consistent with the FLOPs formula below
+                # (4·n_heads·L²·d_head for QK^T + S·V combined).  Using
+                # is_causal=True would halve the real work while the formula
+                # still counts the full triangle, inflating MFU ~2× at long L.
                 attn_out = F.scaled_dot_product_attention(q, k, v)
                 attn_out = (
                     attn_out.transpose(1, 2).contiguous().view(1, seq_len, hidden_size)
                 )
                 return torch.matmul(attn_out, w_out)
 
-            # Warmup
-            for _ in range(3):
+            for _ in range(5):
                 _run()
             torch.cuda.synchronize()
 
-            iters = 10
+            iters = 50
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
@@ -289,18 +325,17 @@ def profile_mfu_attn(
 
             elapsed_s = start.elapsed_time(end) / 1000.0
 
-            # Theoretical attention FLOPs per forward:
-            #   QKV proj : 2 * seq * H * 3H = 6*seq*H^2
-            #   QK^T     : 2 * nheads * seq * seq * head_dim
-            #   Score*V  : 2 * nheads * seq * seq * head_dim  (implicit in SDPA)
-            #   Out proj : 2 * seq * H * H
+            # Prefill-attention FLOPs per forward (q.len = kv.len = L, MHA):
+            #   QKV proj : 2 · L · H · 3H               = 6·L·H²
+            #   QK^T     : 2 · n_heads · L · L · d_head = 2·n_heads·L²·d_head
+            #   Score·V  : 2 · n_heads · L · L · d_head = 2·n_heads·L²·d_head
+            #   Out proj : 2 · L · H · H                = 2·L·H²
             flops_per = (
-                6 * seq_len * hidden_size * hidden_size
-                + 4 * num_heads * seq_len * seq_len * head_dim  # QK^T + score*V
-                + 2 * seq_len * hidden_size * hidden_size
+                8 * seq_len * hidden_size * hidden_size                 # QKV + Out
+                + 4 * num_heads * seq_len * seq_len * head_dim          # QK^T + S·V
             )
             actual = flops_per * iters / elapsed_s
-            mfu_by_seqlen[seq_len] = min(actual / peak_flops, 1.0)
+            mfu_by_seqlen[seq_len] = actual / peak_flops
 
             del x, w_qkv, w_out
             torch.cuda.empty_cache()
@@ -323,7 +358,13 @@ def profile_mfu_ffn(
     seq_lengths: list[int],
     dtype: torch.dtype = torch.float16,
 ) -> dict[int, float]:
-    """Profile FFN MFU at discrete sequence lengths."""
+    """Profile FFN MFU at discrete sequence lengths (prefill-style).
+
+    Matches TightLLM Fig. 7: feed ``seq_len`` tokens through the two
+    FFN linear layers, divide theoretical FLOPs by wall time.  This is
+    the methodology that reproduces the rising-then-flat FFN MFU curve
+    in the paper.
+    """
     mfu_by_seqlen: dict[int, float] = {}
 
     for seq_len in seq_lengths:
@@ -339,11 +380,11 @@ def profile_mfu_ffn(
                 h = F.relu(h)
                 return torch.matmul(h, w2)
 
-            for _ in range(3):
+            for _ in range(5):
                 _run()
             torch.cuda.synchronize()
 
-            iters = 10
+            iters = 50
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
@@ -353,16 +394,18 @@ def profile_mfu_ffn(
             torch.cuda.synchronize()
 
             elapsed_s = start.elapsed_time(end) / 1000.0
-            # FFN FLOPs: 2 * seq * H * F + 2 * seq * F * H = 4 * seq * H * F
+            # FFN FLOPs (q.len = L): 2·L·H·F + 2·L·F·H = 4·L·H·F
             flops_per = 4 * seq_len * hidden_size * ffn_dim
             actual = flops_per * iters / elapsed_s
-            mfu_by_seqlen[seq_len] = min(actual / peak_flops, 1.0)
+            mfu_by_seqlen[seq_len] = actual / peak_flops
 
             del x, w1, w2
             torch.cuda.empty_cache()
 
         except torch.cuda.OutOfMemoryError:
-            logger.warning("OOM at seq_len=%d during FFN profiling, skipping.", seq_len)
+            logger.warning(
+                "OOM at seq_len=%d during FFN profiling, skipping.", seq_len
+            )
             torch.cuda.empty_cache()
             break
 
@@ -436,7 +479,13 @@ def run_offline_profile(
     # 3. Attention MFU
     print(f"\n[3/4] Attention MFU  seq_lengths={seq_lengths}")
     mfu_attn = profile_mfu_attn(
-        torch_device, hidden_size, num_heads, head_dim, peak_flops, seq_lengths, dtype
+        torch_device,
+        hidden_size,
+        num_heads,
+        head_dim,
+        peak_flops,
+        seq_lengths,
+        dtype,
     )
     for sl, val in sorted(mfu_attn.items()):
         print(f"  seq_len={sl:>6d}  MFU_attn={val:.4f}")
