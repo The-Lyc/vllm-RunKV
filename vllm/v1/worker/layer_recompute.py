@@ -46,6 +46,7 @@ class _PrefetchedLayerInputs:
 class _PendingCPUFillLoad:
     gathered_hs_gpu: torch.Tensor
     ready_event: torch.cuda.Event | None
+    start_event: torch.cuda.Event | None = None
 
 
 class LayerRecomputeManager:
@@ -281,6 +282,27 @@ class LayerRecomputeManager:
         """
         return set(int(bid) for bid in plan.skip_logical_block_ids)
 
+    def compute_direct_h2d_kv_token_count(
+        self,
+        *,
+        mapper: PagedBlockMapper,
+        skip_block_ids: set[int],
+    ) -> int:
+        """Valid-token count for blocks H2D'd via ``load_layer_async``.
+
+        These are blocks in ``mapper.mapping`` that are NOT skipped — i.e.
+        their KV is loaded directly from CPU into the GPU staging buffer,
+        not recomputed via qkv_proj.  Uses ``self.cpu_block_valid_lens`` so
+        a partially-filled tail block contributes only its valid tokens.
+        """
+        total = 0
+        valid_lens = self.cpu_block_valid_lens
+        for lid in mapper.mapping:
+            if lid in skip_block_ids:
+                continue
+            total += int(valid_lens[lid])
+        return total
+
     def prefetch_recompute_inputs_for_layer(
         self,
         *,
@@ -449,11 +471,14 @@ class LayerRecomputeManager:
             # ---- SUB-TIMING: cf_h2d (async copy to GPU) ----
             if _t:
                 _th0 = _time.perf_counter()
+            start_event: torch.cuda.Event | None = None
             with record_function_or_nullcontext(
                 f"runkv_recompute:cpu_fill_h2d_copy:L{layer_idx}"
             ):
                 if self._hs_h2d_stream is not None and self.device.type == "cuda":
                     with torch.cuda.stream(self._hs_h2d_stream):
+                        start_event = torch.cuda.Event(enable_timing=True)
+                        start_event.record(self._hs_h2d_stream)
                         gathered_hs_gpu = gathered_hs_cpu.to(
                             self.device, non_blocking=True
                         )
@@ -469,6 +494,7 @@ class LayerRecomputeManager:
             self._pending_cpu_fill_h2d_by_layer[layer_idx] = _PendingCPUFillLoad(
                 gathered_hs_gpu=gathered_hs_gpu,
                 ready_event=ready_event,
+                start_event=start_event,
             )
             return gathered_hs_gpu
 
@@ -493,6 +519,12 @@ class LayerRecomputeManager:
         if pending is None:
             return None
         return pending.ready_event
+
+    def peek_cpu_fill_h2d_start_event(self, layer_idx: int) -> torch.cuda.Event | None:
+        pending = self._pending_cpu_fill_h2d_by_layer.get(layer_idx)
+        if pending is None:
+            return None
+        return pending.start_event
 
     def load_cpu_fill_h2d(
         self,
