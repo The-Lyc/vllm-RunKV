@@ -389,13 +389,22 @@ def compute_layer_replay_plan_for_layer(
         combined_prefix = replay_segment_end + scheduled_len
         query_start_loc.append(combined_prefix)
 
-    query_start_loc_tensor = torch.tensor(query_start_loc, dtype=torch.int32)
-    slot_mapping_tensor = torch.tensor(slot_mapping_values, dtype=torch.int64)
+    # Pin host tensors so downstream `.to(device, non_blocking=True)` is a
+    # genuine async copy. Without pinning, the driver stages pageable memory
+    # and serialises with the host thread, which (with prefetch on the same
+    # H2D engine) can stall the entire forward path.
+    _pin = torch.cuda.is_available()
+    query_start_loc_tensor = torch.tensor(
+        query_start_loc, dtype=torch.int32, pin_memory=_pin
+    )
+    slot_mapping_tensor = torch.tensor(
+        slot_mapping_values, dtype=torch.int64, pin_memory=_pin
+    )
     combined_replay_indices_tensor = torch.tensor(
-        combined_replay_indices, dtype=torch.int64
+        combined_replay_indices, dtype=torch.int64, pin_memory=_pin
     )
     combined_scheduled_indices_tensor = torch.tensor(
-        combined_scheduled_indices, dtype=torch.int64
+        combined_scheduled_indices, dtype=torch.int64, pin_memory=_pin
     )
     replay_blocks_per_req_array = np.asarray(replay_blocks_per_req, dtype=np.int32)
     skip_logical_block_ids_array = np.asarray(
@@ -440,6 +449,36 @@ def compute_layer_replay_plan_for_layer(
         cpu_fill_block_offsets=np.asarray(cpu_fill_block_offsets, dtype=np.int32),
         gpu_reuse_slice_per_req=gpu_reuse_slice_per_req,
     )
+
+
+def promote_plan_indices_to_device(
+    plan: LayerReplayPlan,
+    device: torch.device,
+) -> None:
+    """Move scatter indices to GPU in-place via async H2D.
+
+    `combined_replay_indices` / `combined_scheduled_indices` feed the
+    `index_put_` scatters that build the layer's `combined_hidden_states`,
+    which in turn is the input to qkv_proj. Doing the H2D inside the
+    forward path (after prefetch has been queued) makes qkv_proj wait
+    behind prefetch on the shared copy engine. Promoting here — inside
+    pre_hook(L-1), before schedule_io queues prefetch(L) — lets the small
+    HtoD slip through the empty FIFO ahead of the big prefetch.
+
+    Source tensors must be pinned (see `compute_layer_replay_plan_for_layer`)
+    for `non_blocking=True` to actually return immediately on the host.
+
+    Idempotent under shared-tensor reuse (e.g. `build_stable_successor_plan`
+    transitively forwards the same tensor across layers).
+    """
+    if plan.combined_replay_indices.device != device:
+        plan.combined_replay_indices = plan.combined_replay_indices.to(
+            device, non_blocking=True
+        )
+    if plan.combined_scheduled_indices.device != device:
+        plan.combined_scheduled_indices = plan.combined_scheduled_indices.to(
+            device, non_blocking=True
+        )
 
 
 def build_stable_successor_plan(prev_plan: LayerReplayPlan) -> LayerReplayPlan:
@@ -1135,8 +1174,11 @@ class OPTDynamicReplayRuntime:
     _layer_load_ready_events: list[torch.cuda.Event | None] = field(init=False)
     _layer_load_start_events: list[torch.cuda.Event | None] = field(init=False)
     _layer_cpu_fill_ready_events: list[torch.cuda.Event | None] = field(init=False)
+    _layer_cpu_fill_start_events: list[torch.cuda.Event | None] = field(init=False)
     _layer_forward_start_events: list[torch.cuda.Event | None] = field(init=False)
     _layer_imbalance_ms: list[float | None] = field(init=False)
+    _layer_direct_h2d_kv_token_count: list[int | None] = field(init=False)
+    _layer_load_block_count: list[int | None] = field(init=False)
     _qkv_end_events: list[torch.cuda.Event | None] = field(init=False)
     _speculative_plans: list[LayerReplayPlan | None] = field(init=False)
     _speculative_metadata: list[dict[str, Any] | None] = field(init=False)
@@ -1158,8 +1200,11 @@ class OPTDynamicReplayRuntime:
         self._layer_load_ready_events = [None] * self.num_layers
         self._layer_load_start_events = [None] * self.num_layers
         self._layer_cpu_fill_ready_events = [None] * self.num_layers
+        self._layer_cpu_fill_start_events = [None] * self.num_layers
         self._layer_forward_start_events = [None] * self.num_layers
         self._layer_imbalance_ms = [None] * self.num_layers
+        self._layer_direct_h2d_kv_token_count = [None] * self.num_layers
+        self._layer_load_block_count = [None] * self.num_layers
         self._qkv_end_events = [None] * self.num_layers
         self._speculative_plans = [None] * self.num_layers
         self._speculative_metadata = [None] * self.num_layers
@@ -1396,6 +1441,49 @@ class OPTDynamicReplayRuntime:
         layer_idx: int,
     ) -> torch.cuda.Event | None:
         return self._layer_cpu_fill_ready_events[layer_idx]
+
+    def set_layer_cpu_fill_start_event(
+        self,
+        layer_idx: int,
+        event: torch.cuda.Event | None,
+    ) -> None:
+        # Mirrors load_start_event but for the cpu_fill (HS) H2D stream:
+        # recorded before the H2D copy is enqueued. Pair with
+        # cpu_fill_ready_event to measure stage-1 duration in isolation.
+        self._layer_cpu_fill_start_events[layer_idx] = event
+
+    def get_layer_cpu_fill_start_event(
+        self,
+        layer_idx: int,
+    ) -> torch.cuda.Event | None:
+        return self._layer_cpu_fill_start_events[layer_idx]
+
+    def set_layer_direct_h2d_kv_token_count(
+        self, layer_idx: int, count: int | None
+    ) -> None:
+        # Number of valid history tokens whose KV is loaded directly by
+        # mapper.load_layer_async (= |mapping \ skip_block_ids| × valid_lens,
+        # using LayerRecomputeManager.cpu_block_valid_lens for precision).
+        self._layer_direct_h2d_kv_token_count[layer_idx] = (
+            None if count is None else int(count)
+        )
+
+    def get_layer_direct_h2d_kv_token_count(
+        self, layer_idx: int
+    ) -> int | None:
+        return self._layer_direct_h2d_kv_token_count[layer_idx]
+
+    def set_layer_load_block_count(
+        self, layer_idx: int, count: int | None
+    ) -> None:
+        # Independent block-level cross-check source: |mapping| - |skip|, as
+        # actually enqueued by load_layer_async (set on the mapper).
+        self._layer_load_block_count[layer_idx] = (
+            None if count is None else int(count)
+        )
+
+    def get_layer_load_block_count(self, layer_idx: int) -> int | None:
+        return self._layer_load_block_count[layer_idx]
 
     def set_layer_forward_start_event(
         self,

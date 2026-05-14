@@ -18,8 +18,18 @@ Key equations (adapted from TightLLM Section IV-B, Eq 2-5):
 
     optimal Nr = argmin_{Nr} max(T_attn + T_ffn, T_cache)
 
-The provider plugs into the existing ``ReplayPlanProvider`` protocol and
-reuses the existing budget allocator and plan builder infrastructure.
+NOTE on overlap window (deviates from the paper):
+    The runtime hook in this codebase (``_register_runkv_hooks``) places
+    the host-side ``cudaEventSynchronize`` on layer L+1's KV-ready event
+    *between* QKV-proj(L+1) and FlashAttn(L+1).  This means the compute
+    work that overlaps with layer L+1's prefetch IO is
+
+        attn_scores(L) → out_proj(L) → FFN(L) → QKV_proj(L+1)
+
+    not just ``attn(L) + FFN(L)`` as in the original paper.  ``flops_attn``
+    in ``_compute_times`` therefore includes the next layer's QKV
+    projection (extra 6·H² FLOPs/token) so the ILP's compute-side estimate
+    matches the actual overlap window the runtime exposes.
 """
 
 from __future__ import annotations
@@ -70,11 +80,31 @@ def _compute_times(
 ) -> tuple[float, float]:
     """Compute T_compute and T_transfer for a given Nr (replay_blocks).
 
-    Implements TightLLM Eq 3–5 (KV-only offloading, no disk tier).
+    Implements TightLLM Eq 3–5 (KV-only offloading, no disk tier),
+    extended so the per-layer "overlapable compute window" matches the
+    runtime hook structure in this codebase.
 
-    Eq 3 — Attention compute time:
-        T_attn = Nr · 2·d_attn · (4·d_model + (n_ctx + Nr))
-                 / (FLOPS × MFU_attn)
+    Hook structure (see ``_register_runkv_hooks`` in gpu_model_runner):
+    the pre_hook attached to the Attention module fires *between*
+    QKV-proj(L+1) and FlashAttn(L+1) on the compute stream, and inside
+    that hook the host blocks (``cudaEventSynchronize``) on
+    ``final_ready_event`` of layer L+1's KV transfer.  Concretely, the
+    compute work that executes while IO of the *next* layer is still
+    in flight spans
+
+        attn_scores(L) → out_proj(L) → FFN(L) → QKV_proj(L+1)
+
+    i.e. *everything from the current attention up to, but excluding,
+    the next layer's FlashAttn*.  The original TightLLM paper's Eq 3
+    only counts the current layer's attention block + FFN; we extend
+    the window with the next layer's QKV projection because in steady
+    state every prefetched layer enjoys this extra slack.
+
+    Eq 3' — Attention compute time (per layer, with next-layer QKV
+            credited to the current layer's overlap window):
+        flops_attn = N · ( 8·H²            # QKV(L) + Out(L)
+                          + 6·H²           # QKV(L+1)  (added)
+                          + 2·n_heads·n_ctx·d_head )  # attn scores(L)
 
     Eq 4 — FFN compute time:
         T_ffn  = Nr · 4·d_model·d_ffn / (FLOPS × MFU_ffn)
@@ -97,17 +127,24 @@ def _compute_times(
     d_head = profile.head_dim
     peak = profile.gpu_peak_flops
 
-    # MFU lookup — varies with effective sequence length (paper Fig 7).
-    mfu_attn = max(profile.lookup_mfu_attn(num_actual_tokens), 1e-6)
-    mfu_ffn = max(profile.lookup_mfu_ffn(num_actual_tokens), 1e-6)
+    # MFU lookup — both tables are profiled in the decode regime
+    # (q.len = 1, kv.len = ctx_len), so the look-up key is the per-token
+    # context length, not the batch token count.
+    mfu_attn = max(profile.lookup_mfu_attn(avg_context_len), 1e-6)
+    mfu_ffn = max(profile.lookup_mfu_ffn(avg_context_len), 1e-6)
 
-    # --- Attention FLOPs  (Eq 3) ---
-    # QKV projection:    bs·Nr · 2·d_model · 3·d_attn  = N · 6·H²
-    # Output projection:  bs·Nr · 2·d_attn · d_model    = N · 2·H²
-    # Attention scores:   bs·Nr · 2·d_attn · (n_ctx+Nr) = N · 2·H·ctx
-    #   (d_attn = n_heads·d_head = H for standard MHA)
+    # --- Attention-block FLOPs  (Eq 3, extended) ---
+    # Per-token coefficients (factor of 2 for FMA already included):
+    #   QKV proj  (L)   : 2·H · 3H            = 6·H²
+    #   Out proj  (L)   : 2·H · H             = 2·H²
+    #   QKV proj  (L+1) : 2·H · 3H            = 6·H²   <-- next-layer
+    #                                                     credited here so
+    #                                                     the overlap window
+    #                                                     ends just before
+    #                                                     attn(L+1).
+    #   Attn scores(L)  : 2·n_heads·n_ctx·d_head
     flops_attn = num_actual_tokens * (
-        8 * H * H  # QKV + output proj
+        14 * H * H  # 8·H² (QKV+Out of L) + 6·H² (QKV of L+1)
         + 2 * n_heads * avg_context_len * d_head  # attention scores
     )
 

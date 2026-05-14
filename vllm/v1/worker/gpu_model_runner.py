@@ -174,6 +174,7 @@ from vllm.v1.worker.opt_dynamic_replay import (
     ReplayPlanProvider,
     StaticReplayPlanProvider,
     build_stable_successor_plan,
+    promote_plan_indices_to_device,
 )
 from vllm.v1.worker.runkv_debug import (
     DebugWriter,

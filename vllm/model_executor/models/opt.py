@@ -464,12 +464,12 @@ class OPTDecoder(nn.Module):
                     prev_layer_replay_hidden_states=replay_hidden_states,
                 )
 
-                replay_indices = plan.combined_replay_indices.to(
-                    scheduled_hidden_states.device, dtype=torch.long
-                )
-                scheduled_indices = plan.combined_scheduled_indices.to(
-                    scheduled_hidden_states.device, dtype=torch.long
-                )
+                # Indices were promoted to device in pre_hook(L-1) ahead of
+                # prefetch(L), so they are already on the GPU here. Reading
+                # them inline avoids a forward-path HtoD that would otherwise
+                # serialise behind the prefetch on the shared copy engine.
+                replay_indices = plan.combined_replay_indices
+                scheduled_indices = plan.combined_scheduled_indices
                 combined_hidden_states = torch.empty(
                     (plan.num_actual_tokens, scheduled_hidden_states.shape[-1]),
                     dtype=scheduled_hidden_states.dtype,
@@ -509,21 +509,18 @@ class OPTDecoder(nn.Module):
             # ---- Speculative build for L+2 — non-blocking ----
             # plan(L+1) was written by pre_hook(L) before GPU layer(L) started,
             # so it is already available here as the correct prev_layer_plan.
-            # State-machine heuristic: when the controller is currently in
-            # STEADY or TRANSIT, pre_hook(L+1) will almost certainly take
-            # the stable-successor branch (Δbudget ∈ {0, ±1}) and the
-            # speculative plan would be discarded. Skip the builder work
-            # in those states. TRACKING still submits because Δbudget is
-            # expected to be large. When the state-machine is not active
-            # (legacy path), preserve the original unconditional submit.
+            # Submit unconditionally: the spec builder runs on a CPU side
+            # thread that would otherwise be idle, and any plan unused by
+            # pre_hook's steady-successor branch is discarded by
+            # clear_speculative() at no cost. Gating on SM state previously
+            # caused 48% of nonsteady pre_hooks to fall back to a synchronous
+            # build (TRANSIT skipped submit but pre_hook still required a
+            # full plan when |imbalance| >= deadband).
             if layer_idx + 2 < self.end_layer:
-                _sm_state = runtime.get_last_sm_state()
-                _skip_spec = _sm_state in ("steady", "transit")
-                if not _skip_spec:
-                    runtime.submit_speculative_build(
-                        target_layer_idx=layer_idx + 2,
-                        current_plan=runtime.get_layer_plan(layer_idx + 1),
-                    )
+                runtime.submit_speculative_build(
+                    target_layer_idx=layer_idx + 2,
+                    current_plan=runtime.get_layer_plan(layer_idx + 1),
+                )
 
             runtime.capture_scheduled_layer_input(
                 target_layer_idx=layer_idx + 1,
