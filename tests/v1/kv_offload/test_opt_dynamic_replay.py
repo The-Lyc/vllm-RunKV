@@ -105,6 +105,57 @@ def test_opt_dynamic_replay_runtime_rejects_get_on_unset_layer() -> None:
         runtime.get_layer_plan(0)
 
 
+def test_runtime_direct_h2d_kv_and_load_block_count_roundtrip() -> None:
+    runtime = OPTDynamicReplayRuntime(
+        num_layers=3,
+        cpu_hs_store=torch.empty(1, 1, 1),
+        replay_plan_provider=_DummyReplayPlanProvider(),
+    )
+
+    # Initial state: all None.
+    for li in range(3):
+        assert runtime.get_layer_direct_h2d_kv_token_count(li) is None
+        assert runtime.get_layer_load_block_count(li) is None
+
+    runtime.set_layer_direct_h2d_kv_token_count(1, 12317)
+    runtime.set_layer_load_block_count(1, 774)
+    runtime.set_layer_direct_h2d_kv_token_count(2, 0)
+    runtime.set_layer_load_block_count(2, 0)
+
+    assert runtime.get_layer_direct_h2d_kv_token_count(1) == 12317
+    assert runtime.get_layer_load_block_count(1) == 774
+    assert runtime.get_layer_direct_h2d_kv_token_count(2) == 0
+    assert runtime.get_layer_load_block_count(2) == 0
+    # Unset layer remains None — caller distinguishes "no IO this step" (0)
+    # from "no record" (None) when interpreting the jsonl.
+    assert runtime.get_layer_direct_h2d_kv_token_count(0) is None
+    assert runtime.get_layer_load_block_count(0) is None
+
+    # Float / numpy scalars must be coerced to int.
+    runtime.set_layer_direct_h2d_kv_token_count(0, np.int64(99))
+    runtime.set_layer_load_block_count(0, np.int32(7))
+    assert runtime.get_layer_direct_h2d_kv_token_count(0) == 99
+    assert runtime.get_layer_load_block_count(0) == 7
+    assert isinstance(runtime.get_layer_direct_h2d_kv_token_count(0), int)
+    assert isinstance(runtime.get_layer_load_block_count(0), int)
+
+
+def test_runtime_cpu_fill_start_event_roundtrip() -> None:
+    runtime = OPTDynamicReplayRuntime(
+        num_layers=2,
+        cpu_hs_store=torch.empty(1, 1, 1),
+        replay_plan_provider=_DummyReplayPlanProvider(),
+    )
+
+    # Default None; cuda not required since we store opaque references.
+    assert runtime.get_layer_cpu_fill_start_event(0) is None
+    sentinel = object()  # Stand-in for torch.cuda.Event; runtime is type-agnostic.
+    runtime.set_layer_cpu_fill_start_event(1, sentinel)  # type: ignore[arg-type]
+    assert runtime.get_layer_cpu_fill_start_event(1) is sentinel
+    runtime.set_layer_cpu_fill_start_event(1, None)
+    assert runtime.get_layer_cpu_fill_start_event(1) is None
+
+
 def test_forward_context_accepts_dynamic_replay_runtime() -> None:
     runtime = OPTDynamicReplayRuntime(
         num_layers=1,

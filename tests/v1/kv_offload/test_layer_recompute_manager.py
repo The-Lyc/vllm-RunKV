@@ -185,6 +185,45 @@ def test_register_layernorm_hooks_is_noop_for_dynamic_mode() -> None:
     assert manager._layernorm_hook_handles == []
 
 
+def test_compute_direct_h2d_kv_token_count_uses_valid_lens() -> None:
+    """Sum of cpu_block_valid_lens over (mapping \\ skip_block_ids).
+
+    Partial tail blocks must contribute only their valid token count, not the
+    full block_size; otherwise the metric would high-estimate by up to
+    block_size-1 tokens per request.
+    """
+    manager = _make_manager(num_blocks=16, block_size=4)
+    # Block layout: lid 10/11/12 full (4 tokens each); lid 13 partial (2 tokens).
+    manager.cpu_block_valid_lens[10] = 4
+    manager.cpu_block_valid_lens[11] = 4
+    manager.cpu_block_valid_lens[12] = 4
+    manager.cpu_block_valid_lens[13] = 2
+
+    mapper = SimpleNamespace(mapping={10: 0, 11: 1, 12: 2, 13: 3}, block_size=4)
+
+    # All-skip → 0.
+    assert (
+        manager.compute_direct_h2d_kv_token_count(
+            mapper=mapper, skip_block_ids={10, 11, 12, 13}
+        )
+        == 0
+    )
+    # No skip → 4 + 4 + 4 + 2 = 14.
+    assert (
+        manager.compute_direct_h2d_kv_token_count(
+            mapper=mapper, skip_block_ids=set()
+        )
+        == 14
+    )
+    # Skip 10, 12 → 4 (lid 11) + 2 (lid 13) = 6.
+    assert (
+        manager.compute_direct_h2d_kv_token_count(
+            mapper=mapper, skip_block_ids={10, 12}
+        )
+        == 6
+    )
+
+
 def test_compute_skip_block_ids_is_suffix_only_by_block_index() -> None:
     manager = _make_manager(num_blocks=32, block_size=16)
 
