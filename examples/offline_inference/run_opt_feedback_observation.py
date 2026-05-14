@@ -25,6 +25,7 @@ def _model_tag(model: str) -> str:
 
 def main() -> None:
     root_dir = Path(__file__).resolve().parents[2]
+    passthrough_args = sys.argv[1:]
     python_bin = os.environ.get("PYTHON_BIN", sys.executable)
     model = os.environ.get("MODEL", "/home/lyc/hf_models/opt-2.7b-8k")
     output_dir = os.environ.get(
@@ -32,8 +33,8 @@ def main() -> None:
         "/home/lyc/inference/vllm/exp_results/opt_feedback_observation",
     )
     prefix_blocks = os.environ.get("PREFIX_BLOCKS", "1000")
-    num_prompts = os.environ.get("NUM_PROMPTS", "32")
-    prompt_words = os.environ.get("PROMPT_WORDS", "4000")
+    num_prompts = os.environ.get("NUM_PROMPTS", "128")
+    prompt_words = os.environ.get("PROMPT_WORDS", "1000")
     max_tokens = os.environ.get("MAX_TOKENS", "32")
     gpu_memory_fraction = os.environ.get("GPU_MEMORY_FRACTION", "0.9")
     num_device_buffers = os.environ.get("NUM_DEVICE_BUFFERS", "3")
@@ -123,6 +124,8 @@ def main() -> None:
         cmd.append("--enable-layerwise-nvtx-tracing")
     if enable_profile:
         cmd.append("--profile")
+    if passthrough_args:
+        cmd.extend(passthrough_args)
 
     print("Running OPT feedback observation")
     print(f"  model: {model}")
@@ -141,6 +144,8 @@ def main() -> None:
     print(f"  output_dir: {output_dir}")
     print(f"  suggested_nsys_stem: {nsys_stem}")
     print(f"  enable_nsys: {int(enable_nsys)}")
+    if passthrough_args:
+        print(f"  passthrough_args: {' '.join(passthrough_args)}")
     print()
 
     final_cmd = cmd
@@ -190,6 +195,7 @@ def main() -> None:
             "mfu_flat_jsonl_glob": str(
                 Path(output_dir) / f"opt_component_mfu_*_{run_tag}.flat.jsonl"
             ),
+            "passthrough_args": passthrough_args,
         }
         Path(manifest_file).parent.mkdir(parents=True, exist_ok=True)
         Path(manifest_file).write_text(_json.dumps(_manifest, indent=2) + "\n")

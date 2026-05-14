@@ -59,6 +59,7 @@ def _model_tag(model: str) -> str:
 
 def main() -> None:
     root_dir = Path(__file__).resolve().parents[2]
+    passthrough_args = sys.argv[1:]
     python_bin = os.environ.get("PYTHON_BIN", sys.executable)
     model = os.environ.get("MODEL", "/home/lyc/hf_models/opt-2.7b-8k")
     output_dir = os.environ.get(
@@ -159,6 +160,8 @@ def main() -> None:
         cmd.append("--enable-layerwise-nvtx-tracing")
     if enable_profile:
         cmd.append("--profile")
+    if passthrough_args:
+        cmd.extend(passthrough_args)
 
     print("Running TightLLM ILP planner observation")
     print(f"  model:              {model}")
@@ -176,6 +179,8 @@ def main() -> None:
     print(f"  run_tag:            {run_tag}")
     print(f"  output_dir:         {output_dir}")
     print(f"  enable_nsys:        {int(enable_nsys)}")
+    if passthrough_args:
+        print(f"  passthrough_args:   {' '.join(passthrough_args)}")
     if enable_nsys:
         print(f"  nsys_output:        {nsys_stem}")
     print()
@@ -234,6 +239,7 @@ def main() -> None:
             "mfu_flat_jsonl_glob": str(
                 Path(output_dir) / f"opt_component_mfu_*_{run_tag}.flat.jsonl"
             ),
+            "passthrough_args": passthrough_args,
         }
         Path(manifest_file).parent.mkdir(parents=True, exist_ok=True)
         Path(manifest_file).write_text(_json.dumps(_manifest, indent=2) + "\n")

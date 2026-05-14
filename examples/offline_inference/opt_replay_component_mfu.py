@@ -8,6 +8,8 @@ import argparse
 import contextlib
 import gc
 import os
+from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -107,6 +109,99 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Enable CUDA profiler start/stop for nsys --capture-range=cudaProfilerApi."
+        ),
+    )
+    parser.add_argument(
+        "--resource-pressure-kind",
+        choices=["none", "io", "sm"],
+        default="none",
+        help="Enable runner-controlled resource pressure during engine.step().",
+    )
+    parser.add_argument(
+        "--resource-pressure-clock",
+        choices=["step", "time"],
+        default="step",
+        help="Use scheduler step index or inference elapsed time for pressure stages.",
+    )
+    parser.add_argument(
+        "--resource-pressure-pattern",
+        default="0:0",
+        help="Comma-separated start:target schedule. Step clock uses step:target; time clock uses second:target.",
+    )
+    parser.add_argument(
+        "--resource-pressure-log-path",
+        default=None,
+        help="CSV path for pressure worker actual pressure samples.",
+    )
+    parser.add_argument(
+        "--resource-pressure-step-log-path",
+        default=None,
+        help="JSONL path for per-step resource stage alignment records.",
+    )
+    parser.add_argument("--resource-pressure-device", default="cuda:0")
+    parser.add_argument("--resource-pressure-buffer-mb", type=int, default=256)
+    parser.add_argument(
+        "--resource-pressure-direction",
+        choices=["h2d", "d2h", "bidirectional"],
+        default="h2d",
+    )
+    parser.add_argument("--resource-pressure-matrix-size", type=int, default=4096)
+    parser.add_argument(
+        "--resource-pressure-dtype",
+        choices=["float16", "bfloat16"],
+        default="float16",
+    )
+    parser.add_argument("--resource-pressure-window-s", type=float, default=0.25)
+    parser.add_argument("--resource-pressure-period-ms", type=float, default=100.0)
+    parser.add_argument(
+        "--resource-pressure-max-fraction",
+        type=float,
+        default=0.5,
+        help=(
+            "Clamp background pressure target to this fraction of calibrated "
+            "IO bandwidth or SM duty-cycle capacity. Use 1.0 to allow full target."
+        ),
+    )
+    parser.add_argument(
+        "--resource-pressure-io-calibration-s",
+        type=float,
+        default=0.5,
+        help=(
+            "Seconds spent calibrating the standalone IO copy path before "
+            "inference starts. Set 0 to disable auto calibration."
+        ),
+    )
+    parser.add_argument(
+        "--resource-pressure-io-max-gbps",
+        type=float,
+        default=None,
+        help=(
+            "Manual IO capacity in GB/s for target clamping. Overrides "
+            "auto calibration when positive."
+        ),
+    )
+    parser.add_argument(
+        "--resource-pressure-mode",
+        choices=["thread", "inline"],
+        default="thread",
+        help=(
+            "thread: legacy background-worker pressure (races with model "
+            "execution at host-sync boundaries). inline: pressure injected "
+            "synchronously from RunKV pre_hook on each layer (IO before "
+            "prefetch on a dedicated stream, SM before FA on the compute "
+            "stream). Inline keeps the original IO/compute submission order "
+            "intact and produces identical interference for RunKV / TightLLM."
+        ),
+    )
+    parser.add_argument(
+        "--resource-pressure-inline-layer-period-ms",
+        type=float,
+        default=5.0,
+        help=(
+            "Estimated per-layer wall time used to size each inline burst. "
+            "IO bytes/layer = target_GBps * this_ms * 1e6; SM ms/layer = "
+            "this_ms * target_percent / 100. Set to a representative steady-"
+            "state layer time observed in a baseline run."
         ),
     )
     return parser.parse_args()
@@ -252,9 +347,14 @@ def run_prompts_with_engine(
     *,
     max_tokens: int,
     enable_profiling: bool,
+    resource_controller: Any | None = None,
 ) -> None:
     from vllm import SamplingParams
     from vllm.sampling_params import RequestOutputKind
+    from vllm.v1.profiling.opt_component_mfu import (
+        set_inline_pressure_injector,
+        set_opt_component_mfu_resource_context,
+    )
 
     pending_requests: set[str] = set()
 
@@ -272,6 +372,15 @@ def run_prompts_with_engine(
             )
             pending_requests.add(request_id)
 
+    if resource_controller is not None:
+        resource_controller.start()
+        # Register the controller as the per-layer inline injector when it's
+        # configured for inline mode. The pre_hook in gpu_model_runner picks
+        # it up via vllm.v1.profiling.opt_component_mfu.get_inline_pressure_
+        # injector(); a None registration keeps thread-mode behavior intact.
+        if getattr(resource_controller, "inline_mode", False):
+            set_inline_pressure_injector(resource_controller)
+
     if enable_profiling:
         cuda_profiler_start()
 
@@ -279,6 +388,13 @@ def run_prompts_with_engine(
     try:
         with nvtx_range("inference_loop", color="blue"):
             while pending_requests:
+                resource_context = None
+                step_start_s = None
+                if resource_controller is not None:
+                    resource_context = resource_controller.before_step(step)
+                    step_start_s = resource_context.get("step_start_s")
+                set_opt_component_mfu_resource_context(resource_context)
+
                 with nvtx_range(f"step_{step}", color="yellow"):
                     step_outputs = engine.step()
 
@@ -287,10 +403,93 @@ def run_prompts_with_engine(
                     if request_id is not None and getattr(out, "finished", False):
                         pending_requests.discard(request_id)
 
+                if resource_controller is not None:
+                    resource_controller.after_step(
+                        step_id=step,
+                        step_start_s=step_start_s,
+                        step_end_s=resource_controller.elapsed_s(),
+                        output_count=len(step_outputs),
+                        pending_count=len(pending_requests),
+                    )
+
                 step += 1
     finally:
+        set_opt_component_mfu_resource_context(None)
+        set_inline_pressure_injector(None)
         if enable_profiling:
             cuda_profiler_stop()
+        if resource_controller is not None:
+            resource_controller.stop()
+
+
+def _derive_setting_path(
+    raw_path: str | None,
+    *,
+    setting: str | int,
+    settings_count: int,
+) -> str | None:
+    if raw_path is None:
+        return None
+    if settings_count <= 1:
+        return raw_path
+    path = Path(raw_path)
+    return str(path.with_name(f"{path.stem}_{setting}{path.suffix}"))
+
+
+def _make_resource_controller(
+    args: argparse.Namespace,
+    *,
+    setting: str | int,
+    settings_count: int,
+    run_tag: str,
+):
+    if args.resource_pressure_kind == "none":
+        return None
+
+    from benchmarks.runkv_resource_pressure.controller import (
+        ResourcePressureConfig,
+        ResourcePressureController,
+    )
+
+    log_path = _derive_setting_path(
+        args.resource_pressure_log_path,
+        setting=setting,
+        settings_count=settings_count,
+    )
+    step_log_path = _derive_setting_path(
+        args.resource_pressure_step_log_path,
+        setting=setting,
+        settings_count=settings_count,
+    )
+    if log_path is None and args.output_dir:
+        log_path = str(Path(args.output_dir) / f"pressure_{setting}_{run_tag}.csv")
+    if step_log_path is None and args.output_dir:
+        step_log_path = str(
+            Path(args.output_dir) / f"resource_steps_{setting}_{run_tag}.jsonl"
+        )
+
+    config = ResourcePressureConfig(
+        kind=args.resource_pressure_kind,
+        clock=args.resource_pressure_clock,
+        pattern=args.resource_pressure_pattern,
+        log_path=log_path,
+        step_log_path=step_log_path,
+        device=args.resource_pressure_device,
+        buffer_mb=args.resource_pressure_buffer_mb,
+        direction=args.resource_pressure_direction,
+        matrix_size=args.resource_pressure_matrix_size,
+        dtype=args.resource_pressure_dtype,
+        window_s=args.resource_pressure_window_s,
+        period_ms=args.resource_pressure_period_ms,
+        max_fraction=args.resource_pressure_max_fraction,
+        io_calibration_s=args.resource_pressure_io_calibration_s,
+        io_max_gbps=args.resource_pressure_io_max_gbps,
+        mode=getattr(args, "resource_pressure_mode", "thread"),
+        inline_layer_period_ms=getattr(
+            args, "resource_pressure_inline_layer_period_ms", 5.0
+        ),
+    )
+    return ResourcePressureController(config)
 
 
 def main() -> None:
@@ -309,7 +508,9 @@ def main() -> None:
 
         _run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    for setting in parse_prefix_settings(args.prefix_blocks):
+    prefix_settings = parse_prefix_settings(args.prefix_blocks)
+
+    for setting in prefix_settings:
         prompts = build_prompts(args.num_prompts, args.prompt_words)
 
         # Build per-setting JSONL output path if --output-dir was given
@@ -346,11 +547,22 @@ def main() -> None:
                 max_num_seqs=max(args.num_prompts, 1),
             )
 
+        resource_controller = _make_resource_controller(
+            args,
+            setting=setting,
+            settings_count=len(prefix_settings),
+            run_tag=_run_tag,
+        )
+        if resource_controller is not None:
+            with nvtx_range("resource_pressure_prepare", color="red"):
+                resource_controller.prepare()
+
         run_prompts_with_engine(
             engine,
             prompts,
             max_tokens=args.max_tokens,
             enable_profiling=args.profile,
+            resource_controller=resource_controller,
         )
 
         # ---- Collect imbalance statistics from the replay plan provider ----
