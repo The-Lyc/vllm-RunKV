@@ -64,8 +64,10 @@ try:
     import matplotlib.ticker as mticker
 
     HAS_MPL = True
-except ImportError:
+    MPL_IMPORT_ERROR: ImportError | None = None
+except ImportError as exc:
     HAS_MPL = False
+    MPL_IMPORT_ERROR = exc
 
 try:
     import numpy as np
@@ -671,6 +673,67 @@ class Report:
 # ══════════════════════════════════════════════════════════════════════════════
 # Analysis sections
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+def extract_inference_loop_seconds(nvtx: list[dict]) -> float | None:
+    durations_s = [
+        r["dur_ms"] / 1000.0
+        for r in nvtx
+        if r["text"] == "inference_loop" and r["dur_ms"] > 0
+    ]
+    return sum(durations_s) if durations_s else None
+
+
+def analyze_decode_throughput(
+    rpt: Report,
+    runkv_nvtx: list[dict],
+    tightllm_nvtx: list[dict],
+    num_prompts: int | None,
+    max_tokens: int | None,
+    decode_tokens: int | None,
+    fixed_output_length: bool,
+) -> None:
+    rpt.h1("END-TO-END DECODE THROUGHPUT")
+    if decode_tokens is not None:
+        total_tokens = decode_tokens
+        token_source = "explicit --decode-tokens"
+        throughput_header = "decode_tok/s"
+    elif num_prompts is not None and max_tokens is not None:
+        total_tokens = num_prompts * max_tokens
+        token_source = (
+            f"configured output budget: {num_prompts} prompts x "
+            f"{max_tokens} max tokens"
+        )
+        throughput_header = (
+            "decode_tok/s" if fixed_output_length else "budget_tok/s_ub"
+        )
+    else:
+        rpt.row(
+            "  NOT AVAILABLE - pass --num-prompts and --max-tokens "
+            "(or --decode-tokens) to compute throughput."
+        )
+        return
+
+    rpt.row(f"  decode tokens: {total_tokens} ({token_source})")
+    if decode_tokens is None and fixed_output_length:
+        rpt.row(
+            "  Fixed-length generation is enabled (ignore_eos=True); "
+            "the configured output budget is the actual token count."
+        )
+    elif decode_tokens is None:
+        rpt.row(
+            "  Upper bound only: this trace did not persist final output "
+            "token counts and requests could terminate early at EOS."
+        )
+
+    rows: list[list[Any]] = []
+    for label, nvtx in (("RunKV", runkv_nvtx), ("TightLLM", tightllm_nvtx)):
+        seconds = extract_inference_loop_seconds(nvtx)
+        if seconds is None:
+            rows.append([label, "N/A", "N/A"])
+        else:
+            rows.append([label, f"{seconds:.6f}", f"{total_tokens / seconds:.3f}"])
+    rpt.table(["system", "loop_s", throughput_header], rows, col_width=16)
 
 
 def analyze_layer_total_gpu(
@@ -2491,17 +2554,19 @@ def _glob_expand(paths: list[str]) -> list[str]:
 
 
 def _extract_run_timestamp(paths: list[str]) -> str | None:
-    """Extract YYYYMMDD_HHMM tag from filenames that contain _YYYYMMDD_HHMMSS.
+    """Extract YYYYMMDD_HHMM tag from filenames with an HHMM[SS] run time.
 
-    Example: opt_component_mfu_1000_20260420_101617.flat.jsonl → '20260420_1016'
+    Examples:
+      opt_component_mfu_1000_20260420_101617.flat.jsonl -> '20260420_1016'
+      opt_component_mfu_1000_20260524_2235.flat.jsonl   -> '20260524_2235'
     Returns None if no matching timestamp is found in any of the given paths.
     """
-    _ts_re = re.compile(r"_(\d{8})_(\d{6})")
+    _ts_re = re.compile(r"_(\d{8})_(\d{4})(?:\d{2})?")
     for p in paths:
         m = _ts_re.search(Path(p).name)
         if m:
-            date_part = m.group(1)       # e.g. '20260420'
-            time_part = m.group(2)[:4]   # e.g. '1016' (drop seconds)
+            date_part = m.group(1)
+            time_part = m.group(2)
             return f"{date_part}_{time_part}"
     return None
 
@@ -2514,6 +2579,30 @@ def main() -> None:
     ap.add_argument("--tightllm-sqlite", default="")
     ap.add_argument("--output-dir", default="exp_results/analysis/per_layer")
     ap.add_argument("--skip-warmup-steps", type=int, default=1)
+    ap.add_argument("--num-prompts", type=int, default=None)
+    ap.add_argument("--max-tokens", type=int, default=None)
+    ap.add_argument(
+        "--decode-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Explicit generated decode-token count. Overrides "
+            "--num-prompts * --max-tokens for throughput calculation."
+        ),
+    )
+    ap.add_argument(
+        "--fixed-output-length",
+        action="store_true",
+        help=(
+            "Generation used ignore_eos=True, so "
+            "--num-prompts * --max-tokens is an exact decode-token count."
+        ),
+    )
+    ap.add_argument(
+        "--skip-plots",
+        action="store_true",
+        help="Write the text summary only; do not require or generate matplotlib plots.",
+    )
     ap.add_argument(
         "--compute-stream",
         type=int,
@@ -2527,6 +2616,14 @@ def main() -> None:
         help="Tolerance (ms) for MEMCPY end-time matching (default 2.0)",
     )
     args = ap.parse_args()
+
+    if not args.skip_plots and not HAS_MPL:
+        raise SystemExit(
+            "Plot generation requires matplotlib, but it cannot be imported in "
+            f"this Python environment ({MPL_IMPORT_ERROR}). Install the repository "
+            "bench dependencies (for example `python -m pip install -e '.[bench]'`) "
+            "or rerun with --skip-plots for a summary-only analysis."
+        )
 
     # Derive a timestamp-based subdirectory from input filenames.
     # Priority: runkv_mfu paths → runkv_sqlite → tightllm_mfu → tightllm_sqlite
@@ -2656,6 +2753,15 @@ def main() -> None:
     print(f"  tightllm replay stat layers : {len(tightllm_rs)}")
 
     # ── Analyses ─────────────────────────────────────────────────────────────
+    analyze_decode_throughput(
+        rpt,
+        runkv_nvtx,
+        tightllm_nvtx,
+        args.num_prompts,
+        args.max_tokens,
+        args.decode_tokens,
+        args.fixed_output_length,
+    )
     analyze_imbalance(rpt, runkv_imb, tightllm_imb)
     analyze_compute_vs_io(rpt, runkv_ev, tightllm_ev)
     analyze_layer_total_gpu(rpt, runkv_deltas, tightllm_deltas)
@@ -2706,22 +2812,25 @@ def main() -> None:
         f"  tightllm per-step-layer metrics : {list(k for k, v in tightllm_psl.items() if v)}"
     )
 
-    plot_imbalance(runkv_imb, tightllm_imb, out_dir)
-    plot_compute_vs_io(runkv_ev, tightllm_ev, out_dir)
-    plot_replay_tokens(runkv_rs, tightllm_rs, runkv_deltas, tightllm_deltas, out_dir)
-    plot_clean_compute(runkv_kt, tightllm_kt, out_dir)
-    plot_per_step_layer_lines(runkv_psl, tightllm_psl, out_dir)
-    plot_layer_timeline(
-        runkv_deltas,
-        tightllm_deltas,
-        runkv_dma,
-        tightllm_dma,
-        runkv_prehook,
-        tightllm_prehook,
-        runkv_lc,
-        tightllm_lc,
-        out_dir,
-    )
+    if not args.skip_plots:
+        plot_imbalance(runkv_imb, tightllm_imb, out_dir)
+        plot_compute_vs_io(runkv_ev, tightllm_ev, out_dir)
+        plot_replay_tokens(
+            runkv_rs, tightllm_rs, runkv_deltas, tightllm_deltas, out_dir
+        )
+        plot_clean_compute(runkv_kt, tightllm_kt, out_dir)
+        plot_per_step_layer_lines(runkv_psl, tightllm_psl, out_dir)
+        plot_layer_timeline(
+            runkv_deltas,
+            tightllm_deltas,
+            runkv_dma,
+            tightllm_dma,
+            runkv_prehook,
+            tightllm_prehook,
+            runkv_lc,
+            tightllm_lc,
+            out_dir,
+        )
 
 
 if __name__ == "__main__":

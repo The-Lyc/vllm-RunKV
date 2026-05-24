@@ -690,14 +690,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--runkv-run-dir", nargs="*", default=[])
     parser.add_argument("--tightllm-run-dir", nargs="*", default=[])
+    parser.add_argument(
+        "--dryrun-run-dir",
+        nargs="*",
+        default=[],
+        help=(
+            "Run directories produced by RunKV with DRY_RUN=1 (vanilla "
+            "baseline; planner emits no replay/skip decisions). Stage and "
+            "comparison rows for these runs are emitted under the system "
+            "label 'runkv-dryrun'."
+        ),
+    )
     parser.add_argument("--runkv-step-log", nargs="*", default=[])
     parser.add_argument("--tightllm-step-log", nargs="*", default=[])
+    parser.add_argument("--dryrun-step-log", nargs="*", default=[])
     parser.add_argument("--runkv-mfu", nargs="*", default=[])
     parser.add_argument("--tightllm-mfu", nargs="*", default=[])
+    parser.add_argument("--dryrun-mfu", nargs="*", default=[])
     parser.add_argument("--runkv-mfu-flat", nargs="*", default=[])
     parser.add_argument("--tightllm-mfu-flat", nargs="*", default=[])
+    parser.add_argument("--dryrun-mfu-flat", nargs="*", default=[])
     parser.add_argument("--runkv-pressure", nargs="*", default=[])
     parser.add_argument("--tightllm-pressure", nargs="*", default=[])
+    parser.add_argument("--dryrun-pressure", nargs="*", default=[])
     parser.add_argument("--output-dir", default="exp_results/analysis/staged_resource")
     parser.add_argument("--skip-warmup-steps", type=int, default=1)
     # Decode-throughput inputs. Sqlite paths are optional — when omitted, the
@@ -707,6 +722,7 @@ def build_parser() -> argparse.ArgumentParser:
     # step_0 start → last step end can be turned into tokens/s.
     parser.add_argument("--runkv-sqlite", nargs="*", default=[])
     parser.add_argument("--tightllm-sqlite", nargs="*", default=[])
+    parser.add_argument("--dryrun-sqlite", nargs="*", default=[])
     parser.add_argument(
         "--num-prompts",
         type=int,
@@ -736,6 +752,7 @@ def main() -> None:
     runs: list[RunInputs] = []
     runs.extend(_discover_run_inputs("runkv-feedback", args.runkv_run_dir))
     runs.extend(_discover_run_inputs("tightllm-replay", args.tightllm_run_dir))
+    runs.extend(_discover_run_inputs("runkv-dryrun", args.dryrun_run_dir))
     runs.extend(
         _manual_run_inputs(
             "runkv-feedback",
@@ -754,8 +771,20 @@ def main() -> None:
             pressure_logs=args.tightllm_pressure,
         )
     )
+    runs.extend(
+        _manual_run_inputs(
+            "runkv-dryrun",
+            step_logs=args.dryrun_step_log,
+            mfu_steps=args.dryrun_mfu,
+            mfu_flat=args.dryrun_mfu_flat,
+            pressure_logs=args.dryrun_pressure,
+        )
+    )
     if not runs:
-        raise SystemExit("No run inputs provided. Use --runkv-run-dir / --tightllm-run-dir or explicit file arguments.")
+        raise SystemExit(
+            "No run inputs provided. Use --runkv-run-dir / --tightllm-run-dir / "
+            "--dryrun-run-dir or explicit file arguments."
+        )
 
     all_stage_rows: list[dict[str, Any]] = []
     run_summaries: list[dict[str, Any]] = []
@@ -778,8 +807,9 @@ def main() -> None:
 
     sqlite_overrides_runkv = _expand_patterns(args.runkv_sqlite)
     sqlite_overrides_tightllm = _expand_patterns(args.tightllm_sqlite)
+    sqlite_overrides_dryrun = _expand_patterns(args.dryrun_sqlite)
     throughput_rows: list[dict[str, Any]] = []
-    runkv_idx = tightllm_idx = 0
+    runkv_idx = tightllm_idx = dryrun_idx = 0
     for run in runs:
         if run.system == "runkv-feedback" and runkv_idx < len(sqlite_overrides_runkv):
             override = sqlite_overrides_runkv[runkv_idx]
@@ -787,6 +817,9 @@ def main() -> None:
         elif run.system == "tightllm-replay" and tightllm_idx < len(sqlite_overrides_tightllm):
             override = sqlite_overrides_tightllm[tightllm_idx]
             tightllm_idx += 1
+        elif run.system == "runkv-dryrun" and dryrun_idx < len(sqlite_overrides_dryrun):
+            override = sqlite_overrides_dryrun[dryrun_idx]
+            dryrun_idx += 1
         else:
             override = None
         throughput_rows.append(
