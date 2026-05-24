@@ -304,7 +304,8 @@ class Worker(WorkerBase):
             by adjusting the `gpu_memory_utilization` parameter.
         """
         # RunKV offload has two distinct memory budgets:
-        # 1) CPU KV cache backing store (can be large; optionally capped by
+        # 1) CPU backing store (KV plus hidden-state snapshots when recompute
+        #    is enabled; optionally capped by
         #    kv_offload_config.cpu_memory_limit).
         # 2) GPU staging buffers used at runtime for per-layer paging.
         # We still run a profile to estimate a safe GPU staging budget, but the
@@ -317,7 +318,7 @@ class Worker(WorkerBase):
         )
 
         def _get_runkv_cpu_memory_limit_bytes() -> tuple[int, str]:
-            """Return the CPU KV cache backing store limit in bytes.
+            """Return the CPU backing-store budget in bytes.
 
             If the user provides an explicit cpu_memory_limit, use it; otherwise
             derive a safe limit from current available system memory.
@@ -379,8 +380,8 @@ class Worker(WorkerBase):
                 )
                 cpu_limit, cpu_limit_src = _get_runkv_cpu_memory_limit_bytes()
                 logger.info_once(
-                    "RunKV enabled: using cpu_memory_limit=%s bytes (%s) for CPU KV "
-                    "cache backing store; using kv_cache_memory_bytes=%s bytes as "
+                    "RunKV enabled: using cpu_memory_limit=%s bytes (%s) for CPU "
+                    "backing store; using kv_cache_memory_bytes=%s bytes as "
                     "GPU staging budget baseline; skipped GPU memory profiling.",
                     cpu_limit,
                     cpu_limit_src,
@@ -463,7 +464,7 @@ class Worker(WorkerBase):
             )
             cpu_limit, cpu_limit_src = _get_runkv_cpu_memory_limit_bytes()
             logger.info_once(
-                "RunKV enabled: using cpu_memory_limit=%s bytes (%s) for CPU KV cache "
+                "RunKV enabled: using cpu_memory_limit=%s bytes (%s) for CPU "
                 "backing store; profiled GPU staging budget baseline is %.2f GiB.",
                 cpu_limit,
                 cpu_limit_src,

@@ -30,7 +30,8 @@ class RunKVOffloadConfig:
     # whether turn on async offload
     enable_async_offload: bool = True
 
-    # CPU memory limit for KV cache offload in bytes
+    # CPU backing-store budget in bytes. With layer recompute enabled this is
+    # shared by CPU KV and CPU hidden-state snapshots.
     cpu_memory_limit: int | None = None
 
     # If cpu_memory_limit is not set, cap CPU backing store budget to
