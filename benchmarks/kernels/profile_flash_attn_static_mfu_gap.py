@@ -3,10 +3,11 @@
 
 from __future__ import annotations
 
-import json
+import copy
+import csv
 import math
 import statistics
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -19,13 +20,80 @@ from vllm.attention.utils.fa_utils import (
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, set_random_seed
 
+# Dense Tensor Core TFLOPS using FP32 accumulation. This matches the default
+# BF16 benchmark path and avoids counting structured-sparsity throughput.
 COMMON_FP16_BF16_PEAK_TFLOPS = {
+    "GeForce RTX 3080 Ti": 136,
+    "GeForce RTX 4090": 330,
     "A100": 312.0,
     "A800": 312.0,
     "H100 SXM": 989.0,
     "H100 PCIe": 756.0,
     "H200": 989.0,
     "H800": 989.0,
+}
+
+
+@dataclass(frozen=True)
+class ModelShape:
+    name: str
+    hidden_size: int
+    ffn_intermediate_size: int
+    num_query_heads: int
+    num_kv_heads: int
+    head_size: int
+    activation: str
+    num_hidden_layers: int | None = None
+    native_max_context: int | None = None
+
+
+# Per-layer shapes from the public OPT configurations. OPT uses MHA, so
+# num_kv_heads equals num_query_heads rather than the GQA-shaped legacy default.
+OPT_MODEL_SHAPES = {
+    "opt-2.7b": ModelShape(
+        name="opt-2.7b",
+        hidden_size=2560,
+        ffn_intermediate_size=10240,
+        num_query_heads=32,
+        num_kv_heads=32,
+        head_size=80,
+        activation="relu",
+        num_hidden_layers=32,
+        native_max_context=2048,
+    ),
+    "opt-6.7b": ModelShape(
+        name="opt-6.7b",
+        hidden_size=4096,
+        ffn_intermediate_size=16384,
+        num_query_heads=32,
+        num_kv_heads=32,
+        head_size=128,
+        activation="relu",
+        num_hidden_layers=32,
+        native_max_context=2048,
+    ),
+    "opt-13b": ModelShape(
+        name="opt-13b",
+        hidden_size=5120,
+        ffn_intermediate_size=20480,
+        num_query_heads=40,
+        num_kv_heads=40,
+        head_size=128,
+        activation="relu",
+        num_hidden_layers=40,
+        native_max_context=2048,
+    ),
+    "opt-30b": ModelShape(
+        name="opt-30b",
+        hidden_size=7168,
+        ffn_intermediate_size=28672,
+        num_query_heads=56,
+        num_kv_heads=56,
+        head_size=128,
+        activation="relu",
+        num_hidden_layers=48,
+        native_max_context=2048,
+    ),
 }
 
 
@@ -57,10 +125,72 @@ class RunStats:
     predicted_tflops: float | None = None
     predicted_mfu: float | None = None
     error_pct: float | None = None
+    round_mfus: list[float] = field(default_factory=list, repr=False)
 
 
 def parse_int_list(spec: str) -> list[int]:
     return [int(item) for item in spec.split(",") if item]
+
+
+def resolve_model_shapes(args) -> list[ModelShape]:
+    if args.model_presets:
+        names = [item.strip().lower() for item in args.model_presets.split(",") if item]
+        if not names:
+            raise ValueError("--model-presets must contain at least one model name.")
+        unknown = [name for name in names if name not in OPT_MODEL_SHAPES]
+        if unknown:
+            available = ", ".join(OPT_MODEL_SHAPES)
+            raise ValueError(
+                f"Unknown --model-presets values {unknown}; available presets: {available}."
+            )
+        return [OPT_MODEL_SHAPES[name] for name in names]
+
+    hidden_size = args.num_query_heads * args.head_size
+    return [
+        ModelShape(
+            name="custom",
+            hidden_size=hidden_size,
+            ffn_intermediate_size=(
+                args.ffn_intermediate_size
+                if args.ffn_intermediate_size is not None
+                else args.ffn_multiplier * hidden_size
+            ),
+            num_query_heads=args.num_query_heads,
+            num_kv_heads=args.num_kv_heads,
+            head_size=args.head_size,
+            activation=args.ffn_activation,
+        )
+    ]
+
+
+def args_for_context(args, context_len: int | None):
+    run_args = copy.copy(args)
+    if context_len is None:
+        return run_args
+
+    run_args.seq_len = context_len
+    run_args.mean_seq_len = context_len
+    valid_tails = [
+        tail for tail in parse_int_list(args.tail_seq_lens) if tail >= context_len
+    ]
+    if not valid_tails:
+        valid_tails = [context_len]
+    run_args.tail_seq_lens = ",".join(str(tail) for tail in valid_tails)
+    run_args.budget_tail_seq_len = max(args.budget_tail_seq_len, context_len)
+    return run_args
+
+
+def format_shape(shape: ModelShape) -> str:
+    layers = (
+        f", layers={shape.num_hidden_layers}"
+        if shape.num_hidden_layers is not None
+        else ""
+    )
+    return (
+        f"{shape.name}: hidden={shape.hidden_size}, heads={shape.num_query_heads}, "
+        f"kv_heads={shape.num_kv_heads}, head_size={shape.head_size}, "
+        f"ffn={shape.ffn_intermediate_size}{layers}"
+    )
 
 
 def infer_peak_tflops(device_name: str) -> float | None:
@@ -120,6 +250,32 @@ def format_optional(value: float | None, fmt: str = ".3f") -> str:
     if value is None:
         return "n/a"
     return format(value, fmt)
+
+
+def measure_round_latencies(
+    run,
+    *,
+    warmup: int,
+    trials: int,
+    rounds: int,
+) -> list[float]:
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    round_latencies_ms: list[float] = []
+    for _ in range(rounds):
+        for _ in range(warmup):
+            run()
+        torch.cuda.synchronize()
+
+        samples_ms: list[float] = []
+        for _ in range(trials):
+            start.record()
+            run()
+            end.record()
+            torch.cuda.synchronize()
+            samples_ms.append(start.elapsed_time(end))
+        round_latencies_ms.append(statistics.fmean(samples_ms))
+    return round_latencies_ms
 
 
 def _rebalance_sum(
@@ -294,6 +450,7 @@ class FlashAttnBenchRunner:
         *,
         warmup: int,
         trials: int,
+        rounds: int,
         peak_tflops: float | None,
     ) -> RunStats:
         (
@@ -324,30 +481,35 @@ class FlashAttnBenchRunner:
                 block_table=block_table,
             )
 
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        for _ in range(warmup):
-            run()
-        torch.cuda.synchronize()
-
-        samples_ms: list[float] = []
-        for _ in range(trials):
-            start.record()
-            run()
-            end.record()
-            torch.cuda.synchronize()
-            samples_ms.append(start.elapsed_time(end))
-
-        latency_ms = statistics.fmean(samples_ms)
-        latency_std_ms = statistics.pstdev(samples_ms) if len(samples_ms) > 1 else 0.0
+        round_latencies_ms = measure_round_latencies(
+            run,
+            warmup=warmup,
+            trials=trials,
+            rounds=rounds,
+        )
+        latency_ms = statistics.fmean(round_latencies_ms)
+        latency_std_ms = (
+            statistics.pstdev(round_latencies_ms)
+            if len(round_latencies_ms) > 1
+            else 0.0
+        )
         flops = estimate_attention_flops(
             spec.seq_lens,
             spec.query_lens,
             self.num_query_heads,
             self.head_size,
         )
-        actual_tflops = flops / (latency_ms * 1e-3) / 1e12
-        actual_mfu = actual_tflops / peak_tflops if peak_tflops is not None else None
+        round_tflops = [
+            flops / (round_latency_ms * 1e-3) / 1e12
+            for round_latency_ms in round_latencies_ms
+        ]
+        actual_tflops = statistics.fmean(round_tflops)
+        round_mfus = (
+            [tflops / peak_tflops for tflops in round_tflops]
+            if peak_tflops is not None
+            else []
+        )
+        actual_mfu = statistics.fmean(round_mfus) if round_mfus else None
         return RunStats(
             name=spec.name,
             batch_label=spec.batch_label,
@@ -361,6 +523,7 @@ class FlashAttnBenchRunner:
             latency_std_ms=latency_std_ms,
             actual_tflops=actual_tflops,
             actual_mfu=actual_mfu,
+            round_mfus=round_mfus,
         )
 
 
@@ -423,6 +586,7 @@ class FFNBenchRunner:
         *,
         warmup: int,
         trials: int,
+        rounds: int,
         peak_tflops: float | None,
     ) -> RunStats:
         hidden_states, fc1_weight, fc2_weight = self._build_inputs(spec)
@@ -432,30 +596,35 @@ class FFNBenchRunner:
             inter = self._activation(inter)
             F.linear(inter, fc2_weight)
 
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        for _ in range(warmup):
-            run()
-        torch.cuda.synchronize()
-
-        samples_ms: list[float] = []
-        for _ in range(trials):
-            start.record()
-            run()
-            end.record()
-            torch.cuda.synchronize()
-            samples_ms.append(start.elapsed_time(end))
-
-        latency_ms = statistics.fmean(samples_ms)
-        latency_std_ms = statistics.pstdev(samples_ms) if len(samples_ms) > 1 else 0.0
+        round_latencies_ms = measure_round_latencies(
+            run,
+            warmup=warmup,
+            trials=trials,
+            rounds=rounds,
+        )
+        latency_ms = statistics.fmean(round_latencies_ms)
+        latency_std_ms = (
+            statistics.pstdev(round_latencies_ms)
+            if len(round_latencies_ms) > 1
+            else 0.0
+        )
         flops = estimate_ffn_flops(
             spec.query_lens,
             self.hidden_size,
             self.intermediate_size,
             self.activation,
         )
-        actual_tflops = flops / (latency_ms * 1e-3) / 1e12
-        actual_mfu = actual_tflops / peak_tflops if peak_tflops is not None else None
+        round_tflops = [
+            flops / (round_latency_ms * 1e-3) / 1e12
+            for round_latency_ms in round_latencies_ms
+        ]
+        actual_tflops = statistics.fmean(round_tflops)
+        round_mfus = (
+            [tflops / peak_tflops for tflops in round_tflops]
+            if peak_tflops is not None
+            else []
+        )
+        actual_mfu = statistics.fmean(round_mfus) if round_mfus else None
         return RunStats(
             name=spec.name,
             batch_label=spec.batch_label,
@@ -469,6 +638,7 @@ class FFNBenchRunner:
             latency_std_ms=latency_std_ms,
             actual_tflops=actual_tflops,
             actual_mfu=actual_mfu,
+            round_mfus=round_mfus,
         )
 
 
@@ -756,6 +926,7 @@ def run_nr_experiment(
     calibration_nr: int,
     warmup: int,
     trials: int,
+    rounds: int,
     peak_tflops: float | None,
 ) -> list[RunStats]:
     specs = make_nr_sweep_specs(
@@ -771,6 +942,7 @@ def run_nr_experiment(
             spec,
             warmup=warmup,
             trials=trials,
+            rounds=rounds,
             peak_tflops=peak_tflops,
         )
         for spec in specs
@@ -797,6 +969,7 @@ def run_variance_experiment(
     long_step: int,
     warmup: int,
     trials: int,
+    rounds: int,
     peak_tflops: float | None,
 ) -> list[RunStats]:
     specs = make_variance_sweep_specs(
@@ -811,6 +984,7 @@ def run_variance_experiment(
             spec,
             warmup=warmup,
             trials=trials,
+            rounds=rounds,
             peak_tflops=peak_tflops,
         )
         for spec in specs
@@ -830,6 +1004,7 @@ def run_budget_allocation_experiment(
     long_step: int,
     warmup: int,
     trials: int,
+    rounds: int,
     peak_tflops: float | None,
 ) -> list[RunStats]:
     specs = make_budget_allocation_specs(
@@ -845,6 +1020,7 @@ def run_budget_allocation_experiment(
             spec,
             warmup=warmup,
             trials=trials,
+            rounds=rounds,
             peak_tflops=peak_tflops,
         )
         for spec in specs
@@ -858,10 +1034,44 @@ def run_budget_allocation_experiment(
     return [predictor.annotate(stat) for stat in stats]
 
 
-def save_results(path: Path, results: dict[str, list[RunStats]]) -> None:
-    payload = {key: [asdict(stat) for stat in value] for key, value in results.items()}
+def save_results(
+    path: Path,
+    results: dict[str, list[RunStats]],
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    with path.open("w", encoding="utf-8", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=["setting", "mfu"])
+        writer.writeheader()
+        for case, stats in results.items():
+            for stat in stats:
+                writer.writerow(
+                    {
+                        "setting": f"{case}/{stat.name}",
+                        "mfu": stat.actual_mfu,
+                    }
+                )
+
+
+def report_outliers(
+    results: dict[str, list[RunStats]],
+    threshold_pct: float,
+) -> None:
+    for case, stats in results.items():
+        for stat in stats:
+            if len(stat.round_mfus) < 3:
+                continue
+            median_mfu = statistics.median(stat.round_mfus)
+            if median_mfu <= 0:
+                continue
+            for index, mfu in enumerate(stat.round_mfus, start=1):
+                deviation_pct = abs(mfu - median_mfu) / median_mfu * 100.0
+                if deviation_pct > threshold_pct:
+                    print(
+                        "OUTLIER "
+                        f"setting={case}/{stat.name} round={index} "
+                        f"mfu={mfu:.6f} median={median_mfu:.6f} "
+                        f"deviation={deviation_pct:.2f}%"
+                    )
 
 
 def print_ncu_hint(script_path: Path, args) -> None:
@@ -872,10 +1082,18 @@ def print_ncu_hint(script_path: Path, args) -> None:
         ]
     )
     base = f"ncu --target-processes all --metrics {metrics} python {script_path}"
+    nr_tail_seq_len = (
+        args.nr_tail_seq_len
+        if args.nr_tail_seq_len is not None
+        else max(
+            args.seq_len + args.long_step * max(args.num_long_reqs - 1, 1),
+            args.seq_len * 2,
+        )
+    )
     print("\nNsight Compute hints:")
     print(
         f"  N_r sweep: {base} --experiment nr --batch-size {args.batch_size} "
-        f"--seq-len {args.seq_len} --nr-tail-seq-len {args.nr_tail_seq_len} "
+        f"--seq-len {args.seq_len} --nr-tail-seq-len {nr_tail_seq_len} "
         f"--nr-values {args.nr_values} --num-long-reqs {args.num_long_reqs} "
         f"--long-step {args.long_step} "
         f"--warmup 1 --trials 1"
@@ -901,27 +1119,40 @@ def run_selected_experiments(
     runner,
     args,
     peak_tflops: float | None,
+    verbose: bool,
 ) -> dict[str, list[RunStats]]:
     results: dict[str, list[RunStats]] = {}
 
     if args.experiment in ("nr", "all"):
         nr_values = parse_int_list(args.nr_values)
         calibration_nr = args.calibration_nr or max(nr_values)
+        nr_tail_seq_len = (
+            args.nr_tail_seq_len
+            if args.nr_tail_seq_len is not None
+            else max(
+                args.seq_len + args.long_step * max(args.num_long_reqs - 1, 1),
+                args.seq_len * 2,
+            )
+        )
         results["nr"] = run_nr_experiment(
             runner,
             batch_size=args.batch_size,
             seq_len=args.seq_len,
             nr_values=nr_values,
-            tail_seq_len=args.nr_tail_seq_len,
+            tail_seq_len=nr_tail_seq_len,
             num_long_reqs=args.num_long_reqs,
             long_step=args.long_step,
             calibration_nr=calibration_nr,
             warmup=args.warmup,
             trials=args.trials,
+            rounds=args.rounds,
             peak_tflops=peak_tflops,
         )
-        print_table(f"{module_label} / Experiment 1: N_r Sensitivity", results["nr"])
-        print_summary(f"{module_label} / Experiment 1", results["nr"])
+        if verbose:
+            print_table(
+                f"{module_label} / Experiment 1: N_r Sensitivity", results["nr"]
+            )
+            print_summary(f"{module_label} / Experiment 1", results["nr"])
 
     if args.experiment in ("variance", "all"):
         tail_seq_lens = parse_int_list(args.tail_seq_lens)
@@ -934,20 +1165,22 @@ def run_selected_experiments(
             long_step=args.long_step,
             warmup=args.warmup,
             trials=args.trials,
+            rounds=args.rounds,
             peak_tflops=peak_tflops,
         )
-        print_table(
-            f"{module_label} / Experiment 2: Batch Variance Trap",
-            results["variance"],
-        )
-        print_summary(f"{module_label} / Experiment 2", results["variance"])
-        if args.mean_seq_len == 1024 and 8192 in tail_seq_lens:
-            print(
-                "\nNote: an exact-mean multi-tail replacement is used for the "
-                "high-variance case. The script now builds multiple long requests "
-                "with descending lengths plus a varied short-request tail while "
-                "preserving the exact average length."
+        if verbose:
+            print_table(
+                f"{module_label} / Experiment 2: Batch Variance Trap",
+                results["variance"],
             )
+            print_summary(f"{module_label} / Experiment 2", results["variance"])
+            if args.mean_seq_len == 1024 and 8192 in tail_seq_lens:
+                print(
+                    "\nNote: an exact-mean multi-tail replacement is used for the "
+                    "high-variance case. The script now builds multiple long requests "
+                    "with descending lengths plus a varied short-request tail while "
+                    "preserving the exact average length."
+                )
 
     if args.experiment in ("budget", "all"):
         results["budget"] = run_budget_allocation_experiment(
@@ -960,13 +1193,15 @@ def run_selected_experiments(
             long_step=args.long_step,
             warmup=args.warmup,
             trials=args.trials,
+            rounds=args.rounds,
             peak_tflops=peak_tflops,
         )
-        print_table(
-            f"{module_label} / Experiment 3: Replay Budget Allocation",
-            results["budget"],
-        )
-        print_summary(f"{module_label} / Experiment 3", results["budget"])
+        if verbose:
+            print_table(
+                f"{module_label} / Experiment 3: Replay Budget Allocation",
+                results["budget"],
+            )
+            print_summary(f"{module_label} / Experiment 3", results["budget"])
 
     return results
 
@@ -981,78 +1216,124 @@ def main(args) -> None:
         raise RuntimeError(
             "flash_attn_varlen_func is not available in this environment."
         )
-    if args.nr_tail_seq_len is None:
-        args.nr_tail_seq_len = max(
-            args.seq_len + args.long_step * max(args.num_long_reqs - 1, 1),
-            args.seq_len * 2,
-        )
 
     device_name = torch.cuda.get_device_name(0)
     peak_tflops = args.peak_tflops
     if peak_tflops is None:
         peak_tflops = infer_peak_tflops(device_name)
-        if peak_tflops is not None:
+        if peak_tflops is not None and args.verbose:
             print(
                 f"Inferred peak TFLOPS={peak_tflops:.1f} for {device_name}. "
                 "Pass --peak-tflops to override."
             )
-        else:
+        elif args.verbose:
             print(
                 f"Could not infer peak TFLOPS for {device_name}. "
                 "MFU columns will be reported as n/a. "
                 "Pass --peak-tflops for real MFU."
             )
+    if args.csv_output and peak_tflops is None:
+        raise ValueError(
+            "CSV MFU output requires a known GPU peak; pass --peak-tflops."
+        )
+    if args.rounds < 1:
+        raise ValueError("--rounds must be at least 1.")
+    if args.outlier_threshold_pct <= 0:
+        raise ValueError("--outlier-threshold-pct must be positive.")
+
+    dtype = STR_DTYPE_TO_TORCH_DTYPE[args.dtype]
+    model_shapes = resolve_model_shapes(args)
+    context_lens = (
+        parse_int_list(args.context_lens) if args.context_lens else [None]
+    )
+    if not context_lens:
+        raise ValueError("--context-lens must contain at least one length.")
+    grid_mode = bool(args.model_presets or args.context_lens)
 
     results: dict[str, list[RunStats]] = {}
-    dtype = STR_DTYPE_TO_TORCH_DTYPE[args.dtype]
-    if args.module in ("attention", "all"):
-        attn_runner = FlashAttnBenchRunner(
-            dtype=dtype,
-            num_query_heads=args.num_query_heads,
-            num_kv_heads=args.num_kv_heads,
-            head_size=args.head_size,
-            block_size=args.block_size,
-            softmax_scale=args.softmax_scale,
-            seed=args.seed,
-        )
-        module_results = run_selected_experiments(
-            module_label="Attention",
-            runner=attn_runner,
-            args=args,
-            peak_tflops=peak_tflops,
-        )
-        results.update(
-            {f"attention_{key}": value for key, value in module_results.items()}
-        )
+    for shape in model_shapes:
+        for context_len in context_lens:
+            run_args = args_for_context(args, context_len)
+            suffix = (
+                f" [{shape.name}, ctx={context_len}]"
+                if grid_mode and context_len is not None
+                else f" [{shape.name}]"
+                if grid_mode
+                else ""
+            )
+            result_prefix = ""
+            if grid_mode:
+                result_prefix = shape.name
+                if context_len is not None:
+                    result_prefix += f"/ctx={context_len}"
+                result_prefix += "/"
 
-    if args.module in ("ffn", "all"):
-        hidden_size = args.num_query_heads * args.head_size
-        intermediate_size = (
-            args.ffn_intermediate_size
-            if args.ffn_intermediate_size is not None
-            else args.ffn_multiplier * hidden_size
-        )
-        ffn_runner = FFNBenchRunner(
-            dtype=dtype,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            activation=args.ffn_activation,
-            seed=args.seed,
-        )
-        module_results = run_selected_experiments(
-            module_label="FFN",
-            runner=ffn_runner,
-            args=args,
-            peak_tflops=peak_tflops,
-        )
-        results.update({f"ffn_{key}": value for key, value in module_results.items()})
+            if args.verbose:
+                print(f"\nModel shape: {format_shape(shape)}")
+            if (
+                args.verbose
+                and context_len is not None
+                and shape.native_max_context is not None
+                and context_len > shape.native_max_context
+            ):
+                print(
+                    f"  context={context_len} exceeds the public OPT native "
+                    f"context={shape.native_max_context}; measuring kernel "
+                    "extrapolation only."
+                )
 
-    if args.json_output:
-        save_results(Path(args.json_output), results)
-        print(f"\nSaved JSON results to {args.json_output}")
+            if args.module in ("attention", "all"):
+                attn_runner = FlashAttnBenchRunner(
+                    dtype=dtype,
+                    num_query_heads=shape.num_query_heads,
+                    num_kv_heads=shape.num_kv_heads,
+                    head_size=shape.head_size,
+                    block_size=args.block_size,
+                    softmax_scale=args.softmax_scale,
+                    seed=args.seed,
+                )
+                module_results = run_selected_experiments(
+                    module_label=f"Attention{suffix}",
+                    runner=attn_runner,
+                    args=run_args,
+                    peak_tflops=peak_tflops,
+                    verbose=args.verbose,
+                )
+                results.update(
+                    {
+                        f"{result_prefix}attention_{key}": value
+                        for key, value in module_results.items()
+                    }
+                )
 
-    if args.print_ncu_hint:
-        print_ncu_hint(Path(__file__), args)
+            if args.module in ("ffn", "all"):
+                ffn_runner = FFNBenchRunner(
+                    dtype=dtype,
+                    hidden_size=shape.hidden_size,
+                    intermediate_size=shape.ffn_intermediate_size,
+                    activation=shape.activation,
+                    seed=args.seed,
+                )
+                module_results = run_selected_experiments(
+                    module_label=f"FFN{suffix}",
+                    runner=ffn_runner,
+                    args=run_args,
+                    peak_tflops=peak_tflops,
+                    verbose=args.verbose,
+                )
+                results.update(
+                    {
+                        f"{result_prefix}ffn_{key}": value
+                        for key, value in module_results.items()
+                    }
+                )
+
+            if args.print_ncu_hint:
+                print_ncu_hint(Path(__file__), run_args)
+
+    if args.csv_output:
+        save_results(Path(args.csv_output), results)
+    report_outliers(results, args.outlier_threshold_pct)
 
 
 if __name__ == "__main__":
@@ -1071,6 +1352,25 @@ if __name__ == "__main__":
         "--module",
         choices=["attention", "ffn", "all"],
         default="attention",
+    )
+    parser.add_argument(
+        "--model-presets",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated OPT per-layer shapes to sweep: "
+            "opt-2.7b,opt-6.7b,opt-13b,opt-30b. When set, these presets "
+            "override the manual head/FFN shape arguments."
+        ),
+    )
+    parser.add_argument(
+        "--context-lens",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated context grid, e.g. 1024,2048,4096,8192. "
+            "Each value replaces --seq-len and --mean-seq-len for one grid point."
+        ),
     )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seq-len", type=int, default=2048)
@@ -1098,8 +1398,25 @@ if __name__ == "__main__":
     parser.add_argument("--softmax-scale", type=float, default=None)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--trials", type=int, default=20)
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=5,
+        help="Independent measurement rounds per setting before averaging MFU.",
+    )
+    parser.add_argument(
+        "--outlier-threshold-pct",
+        type=float,
+        default=10.0,
+        help="Report a round whose MFU differs from the per-setting median by this percent.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--peak-tflops", type=float, default=None)
-    parser.add_argument("--json-output", type=str, default=None)
+    parser.add_argument("--csv-output", type=str, default=None)
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print detailed per-experiment tables and informational messages.",
+    )
     parser.add_argument("--print-ncu-hint", action="store_true")
     main(parser.parse_args())

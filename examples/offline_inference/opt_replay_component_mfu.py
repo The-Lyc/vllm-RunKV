@@ -39,6 +39,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-device-buffers", type=int, default=3)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
     parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=None,
+        help=(
+            "Maximum concurrently active requests. Defaults to --num-prompts. "
+            "Set this explicitly when comparing fixed-context memory settings."
+        ),
+    )
+    parser.add_argument(
+        "--max-staging-blocks",
+        type=int,
+        default=None,
+        help=(
+            "Maximum KV blocks in each GPU staging buffer. When omitted, "
+            "--gpu-memory-fraction sizes the buffers automatically."
+        ),
+    )
+    parser.add_argument(
+        "--cpu-memory-gb",
+        "--cpu-kv-memory-gb",
+        dest="cpu_memory_gb",
+        type=float,
+        default=5e10 / (1024**3),
+        help=(
+            "Total CPU cache-store budget in GiB. With dynamic replay enabled, "
+            "this is shared by full-layer KV and full-layer hidden-state "
+            "snapshots. --cpu-kv-memory-gb is accepted as a deprecated alias. "
+            "Use 0 to derive the budget from --cpu-memory-fraction. Default "
+            "preserves the legacy 5e10-byte budget."
+        ),
+    )
+    parser.add_argument(
+        "--cpu-memory-fraction",
+        type=float,
+        default=0.3,
+        help=(
+            "Clamp total CPU cache-store budget to this fraction of currently "
+            "available system memory; it is also the source of the budget "
+            "when --cpu-memory-gb=0."
+        ),
+    )
+    parser.add_argument(
         "--planner",
         choices=["static", "feedback", "tightllm"],
         default="feedback",
@@ -182,15 +224,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--resource-pressure-mode",
-        choices=["thread", "inline"],
+        choices=["thread", "inline", "throttle"],
         default="thread",
         help=(
             "thread: legacy background-worker pressure (races with model "
             "execution at host-sync boundaries). inline: pressure injected "
             "synchronously from RunKV pre_hook on each layer (IO before "
             "prefetch on a dedicated stream, SM before FA on the compute "
-            "stream). Inline keeps the original IO/compute submission order "
-            "intact and produces identical interference for RunKV / TightLLM."
+            "stream). throttle: IO-only; cap the KV / cpu-fill load streams "
+            "to --resource-pressure-pattern target_GBps via a stream-side "
+            "torch.cuda._sleep paired with each copy. Throttle produces a "
+            "deterministic linear relationship between H2D bytes and wall "
+            "time (RunKV's replay savings become exactly proportional) and "
+            "is the recommended mode for staged-resource RunKV vs TightLLM "
+            "experiments."
         ),
     )
     parser.add_argument(
@@ -209,22 +256,28 @@ def parse_args() -> argparse.Namespace:
 
 @contextlib.contextmanager
 def nvtx_range(name: str, color: str = "blue"):
-    if os.environ.get("VLLM_NVTX_SCOPES_FOR_PROFILING", "0") == "1":
-        try:
-            import nvtx
-
-            with nvtx.annotate(name, color=color):
-                yield
-        except ImportError:
-            try:
-                import torch.cuda.nvtx as torch_nvtx
-
-                with torch_nvtx.range(name):
-                    yield
-            except Exception:
-                yield
-    else:
+    if os.environ.get("VLLM_NVTX_SCOPES_FOR_PROFILING", "0") != "1":
         yield
+        return
+
+    cm = None
+    try:
+        import nvtx
+
+        cm = nvtx.annotate(name, color=color)
+    except ImportError:
+        try:
+            import torch.cuda.nvtx as torch_nvtx
+
+            cm = torch_nvtx.range(name)
+        except Exception:
+            cm = None
+
+    if cm is None:
+        yield
+    else:
+        with cm:
+            yield
 
 
 def cuda_profiler_start() -> None:
@@ -265,19 +318,27 @@ def make_kv_offload_config(
     *,
     gpu_memory_fraction: float,
     num_device_buffers: int,
+    max_staging_blocks: int | None,
+    cpu_memory_gb: float,
+    cpu_memory_fraction: float,
     planner: str,
     planner_dry_run: bool,
     use_state_machine: bool = False,
     tightllm_profile_path: str | None = None,
     tightllm_feedback_correction: bool = False,
 ) -> dict:
+    cpu_memory_limit = (
+        int(cpu_memory_gb * 1024**3) if cpu_memory_gb > 0 else None
+    )
     config = {
         "enabled": True,
         "num_device_buffers": num_device_buffers,
+        "max_staging_blocks": max_staging_blocks,
         "gpu_memory_fraction": gpu_memory_fraction,
         "enable_async_prefetch": True,
         "enable_async_offload": True,
-        "cpu_memory_limit": 5e10,
+        "cpu_memory_limit": cpu_memory_limit,
+        "cpu_memory_fraction": cpu_memory_fraction,
     }
     if setting == "baseline":
         config["enable_layer_recompute"] = False
@@ -367,6 +428,7 @@ def run_prompts_with_engine(
                 params=SamplingParams(
                     temperature=0.0,
                     max_tokens=max_tokens,
+                    ignore_eos=True,
                     output_kind=RequestOutputKind.FINAL_ONLY,
                 ),
             )
@@ -494,6 +556,14 @@ def _make_resource_controller(
 
 def main() -> None:
     args = parse_args()
+    if args.max_num_seqs is not None and args.max_num_seqs <= 0:
+        raise ValueError("--max-num-seqs must be > 0 when set")
+    if args.max_staging_blocks is not None and args.max_staging_blocks <= 0:
+        raise ValueError("--max-staging-blocks must be > 0 when set")
+    if args.cpu_memory_gb < 0:
+        raise ValueError("--cpu-memory-gb must be >= 0")
+    if not (0.0 < args.cpu_memory_fraction <= 1.0):
+        raise ValueError("--cpu-memory-fraction must be in (0, 1]")
     if not args.disable_nvtx_scopes:
         os.environ.setdefault("VLLM_NVTX_SCOPES_FOR_PROFILING", "1")
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -535,6 +605,9 @@ def main() -> None:
                     setting,
                     gpu_memory_fraction=args.gpu_memory_fraction,
                     num_device_buffers=args.num_device_buffers,
+                    max_staging_blocks=args.max_staging_blocks,
+                    cpu_memory_gb=args.cpu_memory_gb,
+                    cpu_memory_fraction=args.cpu_memory_fraction,
                     planner=args.planner,
                     planner_dry_run=args.planner_dry_run,
                     use_state_machine=args.use_state_machine,
@@ -544,7 +617,7 @@ def main() -> None:
                 enable_opt_component_mfu_profiling=mfu_profiler_enabled,
                 opt_component_mfu_output_path=_mfu_out,
                 opt_component_mfu_peak_tflops=args.peak_tflops,
-                max_num_seqs=max(args.num_prompts, 1),
+                max_num_seqs=args.max_num_seqs or max(args.num_prompts, 1),
             )
 
         resource_controller = _make_resource_controller(

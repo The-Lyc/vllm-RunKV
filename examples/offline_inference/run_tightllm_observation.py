@@ -78,6 +78,13 @@ def main() -> None:
     max_tokens = os.environ.get("MAX_TOKENS", "32")
     gpu_memory_fraction = os.environ.get("GPU_MEMORY_FRACTION", "0.9")
     num_device_buffers = os.environ.get("NUM_DEVICE_BUFFERS", "3")
+    gpu_memory_utilization = os.environ.get("GPU_MEMORY_UTILIZATION", "")
+    max_num_seqs = os.environ.get("MAX_NUM_SEQS", "")
+    max_staging_blocks = os.environ.get("MAX_STAGING_BLOCKS", "")
+    cpu_memory_gb = os.environ.get(
+        "CPU_MEMORY_GB", os.environ.get("CPU_KV_MEMORY_GB", "")
+    )
+    cpu_memory_fraction = os.environ.get("CPU_MEMORY_FRACTION", "")
     enable_nvtx = os.environ.get("ENABLE_NVTX", "1") == "1"
     enable_layerwise_nvtx = os.environ.get("ENABLE_LAYERWISE_NVTX", "0") == "1"
     enable_opt_component_mfu = (
@@ -150,6 +157,15 @@ def main() -> None:
         "--run-tag",
         run_tag,
     ]
+    for option, value in (
+        ("--gpu-memory-utilization", gpu_memory_utilization),
+        ("--max-num-seqs", max_num_seqs),
+        ("--max-staging-blocks", max_staging_blocks),
+        ("--cpu-memory-gb", cpu_memory_gb),
+        ("--cpu-memory-fraction", cpu_memory_fraction),
+    ):
+        if value:
+            cmd.extend([option, value])
     if tightllm_feedback_correction:
         cmd.append("--tightllm-feedback-correction")
     if not enable_opt_component_mfu:
@@ -173,6 +189,18 @@ def main() -> None:
     print(f"  layerwise_nvtx:     {int(enable_layerwise_nvtx)}")
     print(f"  cuda_profiler:      {int(enable_profile)}")
     print(f"  prefix_blocks:      {prefix_blocks}")
+    print(f"  gpu_memory_fraction:{gpu_memory_fraction}")
+    print(f"  num_device_buffers: {num_device_buffers}")
+    if gpu_memory_utilization:
+        print(f"  gpu_memory_utilization:{gpu_memory_utilization}")
+    if max_num_seqs:
+        print(f"  max_num_seqs:       {max_num_seqs}")
+    if max_staging_blocks:
+        print(f"  max_staging_blocks: {max_staging_blocks}")
+    if cpu_memory_gb:
+        print(f"  cpu_memory_gb:      {cpu_memory_gb}")
+    if cpu_memory_fraction:
+        print(f"  cpu_memory_fraction:{cpu_memory_fraction}")
     print(f"  num_prompts:        {num_prompts}")
     print(f"  prompt_words:       {prompt_words}")
     print(f"  max_tokens:         {max_tokens}")
@@ -228,6 +256,17 @@ def main() -> None:
             "run_tag": run_tag,
             "output_dir": str(Path(output_dir).resolve()),
             "prefix_blocks": prefix_blocks,
+            "num_prompts": num_prompts,
+            "prompt_words": prompt_words,
+            "max_tokens": max_tokens,
+            "fixed_output_length": True,
+            "gpu_memory_fraction": gpu_memory_fraction,
+            "num_device_buffers": num_device_buffers,
+            "gpu_memory_utilization": gpu_memory_utilization or None,
+            "max_num_seqs": max_num_seqs or None,
+            "max_staging_blocks": max_staging_blocks or None,
+            "cpu_memory_gb": cpu_memory_gb or None,
+            "cpu_memory_fraction": cpu_memory_fraction or None,
             "planner": "tightllm",
             "model": model,
             "nsys_report": str(Path(nsys_stem + ".nsys-rep").resolve())
