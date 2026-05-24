@@ -55,12 +55,12 @@ RunKV 和 TightLLM 复现版统一使用：
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `gpu_memory_fraction` | `0.9` | KV offload 可用 GPU fraction |
+| `gpu_memory_fraction` | `0.9` | 未指定固定 staging blocks 时的 GPU staging 自动分配比例 |
 | `num_device_buffers` | `3` | DMA device buffer 数 |
 | `gpu_memory_utilization` | `0.7` | vLLM engine GPU memory utilization |
 | `enable_async_prefetch` | `true` | 开启异步 prefetch |
 | `enable_async_offload` | `true` | 开启异步 offload |
-| `cpu_memory_limit` | `5e10` | CPU KV memory limit |
+| `cpu_memory_gb` | 显式设置 | CPU store 总预算；dynamic replay 下由全层 KV 与全层 hidden states 共享 |
 | `enable_layer_recompute` | `true` | 非 baseline 实验开启 |
 | `layer_recompute_mode` | `prev_layer_output_dynamic` | 当前 RunKV/TightLLM 对比路径 |
 
@@ -75,18 +75,149 @@ TightLLM planner：
 
 ```text
 --planner tightllm
---tightllm-profile-path tightllm_profile.json
+--tightllm-profile-path exp_results/tightllm_profiles/rtx4090/opt-2.7b-8k.json
 ```
 
 TightLLM + feedback correction：
 
 ```text
 --planner tightllm
---tightllm-profile-path tightllm_profile.json
+--tightllm-profile-path exp_results/tightllm_profiles/rtx4090/opt-2.7b-8k.json
 --tightllm-feedback-correction
 ```
 
-### 2.3 统一输出
+### 2.3 TightLLM profile 与硬件/模型矩阵
+
+TightLLM profile 不能跨 GPU 平台直接复用。JSON 同时记录当前设备测得的
+`gpu_peak_flops`、H2D `pcie_bandwidth_h2d` 以及 attention/FFN MFU 曲线；
+3080 Ti 上生成的 profile 用于 4090 或 A800 会使 ILP budget 的依据失真。
+
+profile 还依赖模型结构。每个待测的 `(hardware_platform, model)` 组合生成
+一份 profile；context 不需要单独生成 profile，但 `--seq-lengths` 必须覆盖
+测试 workload 的真实 context token 范围，范围外查询只会钳在端点值。
+
+统一路径布局如下：
+
+```text
+exp_results/tightllm_profiles/<hardware_platform>/<model-directory-name>.json
+```
+
+例如在 4090 机器上生成 OPT-2.7B profile：
+
+```bash
+MODEL=/home/lyc/hf_models/opt-2.7b-8k
+python -m vllm.v1.profiling.tightllm_offline_profiler \
+  --model "$MODEL" \
+  --output exp_results/tightllm_profiles/rtx4090/opt-2.7b-8k.json \
+  --seq-lengths 128 256 512 1024 2048 4096 8192 16384
+```
+
+在 A800 机器上运行同样命令，只将输出路径换成：
+
+```bash
+--output exp_results/tightllm_profiles/a800/opt-2.7b-8k.json
+```
+
+换到 OPT-6.7B 等其他模型时，需要在两台机器上各重新生成该模型的 JSON。
+`scripts/run_benchmark_pipeline.py` 和
+`scripts/run_staged_resource_benchmark.py` 现在都支持：
+
+```text
+--hardware-platform rtx4090|a800
+--tightllm-profile-root exp_results/tightllm_profiles
+```
+
+指定 `--hardware-platform` 后，pipeline 自动选
+`<profile-root>/<platform>/<model-directory-name>.json`；特殊试验仍可用
+`--tightllm-profile-path /path/to/profile.json` 显式覆盖。
+
+### 2.4 4090 24G / A800 80G 内存与并发设置
+
+当前 dynamic replay 路径为了容纳指定 active tokens，CPU store 至少需要：
+
+```text
+CPU KV backing store = active_tokens * num_layers * 4 * hidden_size bytes
+CPU hidden states    = active_tokens * num_layers * 2 * hidden_size bytes
+CPU total            ~= 1.5 * CPU KV backing store
+```
+
+上式中的层数已经是模型的全部 decoder layers，而不是 GPU 上的三个
+staging buffers。当前实现会以 `KV bytes/block + HS bytes/block` 共同计算
+CPU block 数，并为二者预分配 store。因此 `--cpu-memory-gb` 控制的是
+`CPU total`；它不是仅 KV 的预算。旧名 `--cpu-kv-memory-gb` 仍可作为兼容
+alias 使用，但新命令应使用 `--cpu-memory-gb`。
+分配发生在初始化时，常驻 DRAM 接近设置的总预算（只少于一个 block 的
+取整余量），而不是随当步实际活跃 token 数动态增长。
+
+正式实验应传固定的 `--cpu-memory-gb`，并同时传
+`--cpu-memory-fraction 0.30` 作为节点当前可用内存不足时的 clamp。由于
+预算已经同时覆盖 KV 与 HS，`.30` 表示 CPU store 最多使用当前可用主机
+内存的约 `30%`，而不是 `45%`。
+`.30` 不应改变计划 budget：例如 `--cpu-memory-gb 30` 要求初始化时系统
+available DRAM 至少约 `100 GiB`。若日志显示显式预算被 clamp，应降低两端
+matched setting 的 `max_num_seqs` 或改用两端均能提供的相同预算，而不是
+只放宽其中一个平台的上限。
+
+当 context 为 8192 tokens 时，一个 active request 的 CPU 需求为：
+
+| Model | CPU KV/request | HS/request | Dynamic replay CPU total/request |
+|---|---:|---:|---:|
+| OPT-2.7B | 2.50 GiB | 1.25 GiB | 3.75 GiB |
+| OPT-6.7B | 4.00 GiB | 2.00 GiB | 6.00 GiB |
+| OPT-13B | 6.25 GiB | 3.13 GiB | 9.38 GiB |
+| OPT-30B | 10.50 GiB | 5.25 GiB | 15.75 GiB |
+
+其他 context 按长度线性缩放。例如 4096-token 值为表中一半。预算还应为
+decode tokens 和 block rounding 留出至少 `10%` 余量。
+
+GPU staging 不应跨平台用自动比例比较。三个 staging buffers 下，应对每个
+固定 workload 显式设置：
+
+```text
+max_staging_blocks = ceil(1.10 * max_num_seqs * context_tokens / 16)
+GPU staging total  = 3 * max_staging_blocks * 16 * 4 * hidden_size bytes
+```
+
+例如 `context=8192`、`max_num_seqs=4`，设置
+`--max-staging-blocks 2304`；三个 buffer 的 staging 总量约为：
+
+| Model | GPU staging total |
+|---|---:|
+| OPT-2.7B | 1.05 GiB |
+| OPT-6.7B | 1.69 GiB |
+| OPT-13B | 2.11 GiB |
+| OPT-30B | 2.95 GiB |
+
+不要将 CPU total 与三个 GPU buffers 直接按 `1.5x` 比较；`1.5x` 的基准是
+全层 CPU KV。若两侧承载相同 token capacity，则：
+
+```text
+CPU (all-layer KV + HS) / GPU (3-layer KV) = num_layers / 2
+```
+
+因此 OPT-2.7B/6.7B 的 CPU store 约为 GPU staging 的 `16x`，OPT-13B
+约为 `20x`，OPT-30B 约为 `24x`，再叠加预算 headroom 与 block rounding。
+
+推荐先运行的可比 setting：
+
+| GPU | Model | Context | `max_num_seqs` | `max_staging_blocks` | `cpu_memory_gb` | `gpu_memory_utilization` |
+|---|---|---:|---:|---:|---:|---:|
+| RTX 4090 24G | OPT-2.7B | 8192 | 4 | 2304 | 18 | 0.90 |
+| RTX 4090 24G | OPT-6.7B | 8192 | 4 | 2304 | 30 | 0.90 |
+| A800 80G matched | OPT-2.7B | 8192 | 4 | 2304 | 18 | 0.90 |
+| A800 80G matched | OPT-6.7B | 8192 | 4 | 2304 | 30 | 0.90 |
+| A800 80G extended | OPT-13B | 8192 | 4 | 2304 | 45 | 0.90 |
+| A800 80G extended | OPT-30B | 8192 | 2 | 1152 | 40 | 0.90 |
+
+表中 `cpu_memory_gb` 已包含不低于 `20%` 的 total-store headroom；dynamic
+replay 的 KV 与 HS 合计常驻 store 受该列约束。RTX 4090 单卡 fp16 不适合
+直接测 OPT-13B/30B；它们的权重本身已接近或超过 24G 显存预算。
+
+4090 与 A800 的 matched 对比必须使用相同 model、context、`max_num_seqs`、
+`max_staging_blocks`、CPU store budget 和资源压力参数；A800 的 extended
+setting 只能用于展示较大模型能力，不能混在 matched speedup 表中。
+
+### 2.5 统一输出
 
 每个 run 需要产出一个 manifest，至少包含：
 
@@ -119,7 +250,7 @@ FlexGen 原版应保存：
 - 可解析的 JSON 或 CSV 结果
 - run manifest
 
-### 2.4 指标
+### 2.6 指标
 
 必须报告：
 
@@ -517,7 +648,8 @@ exp_results/staged_offline_pilot/
 
 ```bash
 export MODEL=/home/lyc/hf_models/opt-2.7b-8k
-export TIGHTLLM_PROFILE_PATH=tightllm_profile.json
+export HARDWARE_PLATFORM=rtx4090
+export TIGHTLLM_PROFILE_PATH=exp_results/tightllm_profiles/$HARDWARE_PLATFORM/opt-2.7b-8k.json
 export PREFIX_BLOCKS=1000
 export NUM_PROMPTS=128
 export PROMPT_WORDS=8000
@@ -610,6 +742,13 @@ SM severe 只替换 pressure 参数：
 
 ```bash
 python scripts/run_staged_resource_benchmark.py \
+   --hardware-platform rtx4090 \
+   --gpu-memory-utilization 0.90 \
+   --num-device-buffers 3 \
+   --max-num-seqs 4 \
+   --max-staging-blocks 2304 \
+   --cpu-memory-gb 18 \
+   --cpu-memory-fraction 0.30 \
    --resource-pressure-kind io \
    --resource-pressure-clock step \
    --resource-pressure-pattern 0:0,16:15,48:0 \
@@ -620,13 +759,15 @@ python scripts/run_staged_resource_benchmark.py \
    --num-prompts 128 \
    --prompt-words 8000 \
    --max-tokens 128 \
-   --tightllm-profile-path tightllm_profile.json
+   --run-tag rtx4090_opt2.7b_ctx8k_io_r0 \
+   --output-root exp_results/staged_offline_pilot/rtx4090/opt-2.7b-8k/ctx8k
 ```
 
 SM severe 只替换：
 
 ```bash
 python scripts/run_staged_resource_benchmark.py \
+   --hardware-platform rtx4090 \
    --resource-pressure-kind sm \
    --resource-pressure-clock step \
    --resource-pressure-pattern 0:0,16:50,48:0 \
@@ -635,7 +776,29 @@ python scripts/run_staged_resource_benchmark.py \
    --resource-pressure-matrix-size 4096
 ```
 
-默认 pipeline 会打开 Nsight / NVTX / CUDA profiler；每个 run 输出 `manifest.json`、`run.log`、`pressure.csv`、`resource_steps.jsonl`、`opt_component_mfu_*.jsonl`、`.flat.jsonl`、`.nsys-rep`、导出的 `.sqlite`，以及 `prehook_timing/prehook_timing_*.jsonl`。stage-level 分析结果写到 `exp_results/analysis/staged_resource/<pattern>/<run_tag>/`，包含 `analysis_summary.md`、`stage_summary.csv`、`comparison_summary.csv` 和 `summary.json`。per-layer timing 分析按 repeat 写到 `exp_results/analysis/staged_resource_per_layer/<pattern>/<run_tag>/r*/`，由 `tools/analyze_per_layer_timing.py` 生成 imbalance、compute-vs-IO、H2D DMA、prehook、layer_compute、kernel timing、replay token 等多项指标图表和 summary。
+默认 pipeline 会打开 Nsight / NVTX / CUDA profiler；新 run 的原始数据位于 `<output-root>/<pattern>/<run-tag>/<system>/r*/`，从而不会在切换 GPU、模型或 context 时复用原来的 `r0` 目录。每个 run 输出 `manifest.json`、`run.log`、`pressure.csv`、`resource_steps.jsonl`、`opt_component_mfu_*.jsonl`、`.flat.jsonl`、`.nsys-rep`、导出的 `.sqlite`，以及 `prehook_timing/prehook_timing_*.jsonl`。stage-level 分析结果写到 `exp_results/analysis/staged_resource/<pattern>/<run_tag>/`，包含 `analysis_summary.md`、`stage_summary.csv`、`comparison_summary.csv` 和 `summary.json`。per-layer timing 分析按 repeat 写到 `exp_results/analysis/staged_resource_per_layer/<pattern>/<run_tag>/r*/`，由 `tools/analyze_per_layer_timing.py` 生成 imbalance、compute-vs-IO、H2D DMA、prehook、layer_compute、kernel timing、replay token 等多项指标图表和 summary。
+
+跨硬件/模型/context 的 steady-state 对比可用普通 pipeline，每个单元给唯一
+`--run-tag`：
+
+```bash
+python scripts/run_benchmark_pipeline.py \
+   --hardware-platform rtx4090 \
+   --model /home/lyc/hf_models/opt-2.7b-8k \
+   --gpu-memory-utilization 0.90 \
+   --num-device-buffers 3 \
+   --max-num-seqs 4 \
+   --max-staging-blocks 2304 \
+   --cpu-memory-gb 18 \
+   --cpu-memory-fraction 0.30 \
+   --prompt-words 8000 \
+   --max-tokens 128 \
+   --run-tag rtx4090_opt2.7b_ctx8k_steady_r0
+```
+
+当前 runner 的 `--prompt-words` 控制构造 prompt 的 word 数，不是严格 token
+长度；不同模型 tokenizer 下要用实际输入 token 数标注 context，或在要求
+严格等长的实验前将 workload runner 改为 token-id 输入。
 
 如果只想跑轻量 stage summary，不采集 Nsight timeline，可追加：
 
