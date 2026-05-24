@@ -18,6 +18,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_offload_config import RunKVOffloadConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker.io_bandwidth_throttle import throttle_after_copy_if_enabled
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import PagedBlockMapper
@@ -482,6 +483,11 @@ class LayerRecomputeManager:
                         gathered_hs_gpu = gathered_hs_cpu.to(
                             self.device, non_blocking=True
                         )
+                        throttle_after_copy_if_enabled(
+                            self._hs_h2d_stream,
+                            gathered_hs_cpu.element_size()
+                            * gathered_hs_cpu.numel(),
+                        )
                         ready_event = torch.cuda.Event(enable_timing=True)
                         ready_event.record(self._hs_h2d_stream)
                 else:
@@ -669,6 +675,14 @@ class LayerRecomputeManager:
                     hs_gpu = hs_cat_cpu.to(self.device, non_blocking=True)
                     pos_gpu = pos_cat_cpu.to(self.device, non_blocking=True)
                     slot_gpu = slot_cat_cpu.to(self.device, non_blocking=True)
+                    bytes_total = (
+                        hs_cat_cpu.element_size() * hs_cat_cpu.numel()
+                        + pos_cat_cpu.element_size() * pos_cat_cpu.numel()
+                        + slot_cat_cpu.element_size() * slot_cat_cpu.numel()
+                    )
+                    throttle_after_copy_if_enabled(
+                        self._hs_h2d_stream, bytes_total
+                    )
                     ready_event = torch.cuda.Event()
                     ready_event.record(self._hs_h2d_stream)
             else:

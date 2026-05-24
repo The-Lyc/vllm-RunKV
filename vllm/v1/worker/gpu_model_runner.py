@@ -165,6 +165,7 @@ from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
+from vllm.v1.worker.io_bandwidth_throttle import throttle_after_copy_if_enabled
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.layer_recompute import LayerRecomputeManager
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
@@ -858,6 +859,7 @@ class PagedBlockMapper:
                 # ---- Multi-segment DMA: one copy per contiguous segment ----
                 if _t:
                     _tg0 = _time.perf_counter()
+                bytes_total = 0
                 if segments:
                     bd = self._blocks_dim
                     with record_function_or_nullcontext(
@@ -867,25 +869,37 @@ class PagedBlockMapper:
                         if bd == 0:
                             for src_start, slen in segments:
                                 dst_start = self.mapping[src_start]
+                                src = cpu_cache[src_start : src_start + slen]
                                 gpu_buffer[dst_start : dst_start + slen].copy_(
-                                    cpu_cache[src_start : src_start + slen],
+                                    src,
                                     non_blocking=True,
                                 )
+                                bytes_total += src.element_size() * src.numel()
                         else:
                             outer_size = cpu_cache.shape[0]
                             for outer in range(outer_size):
                                 for src_start, slen in segments:
                                     dst_start = self.mapping[src_start]
+                                    src = cpu_cache[
+                                        outer,
+                                        src_start : src_start + slen,
+                                    ]
                                     gpu_buffer[
                                         outer,
                                         dst_start : dst_start + slen,
                                     ].copy_(
-                                        cpu_cache[
-                                            outer,
-                                            src_start : src_start + slen,
-                                        ],
+                                        src,
                                         non_blocking=True,
                                     )
+                                    bytes_total += (
+                                        src.element_size() * src.numel()
+                                    )
+                # Throttle the load stream's effective bandwidth to the
+                # configured target by pairing the just-issued copies with a
+                # parallel _sleep on a per-stream aux stream and gating the
+                # ready event behind max(copy_end, sleep_end). No-op when no
+                # throttle is installed. See docs/design/io_bandwidth_throttle_design.md.
+                throttle_after_copy_if_enabled(self.load_stream, bytes_total)
                 if _t:
                     self._last_timing["mseg_dma"] = _time.perf_counter() - _tg0
                     self._last_timing["copy_count"] = copy_count
@@ -1130,6 +1144,15 @@ class GPUModelRunner(
         )
         self._opt_component_mfu_output_path = (
             self.observability_config.opt_component_mfu_output_path
+        )
+        # Separate gate for the per-layer direct_h2d_kv_token_count compute.
+        # The compute is a Python for-loop over ``mapper.mapping`` (one
+        # iteration per GPU-resident block, easily thousands) and only feeds
+        # the kv_replay_fraction / history_token_count analysis metrics — no
+        # execution-path consumer. Default off so it doesn't sit on the
+        # critical path when the rest of the OPT component profiler is on.
+        self._direct_h2d_kv_token_count_enabled = bool(
+            self.observability_config.enable_direct_h2d_kv_token_count
         )
         self._opt_component_log_enabled = bool(
             (self._opt_component_mfu_enabled or self._opt_component_mfu_output_path)
@@ -3467,32 +3490,35 @@ class GPUModelRunner(
                         # block-level fluctuations of replay length across
                         # consecutive layers are therefore fine in stable
                         # state.
-                        if _timing:
-                            _bp_ts = _time.perf_counter()
-                        _sm_hint = runtime.get_last_plan_change_hint()
-                        if _sm_hint is not None:
-                            _hint_ok = _sm_hint in ("unchanged", "small_delta")
-                            _last_y = runtime.get_layer_imbalance_ms(layer_idx)
-                            _deadband_ms = (
-                                self.replay_plan_provider.gating_deadband_ms
-                                if isinstance(
-                                    self.replay_plan_provider,
-                                    FeedbackReplayPlanProvider,
+                        with record_function_or_nullcontext(
+                            f"runkv:prehook:bp_gate:L{layer_idx}"
+                        ):
+                            if _timing:
+                                _bp_ts = _time.perf_counter()
+                            _sm_hint = runtime.get_last_plan_change_hint()
+                            if _sm_hint is not None:
+                                _hint_ok = _sm_hint in ("unchanged", "small_delta")
+                                _last_y = runtime.get_layer_imbalance_ms(layer_idx)
+                                _deadband_ms = (
+                                    self.replay_plan_provider.gating_deadband_ms
+                                    if isinstance(
+                                        self.replay_plan_provider,
+                                        FeedbackReplayPlanProvider,
+                                    )
+                                    else 0.0
                                 )
-                                else 0.0
-                            )
-                            _imb_ok = (
-                                _last_y is not None
-                                and abs(_last_y) < _deadband_ms
-                            )
-                            _gate_ok = _hint_ok and _imb_ok
-                        else:
-                            _gate_ok = runtime.last_observed_stable()
-                        _stable_reuse_ok = _gate_ok and layer_idx > 0
-                        if _timing:
-                            self._prehook_t_bp_gate += (
-                                _time.perf_counter() - _bp_ts
-                            )
+                                _imb_ok = (
+                                    _last_y is not None
+                                    and abs(_last_y) < _deadband_ms
+                                )
+                                _gate_ok = _hint_ok and _imb_ok
+                            else:
+                                _gate_ok = runtime.last_observed_stable()
+                            _stable_reuse_ok = _gate_ok and layer_idx > 0
+                            if _timing:
+                                self._prehook_t_bp_gate += (
+                                    _time.perf_counter() - _bp_ts
+                                )
 
                         if _stable_reuse_ok:
                             # Steady-state successor plan: reuse replay(L)
@@ -3511,53 +3537,72 @@ class GPUModelRunner(
                             # )
                             if _timing:
                                 self._prehook_n_steady_branch += 1
-                                _bp_ts = _time.perf_counter()
-                            next_plan = build_stable_successor_plan(current_plan)
-                            if _timing:
-                                self._prehook_t_bp_steady_plan += (
-                                    _time.perf_counter() - _bp_ts
+                            with record_function_or_nullcontext(
+                                f"runkv:prehook:bp_steady_plan:L{layer_idx}"
+                            ):
+                                if _timing:
+                                    _bp_ts = _time.perf_counter()
+                                next_plan = build_stable_successor_plan(current_plan)
+                                if _timing:
+                                    self._prehook_t_bp_steady_plan += (
+                                        _time.perf_counter() - _bp_ts
+                                    )
+                            with record_function_or_nullcontext(
+                                f"runkv:prehook:bp_meta:L{layer_idx}"
+                            ):
+                                if _timing:
+                                    _bp_ts = _time.perf_counter()
+                                next_metadata = self._build_layer_attn_metadata(
+                                    layer_idx=next_layer_idx,
+                                    plan=next_plan,
+                                    prev_plan=current_plan,
+                                    prev_metadata=current_metadata,
+                                    base_seq_lens=self.seq_lens.cpu,
+                                    base_max_seq_len=(
+                                        int(np.max(self.seq_lens.np[: self._lr_num_reqs]))
+                                        if self._lr_num_reqs > 0
+                                        else 0
+                                    ),
+                                    block_table_tensor=self.paged_block_tables[next_gid],
+                                    num_reqs=self._lr_num_reqs,
                                 )
-                                _bp_ts = _time.perf_counter()
-                            next_metadata = self._build_layer_attn_metadata(
-                                layer_idx=next_layer_idx,
-                                plan=next_plan,
-                                prev_plan=current_plan,
-                                prev_metadata=current_metadata,
-                                base_seq_lens=self.seq_lens.cpu,
-                                base_max_seq_len=(
-                                    int(np.max(self.seq_lens.np[: self._lr_num_reqs]))
-                                    if self._lr_num_reqs > 0
-                                    else 0
-                                ),
-                                block_table_tensor=self.paged_block_tables[next_gid],
-                                num_reqs=self._lr_num_reqs,
-                            )
-                            if _timing:
-                                self._prehook_t_bp_meta += (
-                                    _time.perf_counter() - _bp_ts
+                                if _timing:
+                                    self._prehook_t_bp_meta += (
+                                        _time.perf_counter() - _bp_ts
+                                    )
+                            with record_function_or_nullcontext(
+                                f"runkv:prehook:bp_skip:L{layer_idx}"
+                            ):
+                                if _timing:
+                                    _bp_ts = _time.perf_counter()
+                                next_skip_block_ids = (
+                                    manager.compute_skip_block_ids_from_plan(next_plan)
                                 )
-                                _bp_ts = _time.perf_counter()
-                            next_skip_block_ids = (
-                                manager.compute_skip_block_ids_from_plan(next_plan)
-                            )
-                            if _timing:
-                                self._prehook_t_bp_skip += (
-                                    _time.perf_counter() - _bp_ts
-                                )
-                            # Discard the pending spec future — it won't be used.
-                            runtime.clear_speculative(next_layer_idx)
+                                if _timing:
+                                    self._prehook_t_bp_skip += (
+                                        _time.perf_counter() - _bp_ts
+                                    )
+                            with record_function_or_nullcontext(
+                                f"runkv:prehook:bp_clear_spec:L{layer_idx}"
+                            ):
+                                # Discard the pending spec future — it won't be used.
+                                runtime.clear_speculative(next_layer_idx)
                         else:
                             # Non-stable: spec plan was built off-critical-path
                             # at end of layer(L-1). Metadata and H2D transfers
                             # are completed here on the main thread.
                             if _timing:
                                 self._prehook_n_nonsteady_branch += 1
-                                _bp_ts = _time.perf_counter()
-                            spec_plan = runtime.pop_speculative(next_layer_idx)
-                            if _timing:
-                                self._prehook_t_bp_pop_spec += (
-                                    _time.perf_counter() - _bp_ts
-                                )
+                            with record_function_or_nullcontext(
+                                f"runkv:prehook:bp_pop_spec:L{layer_idx}"
+                            ):
+                                if _timing:
+                                    _bp_ts = _time.perf_counter()
+                                spec_plan = runtime.pop_speculative(next_layer_idx)
+                                if _timing:
+                                    self._prehook_t_bp_pop_spec += (
+                                        _time.perf_counter() - _bp_ts
+                                    )
                             if spec_plan is not None:
                                 next_plan = spec_plan
                             else:
@@ -3575,73 +3620,83 @@ class GPUModelRunner(
                                         layer_idx,
                                     )
                                     self._dynamic_replay_spec_fallback_logged = True
-                                if _timing:
-                                    self._prehook_n_spec_fallback += 1
-                                    _bp_ts = _time.perf_counter()
-                                next_plan = self._build_dynamic_layer_plan(
-                                    layer_idx=next_layer_idx,
-                                    gid=next_gid,
-                                    num_reqs=self._lr_num_reqs,
-                                    num_scheduled_tokens_np=(
-                                        self._lr_num_scheduled_tokens_np
-                                    ),
-                                    prev_layer_plan=current_plan,
-                                )
-                                if _timing:
-                                    self._prehook_t_bp_fallback += (
-                                        _time.perf_counter() - _bp_ts
+                                with record_function_or_nullcontext(
+                                    f"runkv:prehook:bp_fallback:L{layer_idx}"
+                                ):
+                                    if _timing:
+                                        self._prehook_n_spec_fallback += 1
+                                        _bp_ts = _time.perf_counter()
+                                    next_plan = self._build_dynamic_layer_plan(
+                                        layer_idx=next_layer_idx,
+                                        gid=next_gid,
+                                        num_reqs=self._lr_num_reqs,
+                                        num_scheduled_tokens_np=(
+                                            self._lr_num_scheduled_tokens_np
+                                        ),
+                                        prev_layer_plan=current_plan,
                                     )
+                                    if _timing:
+                                        self._prehook_t_bp_fallback += (
+                                            _time.perf_counter() - _bp_ts
+                                        )
                             # Metadata + H2D always on main thread.
                             assert next_plan is not None
-                            if _timing:
-                                _bp_ts = _time.perf_counter()
-                            next_metadata = self._build_layer_attn_metadata(
-                                layer_idx=next_layer_idx,
-                                plan=next_plan,
-                                prev_plan=current_plan,
-                                prev_metadata=current_metadata,
-                                base_seq_lens=self.seq_lens.cpu,
-                                base_max_seq_len=(
-                                    int(np.max(self.seq_lens.np[: self._lr_num_reqs]))
-                                    if self._lr_num_reqs > 0
-                                    else 0
-                                ),
-                                block_table_tensor=self.paged_block_tables[next_gid],
-                                num_reqs=self._lr_num_reqs,
-                            )
-                            if _timing:
-                                self._prehook_t_bp_meta += (
-                                    _time.perf_counter() - _bp_ts
-                                )
-                                _bp_ts = _time.perf_counter()
-                            _use_plan_skip_fb = (
-                                isinstance(
-                                    self.replay_plan_provider,
-                                    FeedbackReplayPlanProvider,
-                                )
-                                and not self.replay_plan_provider.dry_run
-                            ) or isinstance(
-                                self.replay_plan_provider,
-                                TightLLMReplayPlanProvider,
-                            )
-                            if _use_plan_skip_fb:
-                                next_skip_block_ids = (
-                                    manager.compute_skip_block_ids_from_plan(next_plan)
-                                )
-                            else:
-                                next_skip_block_ids = manager.compute_skip_block_ids_for_layer(
+                            with record_function_or_nullcontext(
+                                f"runkv:prehook:bp_meta:L{layer_idx}"
+                            ):
+                                if _timing:
+                                    _bp_ts = _time.perf_counter()
+                                next_metadata = self._build_layer_attn_metadata(
                                     layer_idx=next_layer_idx,
-                                    gid=next_gid,
-                                    mapper=next_mapper,
-                                    dirty_blocks=(self.paged_dirty_blocks[next_gid]),
-                                    io_prefix_blocks=(
-                                        self.kv_offload_config.layer_recompute_io_prefix_blocks
+                                    plan=next_plan,
+                                    prev_plan=current_plan,
+                                    prev_metadata=current_metadata,
+                                    base_seq_lens=self.seq_lens.cpu,
+                                    base_max_seq_len=(
+                                        int(np.max(self.seq_lens.np[: self._lr_num_reqs]))
+                                        if self._lr_num_reqs > 0
+                                        else 0
                                     ),
+                                    block_table_tensor=self.paged_block_tables[next_gid],
+                                    num_reqs=self._lr_num_reqs,
                                 )
-                            if _timing:
-                                self._prehook_t_bp_skip += (
-                                    _time.perf_counter() - _bp_ts
+                                if _timing:
+                                    self._prehook_t_bp_meta += (
+                                        _time.perf_counter() - _bp_ts
+                                    )
+                            with record_function_or_nullcontext(
+                                f"runkv:prehook:bp_skip:L{layer_idx}"
+                            ):
+                                if _timing:
+                                    _bp_ts = _time.perf_counter()
+                                _use_plan_skip_fb = (
+                                    isinstance(
+                                        self.replay_plan_provider,
+                                        FeedbackReplayPlanProvider,
+                                    )
+                                    and not self.replay_plan_provider.dry_run
+                                ) or isinstance(
+                                    self.replay_plan_provider,
+                                    TightLLMReplayPlanProvider,
                                 )
+                                if _use_plan_skip_fb:
+                                    next_skip_block_ids = (
+                                        manager.compute_skip_block_ids_from_plan(next_plan)
+                                    )
+                                else:
+                                    next_skip_block_ids = manager.compute_skip_block_ids_for_layer(
+                                        layer_idx=next_layer_idx,
+                                        gid=next_gid,
+                                        mapper=next_mapper,
+                                        dirty_blocks=(self.paged_dirty_blocks[next_gid]),
+                                        io_prefix_blocks=(
+                                            self.kv_offload_config.layer_recompute_io_prefix_blocks
+                                        ),
+                                    )
+                                if _timing:
+                                    self._prehook_t_bp_skip += (
+                                        _time.perf_counter() - _bp_ts
+                                    )
 
                         # Store plan + metadata + skip_ids for this next layer,
                         # and cache skip_ids so a later steady-state branch can
@@ -3653,30 +3708,49 @@ class GPUModelRunner(
                         # of the big prefetch. forward path then consumes the
                         # device-resident tensors directly without re-issuing
                         # `.to()` and stalling behind prefetch.
+                        with record_function_or_nullcontext(
+                            f"runkv:prehook:bp_promote:L{layer_idx}"
+                        ):
+                            if _timing:
+                                _bp_ts = _time.perf_counter()
+                            if self.device.type == "cuda":
+                                promote_plan_indices_to_device(next_plan, self.device)
+                            if _timing:
+                                self._prehook_t_bp_promote += (
+                                    _time.perf_counter() - _bp_ts
+                                )
                         if _timing:
                             _bp_ts = _time.perf_counter()
-                        if self.device.type == "cuda":
-                            promote_plan_indices_to_device(next_plan, self.device)
-                        if _timing:
-                            self._prehook_t_bp_promote += (
-                                _time.perf_counter() - _bp_ts
-                            )
-                            _bp_ts = _time.perf_counter()
-                        runtime.set_layer_plan(next_layer_idx, next_plan)
-                        runtime.set_layer_metadata(next_layer_idx, next_metadata)
-                        runtime.set_layer_skip_ids(next_layer_idx, next_skip_block_ids)
+                        with record_function_or_nullcontext(
+                            f"runkv:prehook:bp_set_plan:L{layer_idx}"
+                        ):
+                            runtime.set_layer_plan(next_layer_idx, next_plan)
+                        with record_function_or_nullcontext(
+                            f"runkv:prehook:bp_set_meta:L{layer_idx}"
+                        ):
+                            runtime.set_layer_metadata(next_layer_idx, next_metadata)
+                        with record_function_or_nullcontext(
+                            f"runkv:prehook:bp_set_skip:L{layer_idx}"
+                        ):
+                            runtime.set_layer_skip_ids(next_layer_idx, next_skip_block_ids)
                         # Independent of plan re-use fast paths: derive the
                         # valid-token count for the directly-H2D'd KV bucket
                         # from the current mapper + skip ids each pre_hook.
-                        direct_h2d_kv_count = (
-                            manager.compute_direct_h2d_kv_token_count(
-                                mapper=next_mapper,
-                                skip_block_ids=next_skip_block_ids or set(),
-                            )
-                        )
-                        runtime.set_layer_direct_h2d_kv_token_count(
-                            next_layer_idx, direct_h2d_kv_count
-                        )
+                        # Gated: pure observability, see
+                        # _direct_h2d_kv_token_count_enabled.
+                        if self._direct_h2d_kv_token_count_enabled:
+                            with record_function_or_nullcontext(
+                                f"runkv:prehook:bp_compute_direct_h2d:L{layer_idx}"
+                            ):
+                                direct_h2d_kv_count = (
+                                    manager.compute_direct_h2d_kv_token_count(
+                                        mapper=next_mapper,
+                                        skip_block_ids=next_skip_block_ids or set(),
+                                    )
+                                )
+                                runtime.set_layer_direct_h2d_kv_token_count(
+                                    next_layer_idx, direct_h2d_kv_count
+                                )
                         if _timing:
                             self._prehook_t_bp_runtime_set += (
                                 _time.perf_counter() - _bp_ts
@@ -8914,15 +8988,16 @@ class GPUModelRunner(
             layer0_idx,
             self.layer_recompute_manager.peek_cpu_fill_h2d_start_event(layer0_idx),
         )
-        direct_h2d_kv_count_l0 = (
-            self.layer_recompute_manager.compute_direct_h2d_kv_token_count(
-                mapper=layer0_mapper,
-                skip_block_ids=skip_block_ids,
+        if self._direct_h2d_kv_token_count_enabled:
+            direct_h2d_kv_count_l0 = (
+                self.layer_recompute_manager.compute_direct_h2d_kv_token_count(
+                    mapper=layer0_mapper,
+                    skip_block_ids=skip_block_ids,
+                )
             )
-        )
-        runtime.set_layer_direct_h2d_kv_token_count(
-            layer0_idx, direct_h2d_kv_count_l0
-        )
+            runtime.set_layer_direct_h2d_kv_token_count(
+                layer0_idx, direct_h2d_kv_count_l0
+            )
         runtime.set_layer_load_block_count(
             layer0_idx,
             layer0_mapper.peek_layer_load_block_count(layer0_idx),
