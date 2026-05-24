@@ -40,6 +40,22 @@ DEFAULT_OUTPUT_ROOT = ROOT / "exp_results/staged_offline_pilot"
 MANIFEST_ROOT = ROOT / "exp_results/manifests/staged_resource"
 ANALYSIS_ROOT = ROOT / "exp_results/analysis/staged_resource"
 PER_LAYER_ANALYSIS_ROOT = ROOT / "exp_results/analysis/staged_resource_per_layer"
+DEFAULT_TIGHTLLM_PROFILE_ROOT = ROOT / "exp_results/tightllm_profiles"
+
+
+def _require_plotting_dependency() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", "import matplotlib"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit(
+            "Analysis plots are enabled, but matplotlib is not installed in "
+            f"{sys.executable}. Install the repository bench dependencies "
+            "(`python -m pip install -e '.[bench]'`) before running this "
+            "pipeline, or pass --skip-analysis to run without plots."
+        )
 
 
 def _sanitize_token(value: str) -> str:
@@ -53,6 +69,37 @@ def _default_pattern_name(kind: str, clock: str, pattern: str) -> str:
     if kind == "sm" and pattern == "0:0,16:50,48:0" and clock == "step":
         return "sm_severe_step"
     return _sanitize_token(f"{kind}_{clock}_{pattern}")
+
+
+def _model_tag(model: str) -> str:
+    return _sanitize_token(Path(model).name or model)
+
+
+def _resolve_tightllm_profile_path(args: argparse.Namespace) -> str:
+    if args.tightllm_profile_path:
+        return args.tightllm_profile_path
+    if args.hardware_platform:
+        return str(
+            Path(args.tightllm_profile_root)
+            / _sanitize_token(args.hardware_platform.lower())
+            / f"{_model_tag(args.model)}.json"
+        )
+    return "tightllm_profile.json"
+
+
+def _validate_tightllm_profile_path(args: argparse.Namespace, path: str) -> None:
+    if Path(path).exists():
+        return
+    command = (
+        f"{sys.executable} -m vllm.v1.profiling.tightllm_offline_profiler "
+        f"--model {shlex.quote(args.model)} --output {shlex.quote(path)} "
+        "--seq-lengths 128 256 512 1024 2048 4096 8192 16384"
+    )
+    raise SystemExit(
+        f"ERROR: TightLLM profile not found: {path}\n"
+        f"Generate the profile on hardware platform {args.hardware_platform or 'current'}:\n"
+        f"  {command}"
+    )
 
 
 def _resolve_glob(pattern: str) -> list[str]:
@@ -229,6 +276,15 @@ def build_parser() -> argparse.ArgumentParser:
     ctrl.add_argument("--repeats", type=int, default=1)
     ctrl.add_argument("--skip-runkv", action="store_true")
     ctrl.add_argument("--skip-tightllm", action="store_true")
+    ctrl.add_argument(
+        "--skip-dryrun",
+        action="store_true",
+        help=(
+            "Skip the RunKV-dryrun baseline run. Dryrun runs the same RUNKV "
+            "entry as runkv-feedback but with DRY_RUN=1 (planner emits no "
+            "replay/skip decisions), giving a vanilla reference."
+        ),
+    )
     ctrl.add_argument("--skip-analysis", action="store_true")
 
     test = parser.add_argument_group("Test parameters")
@@ -237,9 +293,65 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("--num-prompts", default="128")
     test.add_argument("--prompt-words", default="8000")
     test.add_argument("--max-tokens", default="128")
-    test.add_argument("--gpu-memory-fraction", default="0.9")
+    test.add_argument("--gpu-memory-utilization", default="0.7")
+    test.add_argument("--gpu-memory-fraction", default="0.95")
     test.add_argument("--num-device-buffers", default="3")
-    test.add_argument("--tightllm-profile-path", default="tightllm_profile.json")
+    test.add_argument(
+        "--max-num-seqs",
+        default="",
+        help=(
+            "Maximum concurrently active requests; empty preserves the runner "
+            "default of --num-prompts."
+        ),
+    )
+    test.add_argument(
+        "--max-staging-blocks",
+        default="",
+        help=(
+            "Explicit KV blocks per GPU staging buffer; empty uses "
+            "--gpu-memory-fraction auto sizing."
+        ),
+    )
+    test.add_argument(
+        "--cpu-memory-gb",
+        "--cpu-kv-memory-gb",
+        dest="cpu_memory_gb",
+        default=str(5e10 / (1024**3)),
+        help=(
+            "Total CPU cache-store budget in GiB; with dynamic replay this "
+            "covers both full-layer KV and hidden-state stores. 0 derives "
+            "it from --cpu-memory-fraction; --cpu-kv-memory-gb remains an alias."
+        ),
+    )
+    test.add_argument(
+        "--cpu-memory-fraction",
+        default="0.3",
+        help="Clamp total CPU cache-store budget to this available-RAM fraction.",
+    )
+    test.add_argument(
+        "--hardware-platform",
+        default="",
+        help=(
+            "Profile key for the current GPU/node, e.g. rtx4090 or a800. "
+            "When set, auto-selects a model-specific TightLLM profile unless "
+            "--tightllm-profile-path is given."
+        ),
+    )
+    test.add_argument(
+        "--tightllm-profile-root",
+        default=str(DEFAULT_TIGHTLLM_PROFILE_ROOT),
+        help="Root for platform/model TightLLM profiles.",
+    )
+    test.add_argument(
+        "--tightllm-profile-path",
+        default="",
+        help=(
+            "Explicit TightLLM profile JSON override. Without this option, "
+            "--hardware-platform resolves "
+            "<profile-root>/<platform>/<model-tag>.json; without either, "
+            "uses legacy tightllm_profile.json."
+        ),
+    )
     test.add_argument(
         "--tightllm-feedback-correction",
         action="store_true",
@@ -269,14 +381,20 @@ def build_parser() -> argparse.ArgumentParser:
     pressure.add_argument("--resource-pressure-io-max-gbps", default="")
     pressure.add_argument(
         "--resource-pressure-mode",
-        choices=["thread", "inline"],
+        choices=["thread", "inline", "throttle"],
         default="thread",
         help=(
             "thread: legacy background-worker pressure. "
             "inline: pressure injected synchronously from RunKV pre_hook on "
             "each layer (IO before prefetch on a dedicated stream, SM before "
             "FA on compute stream). Inline produces identical interference "
-            "for RunKV / TightLLM and does not race with host syncs."
+            "for RunKV / TightLLM and does not race with host syncs. "
+            "throttle: IO-only; cap the KV / cpu-fill load streams to the "
+            "stage's target GB/s via a stream-side torch.cuda._sleep paired "
+            "with each copy. With throttle, --resource-pressure-pattern "
+            "targets are interpreted as GB/s (not a contention fraction), "
+            "and bytes-saved by RunKV translate linearly to wall-time saved. "
+            "See docs/design/io_bandwidth_throttle_design.md."
         ),
     )
     pressure.add_argument(
@@ -317,6 +435,12 @@ def build_parser() -> argparse.ArgumentParser:
     paths = parser.add_argument_group("Analysis path overrides")
     paths.add_argument("--runkv-run-dir", nargs="*", default=[])
     paths.add_argument("--tightllm-run-dir", nargs="*", default=[])
+    paths.add_argument(
+        "--dryrun-run-dir",
+        nargs="*",
+        default=[],
+        help="Reuse existing RunKV-dryrun run directories instead of launching new ones.",
+    )
     paths.add_argument("--skip-warmup-steps", type=int, default=1)
     paths.add_argument("--skip-stage-analysis", action="store_true")
     paths.add_argument("--skip-per-layer-analysis", action="store_true")
@@ -333,8 +457,14 @@ def _common_env(args: argparse.Namespace, run_tag: str, output_dir: Path) -> dic
         "NUM_PROMPTS": args.num_prompts,
         "PROMPT_WORDS": args.prompt_words,
         "MAX_TOKENS": args.max_tokens,
+        "GPU_MEMORY_UTILIZATION": args.gpu_memory_utilization,
         "GPU_MEMORY_FRACTION": args.gpu_memory_fraction,
         "NUM_DEVICE_BUFFERS": args.num_device_buffers,
+        "MAX_NUM_SEQS": args.max_num_seqs,
+        "MAX_STAGING_BLOCKS": args.max_staging_blocks,
+        "CPU_MEMORY_GB": args.cpu_memory_gb,
+        "CPU_MEMORY_FRACTION": args.cpu_memory_fraction,
+        "HARDWARE_PLATFORM": args.hardware_platform,
         "OUTPUT_DIR": str(output_dir),
         "ENABLE_OPT_COMPONENT_MFU_PROFILING": "1",
         "ENABLE_NSYS": "1" if args.enable_nsys else "0",
@@ -421,7 +551,13 @@ def _run_system(
     extra_env: dict[str, str],
 ) -> dict[str, Any]:
     run_tag = f"{pattern_name}_{system_dir_name}_r{repeat_idx}_{args.run_tag}"
-    run_dir = Path(args.output_root) / pattern_name / system_dir_name / f"r{repeat_idx}"
+    run_dir = (
+        Path(args.output_root)
+        / pattern_name
+        / _sanitize_token(args.run_tag)
+        / system_dir_name
+        / f"r{repeat_idx}"
+    )
     run_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = run_dir / "manifest.json"
     env = _common_env(args, run_tag, run_dir)
@@ -458,6 +594,7 @@ def _run_stage_analysis(
     pattern_name: str,
     runkv_dirs: list[str],
     tightllm_dirs: list[str],
+    dryrun_dirs: list[str],
 ) -> Path | None:
     if args.skip_analysis or args.skip_stage_analysis:
         print("[SKIP] staged-resource analysis")
@@ -483,6 +620,8 @@ def _run_stage_analysis(
         cmd.extend(["--runkv-run-dir", *runkv_dirs])
     if tightllm_dirs:
         cmd.extend(["--tightllm-run-dir", *tightllm_dirs])
+    if dryrun_dirs:
+        cmd.extend(["--dryrun-run-dir", *dryrun_dirs])
     rc = _run_step("Staged resource analysis", cmd, {}, manifest_path=None, log_path=None)
     if rc != 0:
         raise SystemExit(rc)
@@ -569,7 +708,13 @@ def _run_per_layer_analysis(
             str(args.compute_stream),
             "--dma-tol-ms",
             str(args.dma_tol_ms),
+            "--num-prompts",
+            str(args.num_prompts),
+            "--max-tokens",
+            str(args.max_tokens),
         ]
+        if not args.runkv_run_dir and not args.tightllm_run_dir:
+            cmd.append("--fixed-output-length")
         rc = _run_step(
             f"Per-layer timing analysis r{pair_idx}",
             cmd,
@@ -585,6 +730,13 @@ def _run_per_layer_analysis(
 
 def main() -> None:
     args = build_parser().parse_args()
+    if not args.skip_analysis and (
+        not args.skip_stage_analysis or not args.skip_per_layer_analysis
+    ):
+        _require_plotting_dependency()
+    args.tightllm_profile_path = _resolve_tightllm_profile_path(args)
+    if not args.skip_tightllm and not args.tightllm_run_dir:
+        _validate_tightllm_profile_path(args, args.tightllm_profile_path)
     pattern_name = args.resource_pattern_name or _default_pattern_name(
         args.resource_pressure_kind,
         args.resource_pressure_clock,
@@ -610,8 +762,10 @@ def main() -> None:
 
     runkv_dirs = list(args.runkv_run_dir)
     tightllm_dirs = list(args.tightllm_run_dir)
+    dryrun_dirs = list(args.dryrun_run_dir)
     runkv_results: list[dict[str, Any]] = []
     tightllm_results: list[dict[str, Any]] = []
+    dryrun_results: list[dict[str, Any]] = []
 
     for run_dir in args.runkv_run_dir:
         runkv_results.append(
@@ -626,6 +780,14 @@ def main() -> None:
             _result_from_existing_run_dir(
                 args=args,
                 system="tightllm-replay",
+                run_dir=run_dir,
+            )
+        )
+    for run_dir in args.dryrun_run_dir:
+        dryrun_results.append(
+            _result_from_existing_run_dir(
+                args=args,
+                system="runkv-dryrun",
                 run_dir=run_dir,
             )
         )
@@ -646,6 +808,28 @@ def main() -> None:
             runkv_dirs.append(result["run_dir"])
     elif args.skip_runkv:
         print("[SKIP] RunKV runs")
+
+    if not args.skip_dryrun and not args.dryrun_run_dir:
+        # Vanilla-baseline reference: same RUNKV entry, same flags, but with
+        # DRY_RUN=1 so the planner emits no replay/skip decisions. This is
+        # the "no clever planning" reference for both throughput and per-stage
+        # IO behavior; the resulting CSV row will sit alongside runkv-feedback
+        # and tightllm-replay in the staged-resource comparison output.
+        for repeat_idx in range(args.repeats):
+            result = _run_system(
+                system="runkv-dryrun",
+                script=RUNKV_SCRIPT,
+                args=args,
+                pattern_name=pattern_name,
+                repeat_idx=repeat_idx,
+                system_dir_name="runkv_dryrun",
+                extra_env={"PLANNER": "feedback", "DRY_RUN": "1", "USE_STATE_MACHINE": "1"},
+            )
+            pipeline_manifest["runs"].append(result)
+            dryrun_results.append(result)
+            dryrun_dirs.append(result["run_dir"])
+    elif args.skip_dryrun:
+        print("[SKIP] RunKV-dryrun runs")
 
     if not args.skip_tightllm and not args.tightllm_run_dir:
         for repeat_idx in range(args.repeats):
@@ -681,6 +865,7 @@ def main() -> None:
         pattern_name=pattern_name,
         runkv_dirs=runkv_dirs,
         tightllm_dirs=tightllm_dirs,
+        dryrun_dirs=dryrun_dirs,
     )
     per_layer_analysis_dirs = _run_per_layer_analysis(
         args=args,

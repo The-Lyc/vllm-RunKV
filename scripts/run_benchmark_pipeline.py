@@ -59,6 +59,60 @@ TIGHTLLM_OUTPUT_DIR = ROOT / "exp_results/tightllm_observation"
 SQLITE_OUTPUT_DIR = ROOT / "exp_results/sqlite"
 ANALYSIS_OUTPUT_DIR = ROOT / "exp_results/analysis/per_layer"
 MANIFEST_DIR = ROOT / "exp_results/manifests"
+DEFAULT_TIGHTLLM_PROFILE_ROOT = ROOT / "exp_results/tightllm_profiles"
+
+
+def _require_plotting_dependency() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", "import matplotlib"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit(
+            "Per-layer analysis is enabled, but matplotlib is not installed in "
+            f"{sys.executable}. Install the repository bench dependencies "
+            "(`python -m pip install -e '.[bench]'`) before running this "
+            "pipeline, or pass --skip-analysis to run without analysis plots."
+        )
+
+
+def _sanitize_token(value: str) -> str:
+    token = "".join(
+        ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in value
+    )
+    return token.strip("_.") or "run"
+
+
+def _model_tag(model: str) -> str:
+    return _sanitize_token(Path(model).name or model)
+
+
+def _resolve_tightllm_profile_path(args: argparse.Namespace) -> str:
+    if args.tightllm_profile_path:
+        return args.tightllm_profile_path
+    if args.hardware_platform:
+        return str(
+            Path(args.tightllm_profile_root)
+            / _sanitize_token(args.hardware_platform.lower())
+            / f"{_model_tag(args.model)}.json"
+        )
+    return "tightllm_profile.json"
+
+
+def _validate_tightllm_profile_path(args: argparse.Namespace, path: str) -> None:
+    if Path(path).exists():
+        return
+    command = (
+        f"{sys.executable} -m vllm.v1.profiling.tightllm_offline_profiler "
+        f"--model {shlex.quote(args.model)} --output {shlex.quote(path)} "
+        "--seq-lengths 128 256 512 1024 2048 4096 8192 16384"
+    )
+    raise SystemExit(
+        f"ERROR: TightLLM profile not found: {path}\n"
+        f"Generate the profile on hardware platform {args.hardware_platform or 'current'}:\n"
+        f"  {command}"
+    )
 
 
 def _resolve_glob(pattern: str) -> list[str]:
@@ -174,14 +228,68 @@ def build_parser() -> argparse.ArgumentParser:
     # ── Test parameters ───────────────────────────────────────────────────
     test = p.add_argument_group("Test parameters")
     test.add_argument("--model", default="/home/lyc/hf_models/opt-2.7b-8k")
-    test.add_argument("--prefix-blocks", default="1000")
-    test.add_argument("--num-prompts", default="128")
-    test.add_argument("--prompt-words", default="1000")
-    test.add_argument("--max-tokens", default="32")
+    test.add_argument("--prefix-blocks", default="10000")
+    test.add_argument("--num-prompts", default="32")
+    test.add_argument("--prompt-words", default="2000")
+    test.add_argument("--max-tokens", default="128")
+    test.add_argument("--gpu-memory-utilization", default="0.9")
     test.add_argument("--gpu-memory-fraction", default="0.9")
     test.add_argument("--num-device-buffers", default="3")
     test.add_argument(
-        "--tightllm-profile-path", default="tightllm_profile.json"
+        "--max-num-seqs",
+        default="",
+        help=(
+            "Maximum concurrently active requests; empty preserves the runner "
+            "default of --num-prompts."
+        ),
+    )
+    test.add_argument(
+        "--max-staging-blocks",
+        default="",
+        help=(
+            "Explicit KV blocks per GPU staging buffer; empty uses "
+            "--gpu-memory-fraction auto sizing."
+        ),
+    )
+    test.add_argument(
+        "--cpu-memory-gb",
+        "--cpu-kv-memory-gb",
+        dest="cpu_memory_gb",
+        default=str(10e10 / (1024**3)),
+        help=(
+            "Total CPU cache-store budget in GiB; with dynamic replay this "
+            "covers both full-layer KV and hidden-state stores. 0 derives "
+            "it from --cpu-memory-fraction; --cpu-kv-memory-gb remains an alias."
+        ),
+    )
+    test.add_argument(
+        "--cpu-memory-fraction",
+        default="0.6",
+        help="Clamp total CPU cache-store budget to this available-RAM fraction.",
+    )
+    test.add_argument(
+        "--hardware-platform",
+        default="",
+        help=(
+            "Profile key for the current GPU/node, e.g. rtx4090 or a800. "
+            "When set, auto-selects a model-specific TightLLM profile unless "
+            "--tightllm-profile-path is given."
+        ),
+    )
+    test.add_argument(
+        "--tightllm-profile-root",
+        default=str(DEFAULT_TIGHTLLM_PROFILE_ROOT),
+        help="Root for platform/model TightLLM profiles.",
+    )
+    test.add_argument(
+        "--tightllm-profile-path",
+        default="",
+        help=(
+            "Explicit TightLLM profile JSON override. Without this option, "
+            "--hardware-platform resolves "
+            "<profile-root>/<platform>/<model-tag>.json; without either, "
+            "uses legacy tightllm_profile.json."
+        ),
     )
 
     # ── Path overrides (for re-running specific steps) ────────────────────
@@ -203,6 +311,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if not args.skip_analysis:
+        _require_plotting_dependency()
+    tightllm_profile_path = _resolve_tightllm_profile_path(args)
+    if not args.skip_tightllm:
+        _validate_tightllm_profile_path(args, tightllm_profile_path)
 
     if not _check_nsys_available():
         print(
@@ -224,8 +337,14 @@ def main() -> None:
         "NUM_PROMPTS": args.num_prompts,
         "PROMPT_WORDS": args.prompt_words,
         "MAX_TOKENS": args.max_tokens,
+        "GPU_MEMORY_UTILIZATION": args.gpu_memory_utilization,
         "GPU_MEMORY_FRACTION": args.gpu_memory_fraction,
         "NUM_DEVICE_BUFFERS": args.num_device_buffers,
+        "MAX_NUM_SEQS": args.max_num_seqs,
+        "MAX_STAGING_BLOCKS": args.max_staging_blocks,
+        "CPU_MEMORY_GB": args.cpu_memory_gb,
+        "CPU_MEMORY_FRACTION": args.cpu_memory_fraction,
+        "HARDWARE_PLATFORM": args.hardware_platform,
         "ENABLE_NVTX": "1",
         "ENABLE_PROFILE": "1",
         "ENABLE_OPT_COMPONENT_MFU_PROFILING": "1",
@@ -256,7 +375,7 @@ def main() -> None:
     if not args.skip_tightllm:
         tightllm_env = dict(common_env)
         tightllm_env["OUTPUT_DIR"] = str(TIGHTLLM_OUTPUT_DIR)
-        tightllm_env["TIGHTLLM_PROFILE_PATH"] = args.tightllm_profile_path
+        tightllm_env["TIGHTLLM_PROFILE_PATH"] = tightllm_profile_path
         rc = _run_step(
             "TightLLM ILP planner observation",
             [sys.executable, str(TIGHTLLM_SCRIPT)],
@@ -357,9 +476,8 @@ def main() -> None:
         print(f"  RunKV    sqlite:   {runkv_sqlite}")
         print(f"  TightLLM sqlite:   {tightllm_sqlite}")
 
-        output_dir = args.analysis_output_dir or str(
-            ANALYSIS_OUTPUT_DIR / run_tag
-        )
+        # analyze_per_layer_timing.py appends the timestamp parsed from inputs.
+        output_dir = args.analysis_output_dir or str(ANALYSIS_OUTPUT_DIR)
 
         analysis_cmd = [
             sys.executable,
@@ -378,7 +496,13 @@ def main() -> None:
             str(args.skip_warmup_steps),
             "--compute-stream",
             str(args.compute_stream),
+            "--num-prompts",
+            str(args.num_prompts),
+            "--max-tokens",
+            str(args.max_tokens),
         ]
+        if not args.skip_runkv and not args.skip_tightllm:
+            analysis_cmd.append("--fixed-output-length")
         rc = _run_step("Per-layer timing analysis", analysis_cmd, {}, None)
         if rc != 0:
             sys.exit(rc)
