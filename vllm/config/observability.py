@@ -76,6 +76,15 @@ class ObservabilityConfig:
     opt_component_mfu_peak_tflops: float | None = None
     """Peak device throughput used to normalize OPT component TFLOPS into MFU."""
 
+    enable_direct_h2d_kv_token_count: bool = False
+    """Enable per-layer ``direct_h2d_kv_token_count`` accounting in the RunKV
+    pre_hook. The count drives the ``kv_replay_fraction`` and
+    ``history_token_count`` metrics in the OPT component MFU JSONL but is not
+    consumed by the execution path. Computing it is a Python for-loop over
+    every GPU-resident block (often thousands per layer) and adds milliseconds
+    per layer per step to the critical path; leave off unless these specific
+    analysis metrics are needed."""
+
     enable_mm_processor_stats: bool = False
     """Enable collection of timing statistics for multimodal processor operations.
     This is for internal use only (e.g., benchmarks) and is not exposed as a CLI

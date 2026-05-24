@@ -533,6 +533,9 @@ class EngineArgs:
     opt_component_mfu_peak_tflops: float | None = (
         ObservabilityConfig.opt_component_mfu_peak_tflops
     )
+    enable_direct_h2d_kv_token_count: bool = (
+        ObservabilityConfig.enable_direct_h2d_kv_token_count
+    )
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
@@ -1187,6 +1190,10 @@ class EngineArgs:
         observability_group.add_argument(
             "--opt-component-mfu-peak-tflops",
             **observability_kwargs["opt_component_mfu_peak_tflops"],
+        )
+        observability_group.add_argument(
+            "--enable-direct-h2d-kv-token-count",
+            **observability_kwargs["enable_direct_h2d_kv_token_count"],
         )
 
         # Scheduler arguments
@@ -1856,6 +1863,9 @@ class EngineArgs:
             ),
             opt_component_mfu_output_path=self.opt_component_mfu_output_path,
             opt_component_mfu_peak_tflops=self.opt_component_mfu_peak_tflops,
+            enable_direct_h2d_kv_token_count=(
+                self.enable_direct_h2d_kv_token_count
+            ),
             enable_mm_processor_stats=self.enable_mm_processor_stats,
         )
 
