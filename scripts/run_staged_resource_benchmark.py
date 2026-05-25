@@ -276,15 +276,6 @@ def build_parser() -> argparse.ArgumentParser:
     ctrl.add_argument("--repeats", type=int, default=1)
     ctrl.add_argument("--skip-runkv", action="store_true")
     ctrl.add_argument("--skip-tightllm", action="store_true")
-    ctrl.add_argument(
-        "--skip-dryrun",
-        action="store_true",
-        help=(
-            "Skip the RunKV-dryrun baseline run. Dryrun runs the same RUNKV "
-            "entry as runkv-feedback but with DRY_RUN=1 (planner emits no "
-            "replay/skip decisions), giving a vanilla reference."
-        ),
-    )
     ctrl.add_argument("--skip-analysis", action="store_true")
 
     test = parser.add_argument_group("Test parameters")
@@ -435,12 +426,6 @@ def build_parser() -> argparse.ArgumentParser:
     paths = parser.add_argument_group("Analysis path overrides")
     paths.add_argument("--runkv-run-dir", nargs="*", default=[])
     paths.add_argument("--tightllm-run-dir", nargs="*", default=[])
-    paths.add_argument(
-        "--dryrun-run-dir",
-        nargs="*",
-        default=[],
-        help="Reuse existing RunKV-dryrun run directories instead of launching new ones.",
-    )
     paths.add_argument("--skip-warmup-steps", type=int, default=1)
     paths.add_argument("--skip-stage-analysis", action="store_true")
     paths.add_argument("--skip-per-layer-analysis", action="store_true")
@@ -594,7 +579,6 @@ def _run_stage_analysis(
     pattern_name: str,
     runkv_dirs: list[str],
     tightllm_dirs: list[str],
-    dryrun_dirs: list[str],
 ) -> Path | None:
     if args.skip_analysis or args.skip_stage_analysis:
         print("[SKIP] staged-resource analysis")
@@ -620,8 +604,6 @@ def _run_stage_analysis(
         cmd.extend(["--runkv-run-dir", *runkv_dirs])
     if tightllm_dirs:
         cmd.extend(["--tightllm-run-dir", *tightllm_dirs])
-    if dryrun_dirs:
-        cmd.extend(["--dryrun-run-dir", *dryrun_dirs])
     rc = _run_step("Staged resource analysis", cmd, {}, manifest_path=None, log_path=None)
     if rc != 0:
         raise SystemExit(rc)
@@ -762,10 +744,8 @@ def main() -> None:
 
     runkv_dirs = list(args.runkv_run_dir)
     tightllm_dirs = list(args.tightllm_run_dir)
-    dryrun_dirs = list(args.dryrun_run_dir)
     runkv_results: list[dict[str, Any]] = []
     tightllm_results: list[dict[str, Any]] = []
-    dryrun_results: list[dict[str, Any]] = []
 
     for run_dir in args.runkv_run_dir:
         runkv_results.append(
@@ -783,15 +763,6 @@ def main() -> None:
                 run_dir=run_dir,
             )
         )
-    for run_dir in args.dryrun_run_dir:
-        dryrun_results.append(
-            _result_from_existing_run_dir(
-                args=args,
-                system="runkv-dryrun",
-                run_dir=run_dir,
-            )
-        )
-
     if not args.skip_runkv and not args.runkv_run_dir:
         for repeat_idx in range(args.repeats):
             result = _run_system(
@@ -808,28 +779,6 @@ def main() -> None:
             runkv_dirs.append(result["run_dir"])
     elif args.skip_runkv:
         print("[SKIP] RunKV runs")
-
-    if not args.skip_dryrun and not args.dryrun_run_dir:
-        # Vanilla-baseline reference: same RUNKV entry, same flags, but with
-        # DRY_RUN=1 so the planner emits no replay/skip decisions. This is
-        # the "no clever planning" reference for both throughput and per-stage
-        # IO behavior; the resulting CSV row will sit alongside runkv-feedback
-        # and tightllm-replay in the staged-resource comparison output.
-        for repeat_idx in range(args.repeats):
-            result = _run_system(
-                system="runkv-dryrun",
-                script=RUNKV_SCRIPT,
-                args=args,
-                pattern_name=pattern_name,
-                repeat_idx=repeat_idx,
-                system_dir_name="runkv_dryrun",
-                extra_env={"PLANNER": "feedback", "DRY_RUN": "1", "USE_STATE_MACHINE": "1"},
-            )
-            pipeline_manifest["runs"].append(result)
-            dryrun_results.append(result)
-            dryrun_dirs.append(result["run_dir"])
-    elif args.skip_dryrun:
-        print("[SKIP] RunKV-dryrun runs")
 
     if not args.skip_tightllm and not args.tightllm_run_dir:
         for repeat_idx in range(args.repeats):
@@ -865,7 +814,6 @@ def main() -> None:
         pattern_name=pattern_name,
         runkv_dirs=runkv_dirs,
         tightllm_dirs=tightllm_dirs,
-        dryrun_dirs=dryrun_dirs,
     )
     per_layer_analysis_dirs = _run_per_layer_analysis(
         args=args,
