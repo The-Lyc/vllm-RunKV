@@ -32,13 +32,13 @@ def main() -> None:
         "OUTPUT_DIR",
         "/home/lyc/inference/vllm/exp_results/opt_feedback_observation",
     )
-    prefix_blocks = os.environ.get("PREFIX_BLOCKS", "1000")
-    num_prompts = os.environ.get("NUM_PROMPTS", "128")
+    prefix_blocks = os.environ.get("PREFIX_BLOCKS", "10000")
+    num_prompts = os.environ.get("NUM_PROMPTS", "32")
     prompt_words = os.environ.get("PROMPT_WORDS", "1000")
-    max_tokens = os.environ.get("MAX_TOKENS", "32")
-    gpu_memory_fraction = os.environ.get("GPU_MEMORY_FRACTION", "0.9")
+    max_tokens = os.environ.get("MAX_TOKENS", "128")
+    gpu_memory_fraction = os.environ.get("GPU_MEMORY_FRACTION", "0.7")
     num_device_buffers = os.environ.get("NUM_DEVICE_BUFFERS", "3")
-    gpu_memory_utilization = os.environ.get("GPU_MEMORY_UTILIZATION", "")
+    gpu_memory_utilization = os.environ.get("GPU_MEMORY_UTILIZATION", "0.9")
     max_num_seqs = os.environ.get("MAX_NUM_SEQS", "")
     max_staging_blocks = os.environ.get("MAX_STAGING_BLOCKS", "")
     cpu_memory_gb = os.environ.get(
@@ -48,6 +48,10 @@ def main() -> None:
     planner = os.environ.get("PLANNER", "feedback")
     dry_run = os.environ.get("DRY_RUN", "1") == "1"
     use_state_machine = os.environ.get("USE_STATE_MACHINE", "0") == "1"
+    async_plan_build = os.environ.get("ASYNC_PLAN_BUILD", "1") == "1"
+    h2d_copy_mode = os.environ.get("H2D_COPY_MODE", "segment")
+    if h2d_copy_mode not in ("segment", "gather"):
+        raise ValueError(f"Unsupported H2D_COPY_MODE: {h2d_copy_mode!r}")
     tightllm_profile_path = os.environ.get("TIGHTLLM_PROFILE_PATH", "")
     tightllm_feedback_correction = (
         os.environ.get("TIGHTLLM_FEEDBACK_CORRECTION", "0") == "1"
@@ -128,6 +132,9 @@ def main() -> None:
         cmd.append("--planner-dry-run")
     if use_state_machine:
         cmd.append("--use-state-machine")
+    if not async_plan_build:
+        cmd.append("--no-async-plan-build")
+    cmd.extend(["--h2d-copy-mode", h2d_copy_mode])
     if tightllm_profile_path:
         cmd.extend(["--tightllm-profile-path", tightllm_profile_path])
     if tightllm_feedback_correction:
@@ -148,6 +155,8 @@ def main() -> None:
     print(f"  planner: {planner}")
     print(f"  planner_dry_run: {int(dry_run)}")
     print(f"  use_state_machine: {int(use_state_machine)}")
+    print(f"  async_plan_build: {int(async_plan_build)}")
+    print(f"  h2d_copy_mode: {h2d_copy_mode}")
     if planner == "tightllm":
         print(f"  tightllm_profile: {tightllm_profile_path}")
         print(f"  tightllm_feedback_correction: {int(tightllm_feedback_correction)}")
@@ -224,6 +233,9 @@ def main() -> None:
             "cpu_memory_gb": cpu_memory_gb or None,
             "cpu_memory_fraction": cpu_memory_fraction or None,
             "planner": planner,
+            "layer_recompute_async_plan_build": async_plan_build,
+            "h2d_copy_mode": h2d_copy_mode,
+            "layer_recompute_use_state_machine": use_state_machine,
             "model": model,
             "nsys_report": str(Path(nsys_stem + ".nsys-rep").resolve())
             if enable_nsys

@@ -105,6 +105,20 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no-async-plan-build",
+        action="store_true",
+        help=(
+            "Build non-steady replay plans synchronously in pre_hook instead "
+            "of consuming speculative background builds."
+        ),
+    )
+    parser.add_argument(
+        "--h2d-copy-mode",
+        choices=["segment", "gather"],
+        default="segment",
+        help="KV H2D staging implementation used by RunKV.",
+    )
+    parser.add_argument(
         "--tightllm-profile-path",
         default=None,
         help="Path to TightLLM offline profile JSON (required for --planner tightllm).",
@@ -323,6 +337,8 @@ def make_kv_offload_config(
     cpu_memory_fraction: float,
     planner: str,
     planner_dry_run: bool,
+    async_plan_build: bool = True,
+    h2d_copy_mode: str = "segment",
     use_state_machine: bool = False,
     tightllm_profile_path: str | None = None,
     tightllm_feedback_correction: bool = False,
@@ -348,6 +364,8 @@ def make_kv_offload_config(
         config["layer_recompute_io_prefix_blocks"] = [int(setting)]
         config["layer_recompute_planner"] = planner
         config["layer_recompute_planner_dry_run"] = planner_dry_run
+        config["layer_recompute_async_plan_build"] = async_plan_build
+        config["h2d_copy_mode"] = h2d_copy_mode
         config["layer_recompute_use_state_machine"] = use_state_machine
         if planner == "tightllm":
             if not tightllm_profile_path:
@@ -610,6 +628,8 @@ def main() -> None:
                     cpu_memory_fraction=args.cpu_memory_fraction,
                     planner=args.planner,
                     planner_dry_run=args.planner_dry_run,
+                    async_plan_build=not args.no_async_plan_build,
+                    h2d_copy_mode=args.h2d_copy_mode,
                     use_state_machine=args.use_state_machine,
                     tightllm_profile_path=args.tightllm_profile_path,
                     tightllm_feedback_correction=args.tightllm_feedback_correction,
