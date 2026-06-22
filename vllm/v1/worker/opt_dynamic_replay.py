@@ -1164,6 +1164,7 @@ class OPTDynamicReplayRuntime:
     cpu_hs_store: torch.Tensor
     replay_plan_provider: ReplayPlanProvider
     layer_recompute_manager: Any | None = None
+    async_plan_build_enabled: bool = True
     scheduled_req_indices: np.ndarray | None = None
     scheduled_positions: np.ndarray | None = None
     _layer_plans: list[LayerReplayPlan | None] = field(init=False)
@@ -1189,7 +1190,7 @@ class OPTDynamicReplayRuntime:
     _last_plan_change_hint: str | None = field(init=False, default=None)
     _last_sm_state: str | None = field(init=False, default=None)
     _builder_fn: Callable[..., None] | None = field(init=False, default=None)
-    _builder_executor: ThreadPoolExecutor = field(init=False)
+    _builder_executor: ThreadPoolExecutor | None = field(init=False, default=None)
     _speculative_futures: dict[int, Future] = field(init=False)
 
     def __post_init__(self) -> None:
@@ -1211,14 +1212,16 @@ class OPTDynamicReplayRuntime:
         self._speculative_skip_ids = [None] * self.num_layers
         self._layer_skip_ids = [None] * self.num_layers
         self._speculative_futures = {}
-        self._builder_executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="runkv-spec-builder",
-        )
+        if self.async_plan_build_enabled:
+            self._builder_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="runkv-spec-builder",
+            )
 
     def close(self) -> None:
         """Shutdown the background builder thread pool gracefully."""
-        self._builder_executor.shutdown(wait=False, cancel_futures=True)
+        if self._builder_executor is not None:
+            self._builder_executor.shutdown(wait=False, cancel_futures=True)
 
     # ---- qkv_end_event ----
 
@@ -1337,10 +1340,13 @@ class OPTDynamicReplayRuntime:
         self, target_layer_idx: int, current_plan: LayerReplayPlan
     ) -> None:
         """Submit a non-blocking speculative build for *target_layer_idx*."""
+        if not self.async_plan_build_enabled:
+            return
         assert self._builder_fn is not None, (
             "bind_speculative_builder() must be called "
             "before submit_speculative_build()"
         )
+        assert self._builder_executor is not None
         future = self._builder_executor.submit(
             self._builder_fn,
             target_layer_idx,

@@ -64,6 +64,15 @@ class RunKVOffloadConfig:
     # When enabled, planner state may update but must not change execution.
     layer_recompute_planner_dry_run: bool = False
 
+    # Build full dynamic plans speculatively on a background CPU thread.
+    # Disabling this preserves the steady-successor fast path, while
+    # non-steady layers build their full plans synchronously in pre_hook.
+    layer_recompute_async_plan_build: bool = True
+
+    # KV H2D staging implementation. "segment" copies contiguous logical
+    # ranges directly, while "gather" stages selected blocks before DMA.
+    h2d_copy_mode: Literal["segment", "gather"] = "segment"
+
     # --- TightLLM planner settings ---
     # Path to offline profile JSON produced by tightllm_offline_profiler.
     # Required when layer_recompute_planner == "tightllm".

@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from copy import copy, deepcopy
 from functools import reduce
 from itertools import product
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeAlias, cast
 
 import numpy as np
 import torch
@@ -392,6 +392,7 @@ class PagedBlockMapper:
         gpu_buffers: dict[int, torch.Tensor],
         cpu_caches_per_layer: dict[str, torch.Tensor],
         device: torch.device,
+        h2d_copy_mode: Literal["segment", "gather"] = "segment",
     ) -> None:
         """Initialize the PagedBlockMapper.
 
@@ -409,6 +410,9 @@ class PagedBlockMapper:
         self.gpu_buffers = gpu_buffers
         self.cpu_caches_per_layer = cpu_caches_per_layer
         self.device = device
+        if h2d_copy_mode not in ("segment", "gather"):
+            raise ValueError(f"Unsupported RunKV H2D copy mode: {h2d_copy_mode!r}")
+        self.h2d_copy_mode = h2d_copy_mode
 
         # Determine which dimension indexes KV-cache blocks.
         # Common layouts are:
@@ -475,6 +479,20 @@ class PagedBlockMapper:
         self._dirty_dst_indices_pinned = torch.empty(
             max_indices, dtype=torch.int64, device="cpu", pin_memory=True
         )
+        if self.h2d_copy_mode == "gather":
+            self._src_indices_pinned = torch.empty(
+                max_indices, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+            self._dst_indices_pinned = torch.empty(
+                max_indices, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+            self._h2d_pinned_staging = torch.empty_like(
+                any_buffer, device="cpu", pin_memory=True
+            )
+            self._h2d_gpu_staging = torch.empty_like(any_buffer)
+            self._scatter_indices_gpu = torch.empty(
+                max_indices, dtype=torch.int64, device=device
+            )
 
         # UVA batch copy kernel (still used for D2H offload where dirty block
         # count is small and SM contention is negligible).
@@ -482,7 +500,8 @@ class PagedBlockMapper:
         self.use_batch_copy = batch_copy_fn is not None
         self._batch_copy_fn = batch_copy_fn
         logger.info(
-            "RunKV: multi-segment DMA H2D (max %d blocks), UVA D2H kernel %s",
+            "RunKV: %s DMA H2D (max %d blocks), UVA D2H kernel %s",
+            self.h2d_copy_mode,
             max_indices,
             "available" if self.use_batch_copy else "unavailable (per-block fallback)",
         )
@@ -576,6 +595,72 @@ class PagedBlockMapper:
             src.select(self._blocks_dim, src_block_id),
             non_blocking=non_blocking,
         )
+
+    def _dma_h2d_gather_copy(
+        self,
+        gpu_buffer: torch.Tensor,
+        cpu_cache: torch.Tensor,
+        src_indices: torch.Tensor,
+        copy_count: int,
+        dst_indices: torch.Tensor | None = None,
+    ) -> None:
+        """Gather selected CPU blocks, then enqueue DMA H2D and optional scatter."""
+        bd = self._blocks_dim
+        staging = self._h2d_pinned_staging
+
+        if bd == 0:
+            with record_function_or_nullcontext("runkv:gather_dma:cpu_gather:bd0"):
+                torch.index_select(cpu_cache, 0, src_indices, out=staging[:copy_count])
+            with record_function_or_nullcontext("runkv:gather_dma:h2d_scatter:bd0"):
+                if dst_indices is None:
+                    gpu_buffer[:copy_count].copy_(
+                        staging[:copy_count], non_blocking=True
+                    )
+                else:
+                    gpu_stg = self._h2d_gpu_staging
+                    gpu_stg[:copy_count].copy_(
+                        staging[:copy_count], non_blocking=True
+                    )
+                    self._scatter_indices_gpu[:copy_count].copy_(
+                        dst_indices, non_blocking=True
+                    )
+                    gpu_buffer.index_copy_(
+                        0,
+                        self._scatter_indices_gpu[:copy_count],
+                        gpu_stg[:copy_count],
+                    )
+            return
+
+        outer_size = cpu_cache.shape[0]
+        with record_function_or_nullcontext("runkv:gather_dma:cpu_gather:bd1"):
+            for outer in range(outer_size):
+                torch.index_select(
+                    cpu_cache[outer],
+                    0,
+                    src_indices,
+                    out=staging[outer, :copy_count],
+                )
+        with record_function_or_nullcontext("runkv:gather_dma:h2d_scatter:bd1"):
+            if dst_indices is None:
+                for outer in range(outer_size):
+                    gpu_buffer[outer, :copy_count].copy_(
+                        staging[outer, :copy_count], non_blocking=True
+                    )
+            else:
+                gpu_stg = self._h2d_gpu_staging
+                for outer in range(outer_size):
+                    gpu_stg[outer, :copy_count].copy_(
+                        staging[outer, :copy_count], non_blocking=True
+                    )
+                self._scatter_indices_gpu[:copy_count].copy_(
+                    dst_indices, non_blocking=True
+                )
+                for outer in range(outer_size):
+                    gpu_buffer[outer].index_copy_(
+                        0,
+                        self._scatter_indices_gpu[:copy_count],
+                        gpu_stg[outer, :copy_count],
+                    )
 
     def _assign_slots(self, logical_block_ids: list[int]) -> None:
         """Assign GPU staging slots for the given logical blocks.
@@ -752,6 +837,7 @@ class PagedBlockMapper:
                 self._last_timing = {
                     "segment_build": 0.0,
                     "mseg_dma": 0.0,
+                    "gather_dma": 0.0,
                     "event": 0.0,
                     "copy_count": 0,
                     "num_segments": 0,
@@ -856,11 +942,11 @@ class PagedBlockMapper:
                 load_start_event.record(self.load_stream)
                 self.load_start_events[layer_idx] = load_start_event
 
-                # ---- Multi-segment DMA: one copy per contiguous segment ----
+                # ---- KV H2D implementation under test ----
                 if _t:
                     _tg0 = _time.perf_counter()
                 bytes_total = 0
-                if segments:
+                if segments and self.h2d_copy_mode == "segment":
                     bd = self._blocks_dim
                     with record_function_or_nullcontext(
                         f"runkv:mseg_dma:L{layer_idx}"
@@ -894,6 +980,39 @@ class PagedBlockMapper:
                                     bytes_total += (
                                         src.element_size() * src.numel()
                                     )
+                elif copy_count and self.h2d_copy_mode == "gather":
+                    self._src_indices_pinned[:copy_count].copy_(
+                        torch.tensor(load_ids, dtype=torch.int64)
+                    )
+                    dst_indices = None
+                    if skip:
+                        self._dst_indices_pinned[:copy_count].copy_(
+                            torch.tensor(
+                                [self.mapping[lid] for lid in load_ids],
+                                dtype=torch.int64,
+                            )
+                        )
+                        dst_indices = self._dst_indices_pinned[:copy_count]
+                    with record_function_or_nullcontext(
+                        f"runkv:gather_dma:L{layer_idx}:{copy_count}blk"
+                    ):
+                        self._dma_h2d_gather_copy(
+                            gpu_buffer,
+                            cpu_cache,
+                            self._src_indices_pinned[:copy_count],
+                            copy_count,
+                            dst_indices=dst_indices,
+                        )
+                    if self._blocks_dim == 0:
+                        bytes_per_block = (
+                            cpu_cache[0].element_size() * cpu_cache[0].numel()
+                        )
+                    else:
+                        bytes_per_block = (
+                            cpu_cache[:, 0].element_size()
+                            * cpu_cache[:, 0].numel()
+                        )
+                    bytes_total = copy_count * bytes_per_block
                 # Throttle the load stream's effective bandwidth to the
                 # configured target by pairing the just-issued copies with a
                 # parallel _sleep on a per-stream aux stream and gating the
@@ -901,7 +1020,13 @@ class PagedBlockMapper:
                 # throttle is installed. See docs/design/io_bandwidth_throttle_design.md.
                 throttle_after_copy_if_enabled(self.load_stream, bytes_total)
                 if _t:
-                    self._last_timing["mseg_dma"] = _time.perf_counter() - _tg0
+                    copy_time = _time.perf_counter() - _tg0
+                    if self.h2d_copy_mode == "segment":
+                        self._last_timing["mseg_dma"] = copy_time
+                        self._last_timing["gather_dma"] = 0.0
+                    else:
+                        self._last_timing["mseg_dma"] = 0.0
+                        self._last_timing["gather_dma"] = copy_time
                     self._last_timing["copy_count"] = copy_count
                     self._last_timing["num_segments"] = len(segments)
 
@@ -1325,6 +1450,7 @@ class GPUModelRunner(
         # -- load_layer_async sub-parts --
         self._prehook_t_sio_segment_build: float = 0.0
         self._prehook_t_sio_mseg_dma: float = 0.0
+        self._prehook_t_sio_gather_dma: float = 0.0
         self._prehook_t_sio_event: float = 0.0
         # -- cpu_fill_h2d_async sub-parts --
         self._prehook_t_sio_cf_prepare: float = 0.0
@@ -1336,6 +1462,7 @@ class GPUModelRunner(
         self._prehook_t_bp_steady_plan: float = 0.0
         self._prehook_t_bp_pop_spec: float = 0.0
         self._prehook_t_bp_fallback: float = 0.0
+        self._prehook_t_bp_sync_plan: float = 0.0
         self._prehook_t_bp_meta: float = 0.0
         self._prehook_t_bp_skip: float = 0.0
         self._prehook_t_bp_promote: float = 0.0
@@ -1351,6 +1478,7 @@ class GPUModelRunner(
         self._prehook_n_meta_reuse_hit: int = 0
         self._prehook_n_meta_reuse_miss: int = 0
         self._prehook_n_spec_fallback: int = 0
+        self._prehook_n_sync_full_plan: int = 0
         self._prehook_t_total: float = 0.0
         self._prehook_layer_count: int = 0
         # All step records kept in memory; flushed to file at shutdown.
@@ -3051,6 +3179,7 @@ class GPUModelRunner(
         sio_sub_fields = [
             "sio_segment_build_ms",
             "sio_mseg_dma_ms",
+            "sio_gather_dma_ms",
             "sio_event_ms",
             "sio_cf_prepare_ms",
             "sio_cf_gather_ms",
@@ -3092,6 +3221,7 @@ class GPUModelRunner(
                 "bp_steady_plan_ms",
                 "bp_pop_spec_ms",
                 "bp_fallback_ms",
+                "bp_sync_plan_ms",
                 "bp_meta_ms",
                 "bp_skip_ms",
                 "bp_promote_ms",
@@ -3153,6 +3283,9 @@ class GPUModelRunner(
             n_spec_fb = sum(
                 r.get("n_spec_fallback", 0) for r in self._prehook_timing_records
             )
+            n_sync_full_plan = sum(
+                r.get("n_sync_full_plan", 0) for r in self._prehook_timing_records
+            )
             n_branches = max(n_steady + n_nonsteady, 1)
             n_meta_total = max(n_meta_hit + n_meta_miss, 1)
             f.write("\n--- branch / reuse counters ---\n")
@@ -3164,6 +3297,7 @@ class GPUModelRunner(
                 f"  nonsteady    : {n_nonsteady:>10d}  "
                 f"({n_nonsteady / n_branches * 100:>5.1f}%)\n"
             )
+            f.write(f"  sync_fullplan: {n_sync_full_plan:>10d}\n")
             f.write(
                 f"  meta reuse hit : {n_meta_hit:>8d}  "
                 f"({n_meta_hit / n_meta_total * 100:>5.1f}%)\n"
@@ -3593,38 +3727,59 @@ class GPUModelRunner(
                             # are completed here on the main thread.
                             if _timing:
                                 self._prehook_n_nonsteady_branch += 1
-                            with record_function_or_nullcontext(
-                                f"runkv:prehook:bp_pop_spec:L{layer_idx}"
-                            ):
-                                if _timing:
-                                    _bp_ts = _time.perf_counter()
-                                spec_plan = runtime.pop_speculative(next_layer_idx)
-                                if _timing:
-                                    self._prehook_t_bp_pop_spec += (
-                                        _time.perf_counter() - _bp_ts
-                                    )
-                            if spec_plan is not None:
-                                next_plan = spec_plan
-                            else:
-                                # Defensive fallback: bootstrap or builder error.
-                                if not getattr(
-                                    self,
-                                    "_dynamic_replay_spec_fallback_logged",
-                                    False,
-                                ):
-                                    logger.warning(
-                                        "RunKV dynamic replay: spec(L%d) missing at "
-                                        "pre_hook(L%d); falling back to synchronous "
-                                        "build.",
-                                        next_layer_idx,
-                                        layer_idx,
-                                    )
-                                    self._dynamic_replay_spec_fallback_logged = True
+                            if runtime.async_plan_build_enabled:
                                 with record_function_or_nullcontext(
-                                    f"runkv:prehook:bp_fallback:L{layer_idx}"
+                                    f"runkv:prehook:bp_pop_spec:L{layer_idx}"
                                 ):
                                     if _timing:
-                                        self._prehook_n_spec_fallback += 1
+                                        _bp_ts = _time.perf_counter()
+                                    spec_plan = runtime.pop_speculative(next_layer_idx)
+                                    if _timing:
+                                        self._prehook_t_bp_pop_spec += (
+                                            _time.perf_counter() - _bp_ts
+                                        )
+                                if spec_plan is not None:
+                                    next_plan = spec_plan
+                                else:
+                                    # Defensive fallback: bootstrap or builder error.
+                                    if not getattr(
+                                        self,
+                                        "_dynamic_replay_spec_fallback_logged",
+                                        False,
+                                    ):
+                                        logger.warning(
+                                            "RunKV dynamic replay: spec(L%d) missing "
+                                            "at pre_hook(L%d); falling back to "
+                                            "synchronous build.",
+                                            next_layer_idx,
+                                            layer_idx,
+                                        )
+                                        self._dynamic_replay_spec_fallback_logged = True
+                                    with record_function_or_nullcontext(
+                                        f"runkv:prehook:bp_fallback:L{layer_idx}"
+                                    ):
+                                        if _timing:
+                                            self._prehook_n_spec_fallback += 1
+                                            _bp_ts = _time.perf_counter()
+                                        next_plan = self._build_dynamic_layer_plan(
+                                            layer_idx=next_layer_idx,
+                                            gid=next_gid,
+                                            num_reqs=self._lr_num_reqs,
+                                            num_scheduled_tokens_np=(
+                                                self._lr_num_scheduled_tokens_np
+                                            ),
+                                            prev_layer_plan=current_plan,
+                                        )
+                                        if _timing:
+                                            self._prehook_t_bp_fallback += (
+                                                _time.perf_counter() - _bp_ts
+                                            )
+                            else:
+                                with record_function_or_nullcontext(
+                                    f"runkv:prehook:bp_sync_plan:L{layer_idx}"
+                                ):
+                                    if _timing:
+                                        self._prehook_n_sync_full_plan += 1
                                         _bp_ts = _time.perf_counter()
                                     next_plan = self._build_dynamic_layer_plan(
                                         layer_idx=next_layer_idx,
@@ -3636,7 +3791,7 @@ class GPUModelRunner(
                                         prev_layer_plan=current_plan,
                                     )
                                     if _timing:
-                                        self._prehook_t_bp_fallback += (
+                                        self._prehook_t_bp_sync_plan += (
                                             _time.perf_counter() - _bp_ts
                                         )
                             # Metadata + H2D always on main thread.
@@ -3850,6 +4005,9 @@ class GPUModelRunner(
                                 "segment_build", 0.0
                             )
                             self._prehook_t_sio_mseg_dma += _la.get("mseg_dma", 0.0)
+                            self._prehook_t_sio_gather_dma += _la.get(
+                                "gather_dma", 0.0
+                            )
                             self._prehook_t_sio_event += _la.get("event", 0.0)
                             # Collect cpu_fill sub-timings only when
                             # load_cpu_fill_h2d_async was actually called;
@@ -5982,6 +6140,7 @@ class GPUModelRunner(
             _sio_sub_accounted = (
                 self._prehook_t_sio_segment_build
                 + self._prehook_t_sio_mseg_dma
+                + self._prehook_t_sio_gather_dma
                 + self._prehook_t_sio_event
                 + self._prehook_t_sio_cf_prepare
                 + self._prehook_t_sio_cf_gather
@@ -6002,6 +6161,7 @@ class GPUModelRunner(
                     "schedule_io_ms": self._prehook_t_schedule_io * 1000,
                     "sio_segment_build_ms": self._prehook_t_sio_segment_build * 1000,
                     "sio_mseg_dma_ms": self._prehook_t_sio_mseg_dma * 1000,
+                    "sio_gather_dma_ms": self._prehook_t_sio_gather_dma * 1000,
                     "sio_event_ms": self._prehook_t_sio_event * 1000,
                     "sio_cf_prepare_ms": self._prehook_t_sio_cf_prepare * 1000,
                     "sio_cf_gather_ms": self._prehook_t_sio_cf_gather * 1000,
@@ -6013,6 +6173,7 @@ class GPUModelRunner(
                     "bp_steady_plan_ms": self._prehook_t_bp_steady_plan * 1000,
                     "bp_pop_spec_ms": self._prehook_t_bp_pop_spec * 1000,
                     "bp_fallback_ms": self._prehook_t_bp_fallback * 1000,
+                    "bp_sync_plan_ms": self._prehook_t_bp_sync_plan * 1000,
                     "bp_meta_ms": self._prehook_t_bp_meta * 1000,
                     "bp_skip_ms": self._prehook_t_bp_skip * 1000,
                     "bp_promote_ms": self._prehook_t_bp_promote * 1000,
@@ -6026,6 +6187,7 @@ class GPUModelRunner(
                     "n_meta_hit": self._prehook_n_meta_reuse_hit,
                     "n_meta_miss": self._prehook_n_meta_reuse_miss,
                     "n_spec_fallback": self._prehook_n_spec_fallback,
+                    "n_sync_full_plan": self._prehook_n_sync_full_plan,
                 }
             )
             # Reset per-step accumulators
@@ -6037,6 +6199,7 @@ class GPUModelRunner(
             self._prehook_t_schedule_io = 0.0
             self._prehook_t_sio_segment_build = 0.0
             self._prehook_t_sio_mseg_dma = 0.0
+            self._prehook_t_sio_gather_dma = 0.0
             self._prehook_t_sio_event = 0.0
             self._prehook_t_sio_cf_prepare = 0.0
             self._prehook_t_sio_cf_gather = 0.0
@@ -6046,6 +6209,7 @@ class GPUModelRunner(
             self._prehook_t_bp_steady_plan = 0.0
             self._prehook_t_bp_pop_spec = 0.0
             self._prehook_t_bp_fallback = 0.0
+            self._prehook_t_bp_sync_plan = 0.0
             self._prehook_t_bp_meta = 0.0
             self._prehook_t_bp_skip = 0.0
             self._prehook_t_bp_promote = 0.0
@@ -6059,6 +6223,7 @@ class GPUModelRunner(
             self._prehook_n_meta_reuse_hit = 0
             self._prehook_n_meta_reuse_miss = 0
             self._prehook_n_spec_fallback = 0
+            self._prehook_n_sync_full_plan = 0
             self._prehook_t_total = 0.0
             self._prehook_layer_count = 0
 
@@ -8892,6 +9057,13 @@ class GPUModelRunner(
             cpu_hs_store=self.layer_recompute_manager.cpu_layer_inputs_by_layer[0],
             replay_plan_provider=self.replay_plan_provider,
             layer_recompute_manager=self.layer_recompute_manager,
+            async_plan_build_enabled=bool(
+                getattr(
+                    self.kv_offload_config,
+                    "layer_recompute_async_plan_build",
+                    True,
+                )
+            ),
         )
         step_anchor_event: torch.cuda.Event | None = None
         if self.device.type == "cuda":
@@ -9020,14 +9192,15 @@ class GPUModelRunner(
             )
             self._dynamic_replay_runtime_logged = True
 
-        # ---- Bind speculative builder callback ----
-        runtime.bind_speculative_builder(
-            functools.partial(
-                self._build_speculative_for_layer_impl,
-                num_reqs=num_reqs,
-                num_scheduled_tokens_np=num_scheduled_tokens_np,
+        if runtime.async_plan_build_enabled:
+            # ---- Bind speculative builder callback ----
+            runtime.bind_speculative_builder(
+                functools.partial(
+                    self._build_speculative_for_layer_impl,
+                    num_reqs=num_reqs,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                )
             )
-        )
 
         # ---- Cache layer-0 skip_ids for steady-state reuse ----
         runtime.set_layer_skip_ids(layer0_idx, skip_block_ids)
@@ -9036,7 +9209,7 @@ class GPUModelRunner(
         # pre_hook(0) has never called observe_feedback, so
         # last_observed_in_deadband() == False → it will walk the
         # non-steady branch and pop_speculative(layer1_idx).
-        if len(self._runkv_layer_info) >= 2:
+        if runtime.async_plan_build_enabled and len(self._runkv_layer_info) >= 2:
             _layer1_name, layer1_idx, _layer1_gid = self._runkv_layer_info[1]
             runtime.submit_speculative_build(
                 target_layer_idx=layer1_idx,
@@ -9161,6 +9334,9 @@ class GPUModelRunner(
                     self.kv_buffers,
                     self.cpu_kv_caches_per_layer,
                     self.device,
+                    h2d_copy_mode=getattr(
+                        self.kv_offload_config, "h2d_copy_mode", "segment"
+                    ),
                 )
                 self.paged_block_mappers.append(mapper)
                 self.paged_dirty_blocks.append(set())

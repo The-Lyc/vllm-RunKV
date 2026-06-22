@@ -606,6 +606,8 @@ class EngineArgs:
     ] = "io_hidden_states"
     runkv_layer_recompute_planner: Literal["static", "feedback"] = "static"
     runkv_layer_recompute_planner_dry_run: bool = False
+    runkv_layer_recompute_async_plan_build: bool = True
+    runkv_h2d_copy_mode: Literal["segment", "gather"] = "segment"
     runkv_layer_recompute_use_state_machine: bool = False
 
     # RunKV layer-wise KV cache offload configuration
@@ -1061,6 +1063,19 @@ class EngineArgs:
             action="store_true",
             default=False,
             help="Update planner state without changing the execution plan.",
+        )
+        runkv_group.add_argument(
+            "--runkv-disable-layer-recompute-async-plan-build",
+            dest="runkv_layer_recompute_async_plan_build",
+            action="store_false",
+            default=True,
+            help="Build non-steady dynamic plans synchronously in pre_hook.",
+        )
+        runkv_group.add_argument(
+            "--runkv-h2d-copy-mode",
+            choices=["segment", "gather"],
+            default="segment",
+            help="KV H2D staging implementation for RunKV. Default: segment.",
         )
 
         # Multimodal related configs
@@ -1973,6 +1988,10 @@ class EngineArgs:
             layer_recompute_planner_dry_run=(
                 self.runkv_layer_recompute_planner_dry_run
             ),
+            layer_recompute_async_plan_build=(
+                self.runkv_layer_recompute_async_plan_build
+            ),
+            h2d_copy_mode=self.runkv_h2d_copy_mode,
             layer_recompute_use_state_machine=(
                 self.runkv_layer_recompute_use_state_machine
             ),

@@ -480,6 +480,8 @@ class TestRunKVOffloadConfig:
         assert config.enable_async_prefetch is True
         assert config.enable_async_offload is True
         assert config.layer_recompute_mode == "io_hidden_states"
+        assert config.layer_recompute_async_plan_build is True
+        assert config.h2d_copy_mode == "segment"
 
     def test_custom_config(self):
         """Test custom configuration."""
@@ -492,6 +494,8 @@ class TestRunKVOffloadConfig:
             gpu_memory_fraction=0.2,
             enable_async_prefetch=False,
             layer_recompute_mode="prev_layer_output_dynamic",
+            layer_recompute_async_plan_build=False,
+            h2d_copy_mode="gather",
         )
 
         assert config.enabled is True
@@ -500,6 +504,8 @@ class TestRunKVOffloadConfig:
         assert config.gpu_memory_fraction == 0.2
         assert config.enable_async_prefetch is False
         assert config.layer_recompute_mode == "prev_layer_output_dynamic"
+        assert config.layer_recompute_async_plan_build is False
+        assert config.h2d_copy_mode == "gather"
 
 
 class TestRunKVMemorySizing:

@@ -509,14 +509,18 @@ class OPTDecoder(nn.Module):
             # ---- Speculative build for L+2 — non-blocking ----
             # plan(L+1) was written by pre_hook(L) before GPU layer(L) started,
             # so it is already available here as the correct prev_layer_plan.
-            # Submit unconditionally: the spec builder runs on a CPU side
+            # Submit whenever the asynchronous builder is enabled: the builder runs
+            # on a CPU side
             # thread that would otherwise be idle, and any plan unused by
             # pre_hook's steady-successor branch is discarded by
             # clear_speculative() at no cost. Gating on SM state previously
             # caused 48% of nonsteady pre_hooks to fall back to a synchronous
             # build (TRANSIT skipped submit but pre_hook still required a
             # full plan when |imbalance| >= deadband).
-            if layer_idx + 2 < self.end_layer:
+            if (
+                runtime.async_plan_build_enabled
+                and layer_idx + 2 < self.end_layer
+            ):
                 runtime.submit_speculative_build(
                     target_layer_idx=layer_idx + 2,
                     current_plan=runtime.get_layer_plan(layer_idx + 1),

@@ -170,3 +170,25 @@ def test_forward_context_accepts_dynamic_replay_runtime() -> None:
     )
 
     assert forward_context.layer_recompute_runtime is runtime
+
+
+def test_runtime_disabled_async_plan_build_does_not_submit() -> None:
+    runtime = OPTDynamicReplayRuntime(
+        num_layers=2,
+        cpu_hs_store=torch.empty(1, 1, 1),
+        replay_plan_provider=_DummyReplayPlanProvider(),
+        async_plan_build_enabled=False,
+    )
+    called = False
+
+    def _builder(*args: object, **kwargs: object) -> None:
+        nonlocal called
+        called = True
+
+    runtime.bind_speculative_builder(_builder)
+    runtime.submit_speculative_build(1, _make_layer_plan())
+
+    assert runtime._builder_executor is None
+    assert not runtime._speculative_futures
+    assert called is False
+    runtime.close()
