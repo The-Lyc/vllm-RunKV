@@ -28,7 +28,8 @@ def analyze_step_variance(file_path):
     print("-" * 55)
 
     for step in sorted_steps:
-        data_points = np.array(step_groups[step])
+        # Exclude boundary layer imbalance values before estimating step noise.
+        data_points = np.array(step_groups[step][1:-1])
         if len(data_points) > 1:
             s_std = np.std(data_points, ddof=1)
             s_mean = np.mean(data_points)
@@ -59,7 +60,7 @@ def analyze_step_variance(file_path):
     return meta_stats
 
 # 执行分析
-file_name = '/home/lyc/inference/vllm/exp_results/opt_feedback_observation/opt_component_mfu_1000_20260422_174059.flat.jsonl' # 替换为你的文件名
+file_name = '/home/lyc/inference/vllm/exp_results/opt_feedback_observation/opt_component_mfu_10000_20260526_204620.flat.jsonl' # 替换为你的文件名
 results = analyze_step_variance(file_name)
 
 print("\n" + "="*40)

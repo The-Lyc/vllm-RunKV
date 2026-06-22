@@ -2178,6 +2178,8 @@ def plot_per_step_layer_lines(
     runkv_psl: dict[str, dict[int, dict[int, float]]],
     tightllm_psl: dict[str, dict[int, dict[int, float]]],
     out_dir: Path,
+    resource_stages: list[dict[str, Any]] | None = None,
+    uncapped_bandwidth_gbps: float | None = None,
 ) -> None:
     """Plot per-step × per-layer line charts for compute, IO, and imbalance.
 
@@ -2305,7 +2307,11 @@ def plot_per_step_layer_lines(
         if not r_data and not t_data:
             continue
 
-        fig, ax = plt.subplots(figsize=(16, 5))
+        paper_imbalance = metric == "imbalance"
+        if paper_imbalance:
+            fig, ax = plt.subplots(figsize=(10.8, 4.4))
+        else:
+            fig, ax = plt.subplots(figsize=(16, 5))
         for data, lbl, color in [
             (r_data, "RunKV", "#4C72B0"),
             (t_data, "TightLLM", "#DD8452"),
@@ -2336,27 +2342,95 @@ def plot_per_step_layer_lines(
                 steps_a[valid],
                 means_a[valid],
                 color=color,
-                lw=1.5,
-                label=f"{lbl} mean",
+                lw=2.2 if paper_imbalance else 1.5,
+                label=lbl if paper_imbalance else f"{lbl} mean",
             )
             ax.fill_between(
                 steps_a[valid],
                 (means_a - stds_a)[valid],
                 (means_a + stds_a)[valid],
                 color=color,
-                alpha=0.15,
+                alpha=0.18 if paper_imbalance else 0.15,
             )
 
-        ax.set_xlabel("Step")
-        ax.set_ylabel("|Imbalance| (ms)" if metric == "imbalance" else ylabel)
-        ax.set_title(f"{'|Imbalance|' if metric == 'imbalance' else description}: cross-layer mean ± std per step")
-        if metric == "imbalance":
-            ax.axhline(0, color="k", lw=0.8, ls="--")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        fig.tight_layout()
+        if paper_imbalance:
+            ax.set_xlabel("Decoding step", fontsize=14)
+            ax.set_ylabel("Imbalance (ms)", fontsize=14)
+            ax.tick_params(axis="both", which="major", labelsize=12)
+            ax.legend(frameon=False, fontsize=12, ncol=2, loc="upper left")
+            ax.grid(True, axis="y", alpha=0.25, linewidth=0.8)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.margins(x=0.01)
+            if resource_stages:
+                min_step = min(
+                    min(r_data.keys(), default=float("inf")),
+                    min(t_data.keys(), default=float("inf")),
+                )
+                max_step = max(
+                    max(r_data.keys(), default=float("-inf")),
+                    max(t_data.keys(), default=float("-inf")),
+                )
+                for i, stage in enumerate(resource_stages):
+                    start = float(stage["start_step"])
+                    end = (
+                        float(resource_stages[i + 1]["start_step"])
+                        if i + 1 < len(resource_stages)
+                        else max_step + 1
+                    )
+                    visible_start = max(start, min_step)
+                    visible_end = min(end, max_step + 1)
+                    if visible_end <= visible_start:
+                        continue
+                    if i:
+                        ax.axvline(start, color="0.65", lw=0.8, ls="--", zorder=0)
+                    if i % 2:
+                        ax.axvspan(
+                            visible_start,
+                            visible_end,
+                            color="0.5",
+                            alpha=0.035,
+                            zorder=0,
+                        )
+                    target = float(stage["target"])
+                    cap_text = (
+                        (
+                            f"uncapped (~{uncapped_bandwidth_gbps:g} GB/s)"
+                            if uncapped_bandwidth_gbps is not None
+                            else "uncapped"
+                        )
+                        if target <= 0
+                        else f"{target:g} GB/s"
+                    )
+                    ax.text(
+                        (visible_start + visible_end) / 2,
+                        -0.14,
+                        f"{stage['label']}\nI/O BW cap:\n{cap_text}",
+                        transform=ax.get_xaxis_transform(),
+                        ha="center",
+                        va="top",
+                        fontsize=10,
+                        color="0.25",
+                        clip_on=False,
+                    )
+                ax.set_xlabel("Decoding step", fontsize=14, labelpad=66)
+            fig.tight_layout(pad=0.35)
+        else:
+            ax.set_xlabel("Step")
+            ax.set_ylabel(ylabel)
+            ax.set_title(f"{description}: cross-layer mean ± std per step")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
         out = out_dir / f"step_layer_{metric}_combined.png"
-        fig.savefig(out, dpi=150)
+        if paper_imbalance:
+            fig.savefig(out, dpi=300, bbox_inches="tight")
+            pdf_out = out_dir / "step_layer_imbalance_combined.pdf"
+            with matplotlib.rc_context({"pdf.fonttype": 42, "ps.fonttype": 42}):
+                fig.savefig(pdf_out, format="pdf", bbox_inches="tight")
+            print(f"  [plot] {pdf_out}")
+        else:
+            fig.savefig(out, dpi=150)
         plt.close(fig)
         print(f"  [plot] {out}")
 
@@ -2553,6 +2627,30 @@ def _glob_expand(paths: list[str]) -> list[str]:
     return sorted(out)
 
 
+def load_resource_stages(paths: list[str]) -> list[dict[str, Any]]:
+    """Load one representative record for each resource stage."""
+    stages: dict[int, dict[str, Any]] = {}
+    for raw_path in _glob_expand(paths):
+        path = Path(raw_path)
+        if not path.exists():
+            continue
+        with path.open() as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                stage_id = int(record.get("resource_stage_id", 0))
+                if stage_id in stages:
+                    continue
+                stages[stage_id] = {
+                    "label": str(record.get("resource_stage", f"S{stage_id + 1}")),
+                    "start_step": float(record.get("stage_start_step", 0)),
+                    "target": float(record.get("resource_target", 0)),
+                    "unit": str(record.get("resource_target_unit", "")),
+                }
+    return [stages[stage_id] for stage_id in sorted(stages)]
+
+
 def _extract_run_timestamp(paths: list[str]) -> str | None:
     """Extract YYYYMMDD_HHMM tag from filenames with an HHMM[SS] run time.
 
@@ -2577,6 +2675,18 @@ def main() -> None:
     ap.add_argument("--tightllm-mfu", nargs="*", default=[])
     ap.add_argument("--runkv-sqlite", default="")
     ap.add_argument("--tightllm-sqlite", default="")
+    ap.add_argument(
+        "--resource-steps",
+        nargs="*",
+        default=[],
+        help="Resource step JSONL files used to annotate staged bandwidth plots.",
+    )
+    ap.add_argument(
+        "--uncapped-bandwidth-gbps",
+        type=float,
+        default=None,
+        help="Approximate bandwidth shown for resource stages without a throttle cap.",
+    )
     ap.add_argument("--output-dir", default="exp_results/analysis/per_layer")
     ap.add_argument("--skip-warmup-steps", type=int, default=1)
     ap.add_argument("--num-prompts", type=int, default=None)
@@ -2805,6 +2915,7 @@ def main() -> None:
     # ── Collect per-step × per-layer timing ──────────────────────────────────
     runkv_psl = collect_per_step_layer_timing(runkv_flat, skip)
     tightllm_psl = collect_per_step_layer_timing(tightllm_flat, skip)
+    resource_stages = load_resource_stages(args.resource_steps)
     print(
         f"  runkv    per-step-layer metrics : {list(k for k, v in runkv_psl.items() if v)}"
     )
@@ -2819,7 +2930,13 @@ def main() -> None:
             runkv_rs, tightllm_rs, runkv_deltas, tightllm_deltas, out_dir
         )
         plot_clean_compute(runkv_kt, tightllm_kt, out_dir)
-        plot_per_step_layer_lines(runkv_psl, tightllm_psl, out_dir)
+        plot_per_step_layer_lines(
+            runkv_psl,
+            tightllm_psl,
+            out_dir,
+            resource_stages=resource_stages,
+            uncapped_bandwidth_gbps=args.uncapped_bandwidth_gbps,
+        )
         plot_layer_timeline(
             runkv_deltas,
             tightllm_deltas,
