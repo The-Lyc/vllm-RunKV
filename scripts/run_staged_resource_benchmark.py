@@ -280,12 +280,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     test = parser.add_argument_group("Test parameters")
     test.add_argument("--model", default="/home/lyc/hf_models/opt-2.7b-8k")
-    test.add_argument("--prefix-blocks", default="1000")
-    test.add_argument("--num-prompts", default="128")
-    test.add_argument("--prompt-words", default="8000")
+    test.add_argument("--prefix-blocks", default="10000")
+    test.add_argument("--num-prompts", default="32")
+    test.add_argument("--prompt-words", default="2000")
     test.add_argument("--max-tokens", default="128")
-    test.add_argument("--gpu-memory-utilization", default="0.7")
-    test.add_argument("--gpu-memory-fraction", default="0.95")
+    test.add_argument("--gpu-memory-utilization", default="0.8")
+    test.add_argument("--gpu-memory-fraction", default="0.7")
     test.add_argument("--num-device-buffers", default="3")
     test.add_argument(
         "--max-num-seqs",
@@ -307,7 +307,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--cpu-memory-gb",
         "--cpu-kv-memory-gb",
         dest="cpu_memory_gb",
-        default=str(5e10 / (1024**3)),
+        default=str(10e10 / (1024**3)),
         help=(
             "Total CPU cache-store budget in GiB; with dynamic replay this "
             "covers both full-layer KV and hidden-state stores. 0 derives "
@@ -316,7 +316,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     test.add_argument(
         "--cpu-memory-fraction",
-        default="0.3",
+        default="0.6",
         help="Clamp total CPU cache-store budget to this available-RAM fraction.",
     )
     test.add_argument(
@@ -710,6 +710,44 @@ def _run_per_layer_analysis(
     return output_dirs
 
 
+def _print_settings(args: argparse.Namespace, pattern_name: str) -> None:
+    print("Running OPT staged-resource benchmark")
+    print(f"  model:                       {args.model}")
+    print(f"  prefix_blocks:               {args.prefix_blocks}")
+    print(f"  num_prompts:                 {args.num_prompts}")
+    print(f"  prompt_words:                {args.prompt_words}")
+    print(f"  max_tokens:                  {args.max_tokens}")
+    print(f"  gpu_memory_fraction:         {args.gpu_memory_fraction}")
+    print(f"  gpu_memory_utilization:      {args.gpu_memory_utilization}")
+    print(f"  num_device_buffers:          {args.num_device_buffers}")
+    if args.max_num_seqs:
+        print(f"  max_num_seqs:                {args.max_num_seqs}")
+    if args.max_staging_blocks:
+        print(f"  max_staging_blocks:          {args.max_staging_blocks}")
+    print(f"  cpu_memory_gb:               {args.cpu_memory_gb}")
+    print(f"  cpu_memory_fraction:         {args.cpu_memory_fraction}")
+    if args.hardware_platform:
+        print(f"  hardware_platform:           {args.hardware_platform}")
+    print(f"  resource_pressure_kind:      {args.resource_pressure_kind}")
+    print(f"  resource_pressure_mode:      {args.resource_pressure_mode}")
+    print(f"  resource_pressure_clock:     {args.resource_pressure_clock}")
+    print(f"  resource_pressure_pattern:   {args.resource_pressure_pattern}")
+    print(f"  resource_pressure_device:    {args.resource_pressure_device}")
+    print(f"  resource_pressure_max_fraction: {args.resource_pressure_max_fraction}")
+    print(f"  resource_pressure_io_calibration_s: {args.resource_pressure_io_calibration_s}")
+    print(f"  pattern_name:                {pattern_name}")
+    print(f"  run_tag:                     {args.run_tag}")
+    print(f"  output_root:                 {args.output_root}")
+    print(f"  repeats:                     {args.repeats}")
+    print(f"  enable_nsys:                 {int(args.enable_nsys)}")
+    print(f"  enable_nvtx:                 {int(args.enable_nvtx)}")
+    print(f"  enable_profile:              {int(args.enable_profile)}")
+    print(f"  skip_runkv:                  {int(args.skip_runkv)}")
+    print(f"  skip_tightllm:               {int(args.skip_tightllm)}")
+    print(f"  skip_analysis:               {int(args.skip_analysis)}")
+    print()
+
+
 def main() -> None:
     args = build_parser().parse_args()
     if not args.skip_analysis and (
@@ -724,6 +762,7 @@ def main() -> None:
         args.resource_pressure_clock,
         args.resource_pressure_pattern,
     )
+    _print_settings(args, pattern_name)
     Path(args.output_root).mkdir(parents=True, exist_ok=True)
     MANIFEST_ROOT.mkdir(parents=True, exist_ok=True)
 

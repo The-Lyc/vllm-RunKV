@@ -233,7 +233,7 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("--prompt-words", default="2000")
     test.add_argument("--max-tokens", default="128")
     test.add_argument("--gpu-memory-utilization", default="0.9")
-    test.add_argument("--gpu-memory-fraction", default="0.9")
+    test.add_argument("--gpu-memory-fraction", default="0.7")
     test.add_argument("--num-device-buffers", default="3")
     test.add_argument(
         "--max-num-seqs",
