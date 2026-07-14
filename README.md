@@ -23,6 +23,51 @@ For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
 This is RunKV version of vLLM(Forked From vanilla vLLM).
 
+## Startup
+- Clone the resposity:
+```
+git clone https://github.com/The-Lyc/vllm-RunKV.git
+cd vllm-RunKV
+```
+- create venv
+```
+uv venv --python 3.12 --seed
+source .venv/bin/activate
+```
+
+- config cuda environment
+```
+export CUDA_HOME=/usr/local/cuda-12.8
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+```
+
+- install torch
+```
+uv pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu128
+```
+
+- install dependencies
+```
+python -m pip install -r requirements/build.txt
+```
+
+- compile runkv kernel
+```
+MAX_JOBS=16 TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0" \
+python setup_runkv.py build_ext --inplace
+# validate
+python -c "import runkv_kernels; print(runkv_kernels.batch_copy_blocks)"
+```
+
+- compile vllm kernels
+```
+MAX_JOBS=16 NVCC_THREADS=1 VLLM_TARGET_DEVICE=cuda \
+python -m pip install -e . --no-build-isolation -v
+# validate
+python -c "import vllm; import vllm._C; import vllm._moe_C; print('vLLM extensions OK')"
+```
+
 ## Roadmap
 
 | Feature                                                       | Code | Test | 
