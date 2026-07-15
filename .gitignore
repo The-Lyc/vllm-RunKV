@@ -231,6 +231,8 @@ benchmarks/**/benchmark_results/
 runkv_debug_logs/
 runkv_prehook_timing/
 runkv*/
+!benchmarks/runkv_resource_pressure/
+!benchmarks/runkv_resource_pressure/*.py
 #experimental results
 exp_results/*
 
