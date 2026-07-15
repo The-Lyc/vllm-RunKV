@@ -196,6 +196,7 @@ AGENTS.md
 
 # Results
 *.csv
+/exp_results
 
 # Nsight Systems (nsys) profiling outputs
 *.nsys-rep
