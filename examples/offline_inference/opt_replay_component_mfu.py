@@ -238,7 +238,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--resource-pressure-mode",
-        choices=["thread", "inline", "throttle"],
+        choices=["thread", "inline", "throttle", "process"],
         default="thread",
         help=(
             "thread: legacy background-worker pressure (races with model "
@@ -251,7 +251,12 @@ def parse_args() -> argparse.Namespace:
             "deterministic linear relationship between H2D bytes and wall "
             "time (RunKV's replay savings become exactly proportional) and "
             "is the recommended mode for staged-resource RunKV vs TightLLM "
-            "experiments."
+            "experiments. process: launch independent CUDA worker processes "
+            "at each stage so they physically contend for PCIe bandwidth or "
+            "SM time. In process mode, positive IO targets are interpreted as "
+            "desired benchmark-visible GB/s; positive SM targets are desired "
+            "benchmark-visible compute percent. Target 0 means no process "
+            "contention."
         ),
     )
     parser.add_argument(
@@ -611,52 +616,68 @@ def main() -> None:
         else:
             _mfu_out = None
 
-        with nvtx_range("build_engine", color="purple"):
-            engine = build_engine(
-                model=args.model,
-                gpu_memory_utilization=args.gpu_memory_utilization,
-                enable_layerwise_nvtx_tracing=args.enable_layerwise_nvtx_tracing,
-                profiler_config=(
-                    {"profiler": "cuda"} if not args.disable_nvtx_scopes else None
-                ),
-                kv_offload_config=make_kv_offload_config(
-                    setting,
-                    gpu_memory_fraction=args.gpu_memory_fraction,
-                    num_device_buffers=args.num_device_buffers,
-                    max_staging_blocks=args.max_staging_blocks,
-                    cpu_memory_gb=args.cpu_memory_gb,
-                    cpu_memory_fraction=args.cpu_memory_fraction,
-                    planner=args.planner,
-                    planner_dry_run=args.planner_dry_run,
-                    async_plan_build=not args.no_async_plan_build,
-                    h2d_copy_mode=args.h2d_copy_mode,
-                    use_state_machine=args.use_state_machine,
-                    tightllm_profile_path=args.tightllm_profile_path,
-                    tightllm_feedback_correction=args.tightllm_feedback_correction,
-                ),
-                enable_opt_component_mfu_profiling=mfu_profiler_enabled,
-                opt_component_mfu_output_path=_mfu_out,
-                opt_component_mfu_peak_tflops=args.peak_tflops,
-                max_num_seqs=args.max_num_seqs or max(args.num_prompts, 1),
-            )
-
         resource_controller = _make_resource_controller(
             args,
             setting=setting,
             settings_count=len(prefix_settings),
             run_tag=_run_tag,
         )
-        if resource_controller is not None:
+        resource_controller_prepared = False
+        if (
+            resource_controller is not None
+            and getattr(args, "resource_pressure_mode", "thread") == "process"
+        ):
             with nvtx_range("resource_pressure_prepare", color="red"):
                 resource_controller.prepare()
+            resource_controller_prepared = True
 
-        run_prompts_with_engine(
-            engine,
-            prompts,
-            max_tokens=args.max_tokens,
-            enable_profiling=args.profile,
-            resource_controller=resource_controller,
-        )
+        engine = None
+        try:
+            with nvtx_range("build_engine", color="purple"):
+                engine = build_engine(
+                    model=args.model,
+                    gpu_memory_utilization=args.gpu_memory_utilization,
+                    enable_layerwise_nvtx_tracing=args.enable_layerwise_nvtx_tracing,
+                    profiler_config=(
+                        {"profiler": "cuda"} if not args.disable_nvtx_scopes else None
+                    ),
+                    kv_offload_config=make_kv_offload_config(
+                        setting,
+                        gpu_memory_fraction=args.gpu_memory_fraction,
+                        num_device_buffers=args.num_device_buffers,
+                        max_staging_blocks=args.max_staging_blocks,
+                        cpu_memory_gb=args.cpu_memory_gb,
+                        cpu_memory_fraction=args.cpu_memory_fraction,
+                        planner=args.planner,
+                        planner_dry_run=args.planner_dry_run,
+                        async_plan_build=not args.no_async_plan_build,
+                        h2d_copy_mode=args.h2d_copy_mode,
+                        use_state_machine=args.use_state_machine,
+                        tightllm_profile_path=args.tightllm_profile_path,
+                        tightllm_feedback_correction=args.tightllm_feedback_correction,
+                    ),
+                    enable_opt_component_mfu_profiling=mfu_profiler_enabled,
+                    opt_component_mfu_output_path=_mfu_out,
+                    opt_component_mfu_peak_tflops=args.peak_tflops,
+                    max_num_seqs=args.max_num_seqs or max(args.num_prompts, 1),
+                )
+
+            if resource_controller is not None and not resource_controller_prepared:
+                with nvtx_range("resource_pressure_prepare", color="red"):
+                    resource_controller.prepare()
+                resource_controller_prepared = True
+
+            run_prompts_with_engine(
+                engine,
+                prompts,
+                max_tokens=args.max_tokens,
+                enable_profiling=args.profile,
+                resource_controller=resource_controller,
+            )
+        except Exception:
+            if resource_controller is not None and resource_controller_prepared:
+                resource_controller.stop()
+            raise
 
         # ---- Collect imbalance statistics from the replay plan provider ----
         try:

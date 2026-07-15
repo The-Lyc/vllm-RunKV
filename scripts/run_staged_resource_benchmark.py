@@ -9,6 +9,12 @@ same workload and a runner-controlled resource pressure schedule, discovers the
 JSONL/CSV/nsys artifacts, exports nsys reports to sqlite, and calls both the
 staged-resource analysis script and the per-layer timing analysis script.
 
+The default IO pressure mode uses real PCIe contention: after the configured
+step, the runner launches independent CUDA worker processes that continuously
+copy pinned CPU memory to the GPU.  If the no-contention PCIe bandwidth is
+24 GB/s, targets 12, 8, and 6 GB/s correspond to 1, 2, and 3 extra contending
+processes, respectively.
+
 Default mode mirrors scripts/run_benchmark_pipeline.py: nsys/NVTX/CUDA profiler
 and RunKV prehook timing are enabled so timeline-level metrics are available.
 Use --disable-nsys/--disable-nvtx/--disable-profile/--disable-prehook-timing for
@@ -64,6 +70,10 @@ def _sanitize_token(value: str) -> str:
 
 
 def _default_pattern_name(kind: str, clock: str, pattern: str) -> str:
+    if kind == "io" and pattern == "0:24,16:12,48:24" and clock == "step":
+        return "io_pcie12_step"
+    if kind == "sm" and pattern == "0:100,16:50,48:100" and clock == "step":
+        return "sm_process50_step"
     if kind == "io" and pattern == "0:0,16:15,48:0" and clock == "step":
         return "io_severe_step"
     if kind == "sm" and pattern == "0:0,16:50,48:0" and clock == "step":
@@ -279,10 +289,10 @@ def build_parser() -> argparse.ArgumentParser:
     ctrl.add_argument("--skip-analysis", action="store_true")
 
     test = parser.add_argument_group("Test parameters")
-    test.add_argument("--model", default="/home/lyc/hf_models/opt-2.7b-8k")
+    test.add_argument("--model", default="/data/models/opt-2.7b-8k")
     test.add_argument("--prefix-blocks", default="10000")
-    test.add_argument("--num-prompts", default="32")
-    test.add_argument("--prompt-words", default="2000")
+    test.add_argument("--num-prompts", default="64")
+    test.add_argument("--prompt-words", default="1000")
     test.add_argument("--max-tokens", default="128")
     test.add_argument("--gpu-memory-utilization", default="0.8")
     test.add_argument("--gpu-memory-fraction", default="0.7")
@@ -307,7 +317,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--cpu-memory-gb",
         "--cpu-kv-memory-gb",
         dest="cpu_memory_gb",
-        default=str(10e10 / (1024**3)),
+        default=str(5e10 / (1024**3)),
         help=(
             "Total CPU cache-store budget in GiB; with dynamic replay this "
             "covers both full-layer KV and hidden-state stores. 0 derives "
@@ -352,7 +362,18 @@ def build_parser() -> argparse.ArgumentParser:
     pressure = parser.add_argument_group("Resource pressure")
     pressure.add_argument("--resource-pressure-kind", choices=["io", "sm"], default="io")
     pressure.add_argument("--resource-pressure-clock", choices=["step", "time"], default="step")
-    pressure.add_argument("--resource-pressure-pattern", default="0:0,16:15,48:0")
+    pressure.add_argument(
+        "--resource-pressure-pattern",
+        default="0:24,16:12,48:24",
+        help=(
+            "Comma-separated start:target schedule. In process mode, positive "
+            "IO targets are desired benchmark-visible GB/s, and positive SM "
+            "targets are desired benchmark-visible compute percent. Target 0 "
+            "means no process contention. With a 24 GB/s IO baseline, 12/8/6 "
+            "GB/s starts 1/2/3 contending processes; for SM, 50/33.3/25 "
+            "percent starts 1/2/3 contending processes."
+        ),
+    )
     pressure.add_argument("--resource-pattern-name", default="")
     pressure.add_argument("--resource-pressure-device", default="cuda:0")
     pressure.add_argument("--resource-pressure-buffer-mb", default="256")
@@ -369,11 +390,19 @@ def build_parser() -> argparse.ArgumentParser:
     pressure.add_argument("--resource-pressure-period-ms", default="100.0")
     pressure.add_argument("--resource-pressure-max-fraction", default="0.5")
     pressure.add_argument("--resource-pressure-io-calibration-s", default="0.5")
-    pressure.add_argument("--resource-pressure-io-max-gbps", default="")
+    pressure.add_argument(
+        "--resource-pressure-io-max-gbps",
+        default="",
+        help=(
+            "No-contention PCIe bandwidth in GB/s. Process mode defaults to "
+            "24.0 when this is omitted; other modes keep their legacy "
+            "calibration behavior."
+        ),
+    )
     pressure.add_argument(
         "--resource-pressure-mode",
-        choices=["thread", "inline", "throttle"],
-        default="thread",
+        choices=["thread", "inline", "throttle", "process"],
+        default="process",
         help=(
             "thread: legacy background-worker pressure. "
             "inline: pressure injected synchronously from RunKV pre_hook on "
@@ -385,7 +414,12 @@ def build_parser() -> argparse.ArgumentParser:
             "with each copy. With throttle, --resource-pressure-pattern "
             "targets are interpreted as GB/s (not a contention fraction), "
             "and bytes-saved by RunKV translate linearly to wall-time saved. "
-            "See docs/design/io_bandwidth_throttle_design.md."
+            "process: launch independent CUDA worker processes at "
+            "each stage so the benchmark physically shares PCIe bandwidth or "
+            "SM time with them. In process mode, IO targets are desired "
+            "benchmark-visible GB/s and SM targets are desired benchmark-"
+            "visible compute percent. See docs/design/io_bandwidth_throttle_"
+            "design.md for the older throttle mode."
         ),
     )
     pressure.add_argument(
@@ -735,6 +769,8 @@ def _print_settings(args: argparse.Namespace, pattern_name: str) -> None:
     print(f"  resource_pressure_device:    {args.resource_pressure_device}")
     print(f"  resource_pressure_max_fraction: {args.resource_pressure_max_fraction}")
     print(f"  resource_pressure_io_calibration_s: {args.resource_pressure_io_calibration_s}")
+    if args.resource_pressure_io_max_gbps:
+        print(f"  resource_pressure_io_max_gbps: {args.resource_pressure_io_max_gbps}")
     print(f"  pattern_name:                {pattern_name}")
     print(f"  run_tag:                     {args.run_tag}")
     print(f"  output_root:                 {args.output_root}")
@@ -750,6 +786,18 @@ def _print_settings(args: argparse.Namespace, pattern_name: str) -> None:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if (
+        args.resource_pressure_mode == "process"
+        and args.resource_pressure_kind == "sm"
+        and args.resource_pressure_pattern == "0:24,16:12,48:24"
+    ):
+        args.resource_pressure_pattern = "0:100,16:50,48:100"
+    if (
+        args.resource_pressure_mode == "process"
+        and args.resource_pressure_kind == "io"
+        and not args.resource_pressure_io_max_gbps
+    ):
+        args.resource_pressure_io_max_gbps = "24.0"
     if not args.skip_analysis and (
         not args.skip_stage_analysis or not args.skip_per_layer_analysis
     ):
