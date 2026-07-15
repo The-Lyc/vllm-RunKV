@@ -39,11 +39,11 @@ print("=" * 60)
 def _pick_default_model() -> str:
     # Prefer local Qwen models.
     local_models = [
-        "~/hf_models/Qwen2.5-0.5B-Instruct",
-        "~/hf_models/Qwen2.5-1.5B-Instruct",
-        "~/hf_models/Qwen3-0.6B",
-        "~/hf_models/Qwen2-0.5B-Instruct",
-        "~/hf_models/Qwen2-1.5B-Instruct",
+        "/data/models/Qwen2.5-0.5B-Instruct",
+        "/data/models/Qwen2.5-1.5B-Instruct",
+        "/data/models/Qwen3-0.6B",
+        "/data/models/Qwen2-0.5B-Instruct",
+        "/data/models/Qwen2-1.5B-Instruct",
     ]
     for local_path in local_models:
         expanded_path = Path(local_path).expanduser()

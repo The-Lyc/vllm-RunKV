@@ -189,7 +189,7 @@ def _is_complete(
 def main() -> None:
     args = parse_args()
     output_root = args.output_root.resolve()
-    model = "/home/lyc/hf_models/opt-2.7b-8k"
+    model = "/data/models/opt-2.7b-8k"
 
     for workload in args.workloads:
         baseline = BASELINES[workload]

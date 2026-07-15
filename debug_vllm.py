@@ -34,11 +34,11 @@ def main():
     # Model config: prefer Qwen models.
     # Priority 1: try local Qwen models.
     local_models = [
-        "~/hf_models/Qwen2.5-0.5B-Instruct",
-        "~/hf_models/Qwen2.5-1.5B-Instruct",
-        "~/hf_models/Qwen3-0.6B",
-        "~/hf_models/Qwen2-0.5B-Instruct",
-        "~/hf_models/Qwen2-1.5B-Instruct",
+        "/data/models/Qwen2.5-0.5B-Instruct",
+        "/data/models/Qwen2.5-1.5B-Instruct",
+        "/data/models/Qwen3-0.6B",
+        "/data/models/Qwen2-0.5B-Instruct",
+        "/data/models/Qwen2-1.5B-Instruct",
     ]
     
     model_name = None

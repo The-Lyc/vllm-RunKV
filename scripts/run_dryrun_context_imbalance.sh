@@ -20,7 +20,7 @@ RUNNER="${ROOT}/examples/offline_inference/run_opt_feedback_observation.py"
 ANALYZER="${ROOT}/tools/analyze_dryrun_imbalance.py"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
-MODEL="${MODEL:-/home/lyc/hf_models/opt-2.7b-8k}"
+MODEL="${MODEL:-/data/models/opt-2.7b-8k}"
 CONTEXTS="${CONTEXTS:-1000 2000 4000 8000}"
 PREFIX_BLOCKS="${PREFIX_BLOCKS:-10000}"
 NUM_DEVICE_BUFFERS="${NUM_DEVICE_BUFFERS:-3}"

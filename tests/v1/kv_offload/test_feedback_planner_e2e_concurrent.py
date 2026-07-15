@@ -35,7 +35,7 @@ Requirements:
 
 Example:
     python test_feedback_planner_e2e_concurrent.py \\
-        --model ~/hf_models/opt-2.7b \\
+        --model /data/models/opt-2.7b \\
         --num-requests 64 --prefix-blocks 1000
 """
 
@@ -956,8 +956,8 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="~/hf_models/opt-2.7b",
-        help="HuggingFace model name (default: ~/hf_models/opt-2.7b)",
+        default="/data/models/opt-2.7b",
+        help="HuggingFace model name (default: /data/models/opt-2.7b)",
     )
     parser.add_argument(
         "--num-requests",

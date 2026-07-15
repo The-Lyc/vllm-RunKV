@@ -227,13 +227,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ── Test parameters ───────────────────────────────────────────────────
     test = p.add_argument_group("Test parameters")
-    test.add_argument("--model", default="/home/lyc/hf_models/opt-2.7b-8k")
+    test.add_argument("--model", default="/data/models/opt-2.7b-8k")
     test.add_argument("--prefix-blocks", default="10000")
     test.add_argument("--num-prompts", default="32")
-    test.add_argument("--prompt-words", default="2000")
-    test.add_argument("--max-tokens", default="128")
+    test.add_argument("--prompt-words", default="8000")
+    test.add_argument("--max-tokens", default="32")
     test.add_argument("--gpu-memory-utilization", default="0.9")
-    test.add_argument("--gpu-memory-fraction", default="0.7")
+    test.add_argument("--gpu-memory-fraction", default="0.8")
     test.add_argument("--num-device-buffers", default="3")
     test.add_argument(
         "--max-num-seqs",
@@ -255,7 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--cpu-memory-gb",
         "--cpu-kv-memory-gb",
         dest="cpu_memory_gb",
-        default=str(10e10 / (1024**3)),
+        default=str(5e10 / (1024**3)),
         help=(
             "Total CPU cache-store budget in GiB; with dynamic replay this "
             "covers both full-layer KV and hidden-state stores. 0 derives "
@@ -264,7 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     test.add_argument(
         "--cpu-memory-fraction",
-        default="0.6",
+        default="0.8",
         help="Clamp total CPU cache-store budget to this available-RAM fraction.",
     )
     test.add_argument(

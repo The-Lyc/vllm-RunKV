@@ -61,7 +61,7 @@ def main() -> None:
     root_dir = Path(__file__).resolve().parents[2]
     passthrough_args = sys.argv[1:]
     python_bin = os.environ.get("PYTHON_BIN", sys.executable)
-    model = os.environ.get("MODEL", "/home/lyc/hf_models/opt-2.7b-8k")
+    model = os.environ.get("MODEL", "/data/models/opt-2.7b-8k")
     output_dir = os.environ.get(
         "OUTPUT_DIR",
         "/home/lyc/inference/vllm/exp_results/tightllm_observation",

@@ -38,7 +38,7 @@ Requirements:
     - nvtx package (pip install nvtx) for NVTX markers
 
 Example:
-    python test_dynamic_replay_e2e_concurrent.py --model "~/hf_models/Qwen3-0.6B" \
+    python test_dynamic_replay_e2e_concurrent.py --model "/data/models/Qwen3-0.6B" \
         --num-requests 100 --use-very-long-prompts
 """
 
@@ -1017,8 +1017,8 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="~/hf_models/opt-2.7b",
-        help="HuggingFace model name (default: ~/hf_models/opt-2.7b)",
+        default="/data/models/opt-2.7b",
+        help="HuggingFace model name (default: /data/models/opt-2.7b)",
     )
     parser.add_argument(
         "--num-requests",

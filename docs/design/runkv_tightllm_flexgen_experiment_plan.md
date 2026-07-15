@@ -40,7 +40,7 @@
 | CUDA / PyTorch | 记录版本 |
 | vLLM commit | 记录 git commit |
 | FlexGen commit | 记录 git commit 或 release |
-| 模型 | 优先 `facebook/opt-2.7b` 或本地 `/home/lyc/hf_models/opt-2.7b-8k` |
+| 模型 | 优先 `facebook/opt-2.7b` 或本地 `/data/models/opt-2.7b-8k` |
 | dtype | fp16 |
 | tensor parallel | 1 |
 | random seed | 固定 |
@@ -105,7 +105,7 @@ exp_results/tightllm_profiles/<hardware_platform>/<model-directory-name>.json
 例如在 4090 机器上生成 OPT-2.7B profile：
 
 ```bash
-MODEL=/home/lyc/hf_models/opt-2.7b-8k
+MODEL=/data/models/opt-2.7b-8k
 python -m vllm.v1.profiling.tightllm_offline_profiler \
   --model "$MODEL" \
   --output exp_results/tightllm_profiles/rtx4090/opt-2.7b-8k.json \
@@ -560,7 +560,7 @@ SM 变化场景中，预期 RunKV 会减少 replay budget，避免在 compute �
 
 | 参数 | pilot 值 | 说明 |
 |---|---:|---|
-| `MODEL` | `/home/lyc/hf_models/opt-2.7b-8k` | 与现有 profile / runner 默认一致 |
+| `MODEL` | `/data/models/opt-2.7b-8k` | 与现有 profile / runner 默认一致 |
 | `PREFIX_BLOCKS` | `1000` | 保持当前离线 observation 默认路径 |
 | `NUM_PROMPTS` | `128` | 尽量让单次 run 覆盖完整 90s 阶段 |
 | `PROMPT_WORDS` | `8000` | 长上下文，放大 KV offload / replay 差异 |
@@ -647,7 +647,7 @@ exp_results/staged_offline_pilot/
 公共变量：
 
 ```bash
-export MODEL=/home/lyc/hf_models/opt-2.7b-8k
+export MODEL=/data/models/opt-2.7b-8k
 export HARDWARE_PLATFORM=rtx4090
 export TIGHTLLM_PROFILE_PATH=exp_results/tightllm_profiles/$HARDWARE_PLATFORM/opt-2.7b-8k.json
 export PREFIX_BLOCKS=1000
@@ -754,7 +754,7 @@ python scripts/run_staged_resource_benchmark.py \
    --resource-pressure-pattern 0:0,16:15,48:0 \
    --resource-pattern-name io_severe_step \
    --repeats 3 \
-   --model /home/lyc/hf_models/opt-2.7b-8k \
+   --model /data/models/opt-2.7b-8k \
    --prefix-blocks 1000 \
    --num-prompts 128 \
    --prompt-words 8000 \
@@ -784,7 +784,7 @@ python scripts/run_staged_resource_benchmark.py \
 ```bash
 python scripts/run_benchmark_pipeline.py \
    --hardware-platform rtx4090 \
-   --model /home/lyc/hf_models/opt-2.7b-8k \
+   --model /data/models/opt-2.7b-8k \
    --gpu-memory-utilization 0.90 \
    --num-device-buffers 3 \
    --max-num-seqs 4 \

@@ -568,7 +568,7 @@ def test_runkv_layer_recompute_mode_parser_rejects_invalid_value():
 
 def test_runkv_layer_recompute_mode_defaults_to_io_hidden_states():
     engine_args = EngineArgs(
-        model="/home/lyc/hf_models/opt-1.3b",
+        model="/data/models/opt-1.3b",
         enable_runkv=True,
     )
     config = engine_args._build_kv_offload_config()
@@ -580,7 +580,7 @@ def test_runkv_layer_recompute_mode_cli_round_trip():
     args = parser.parse_args(
         [
             "--model",
-            "/home/lyc/hf_models/opt-1.3b",
+            "/data/models/opt-1.3b",
             "--enable-runkv",
             "--runkv-enable-layer-recompute",
             "--runkv-layer-recompute-mode",
@@ -596,7 +596,7 @@ def test_runkv_layer_recompute_mode_cli_round_trip():
 
 def test_runkv_layer_recompute_mode_validation_rejects_invalid_value():
     engine_args = EngineArgs(
-        model="/home/lyc/hf_models/opt-1.3b",
+        model="/data/models/opt-1.3b",
         enable_runkv=True,
         runkv_layer_recompute_mode="bad-mode",
     )
@@ -606,7 +606,7 @@ def test_runkv_layer_recompute_mode_validation_rejects_invalid_value():
 
 def test_runkv_layer_recompute_mode_from_kv_offload_config_dict():
     engine_args = EngineArgs(
-        model="/home/lyc/hf_models/opt-1.3b",
+        model="/data/models/opt-1.3b",
         kv_offload_config={
             "enabled": True,
             "enable_layer_recompute": True,
@@ -624,7 +624,7 @@ def test_runkv_layer_recompute_mode_from_kv_offload_config_object():
         layer_recompute_mode="prev_layer_output_dynamic",
     )
     engine_args = EngineArgs(
-        model="/home/lyc/hf_models/opt-1.3b",
+        model="/data/models/opt-1.3b",
         kv_offload_config=config_obj,
     )
     config = engine_args._build_kv_offload_config()
@@ -633,7 +633,7 @@ def test_runkv_layer_recompute_mode_from_kv_offload_config_object():
 
 def test_runkv_layer_recompute_mode_from_kv_offload_config_dict_rejects_invalid():
     engine_args = EngineArgs(
-        model="/home/lyc/hf_models/opt-1.3b",
+        model="/data/models/opt-1.3b",
         kv_offload_config={
             "enabled": True,
             "enable_layer_recompute": True,

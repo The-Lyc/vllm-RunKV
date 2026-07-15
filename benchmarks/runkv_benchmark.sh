@@ -13,7 +13,7 @@ set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-MODEL=${MODEL:-"/home/lyc/hf_models/Qwen2.5-1.5B-Instruct"}
+MODEL=${MODEL:-"/data/models/Qwen2.5-1.5B-Instruct"}
 RESULTS_DIR=${RESULTS_DIR:-"${SCRIPT_DIR}/benchmark_results"}
 NUM_PROMPTS=${NUM_PROMPTS:-1000}
 SEED=${SEED:-42}

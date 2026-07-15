@@ -448,7 +448,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        default=os.environ.get("MODEL", "/home/lyc/hf_models/opt-2.7b-8k"),
+        default=os.environ.get("MODEL", "/data/models/opt-2.7b-8k"),
     )
     parser.add_argument(
         "--tightllm-profile-path",
