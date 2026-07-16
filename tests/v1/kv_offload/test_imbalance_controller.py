@@ -55,6 +55,19 @@ def test_pure_steady_stays_steady_with_zero_delta():
     assert unchanged_ratio > 0.8, f"unchanged ratio too low: {unchanged_ratio}"
 
 
+@pytest.mark.parametrize(("imbalance_ms", "expected_delta"), [(2.0, 1), (-2.0, -1)])
+def test_steady_nudge_matches_imbalance_sign(
+    imbalance_ms: float, expected_delta: int
+):
+    """With negative plant gain, the corrective budget delta matches y's sign."""
+    ctl = _mk_controller(deadband_ms=0.5, steady_small_step_blocks=1)
+
+    decision = ctl.observe(imbalance_ms=imbalance_ms, current_budget=10)
+
+    assert decision.state == SMState.STEADY
+    assert decision.delta_budget == expected_delta
+
+
 def test_single_outlier_triggers_transit_then_false_alarm_back_to_steady():
     ctl = _mk_controller(window_size=3, sigma_baseline_ms=0.5)
     # Seed a clean steady state.
@@ -75,8 +88,11 @@ def test_single_outlier_triggers_transit_then_false_alarm_back_to_steady():
     assert saw_steady_after_transit
 
 
-def test_real_shift_transitions_to_tracking_with_probe():
-    """Steady at 0, then jumps to +15 ms — should enter TRACKING with a probe."""
+@pytest.mark.parametrize(("shift_ms", "expected_probe"), [(15.0, 2), (-15.0, -2)])
+def test_real_shift_transitions_to_tracking_with_probe(
+    shift_ms: float, expected_probe: int
+):
+    """A signed regime shift should enter TRACKING with a same-sign probe."""
     ctl = _mk_controller(
         window_size=3,
         sigma_baseline_ms=0.5,
@@ -87,14 +103,18 @@ def test_real_shift_transitions_to_tracking_with_probe():
     # Clean steady at 0.
     for _ in range(5):
         ctl.observe(imbalance_ms=0.0, current_budget=10)
-    # Sustained high-imbalance regime.
+    # Sustained shifted-imbalance regime.
     got_probe = False
     for _ in range(10):
-        d = ctl.observe(imbalance_ms=15.0, current_budget=10)
+        d = ctl.observe(imbalance_ms=shift_ms, current_budget=10)
         if d.state == SMState.TRACKING and abs(d.delta_budget) == 2:
             got_probe = True
-            # Probe sign must oppose imbalance sign because gain<0.
-            assert d.delta_budget < 0
+            # For gain < 0, -imbalance / gain has the same sign as imbalance.
+            assert d.delta_budget == expected_probe
+            # If the probe has not produced a measurable gain yet, the
+            # sign-only fallback must preserve the same corrective direction.
+            fallback = ctl.observe(imbalance_ms=shift_ms, current_budget=10)
+            assert fallback.delta_budget * shift_ms > 0
             break
     assert got_probe
 

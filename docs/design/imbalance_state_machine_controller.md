@@ -135,7 +135,7 @@ TRACKING 的核心挑战是：首步时我们**不知道 gain 的数值**。写�
 利用这个不变量，TRACKING 采用 **probe-then-exploit** 策略：
 
 **首步（probe）**：只用符号，不用数值
-- `Δbudget = −sign(mean_window) × probe_size`，其中 `probe_size = 2 blocks`
+- `Δbudget = sign(mean_window) × probe_size`，其中 `probe_size = 2 blocks`。因为 `gain < 0`，Newton 方向 `−mean_window / gain` 与 `mean_window` 同号
 - `probe_size` 是一个 system-agnostic 的 safe 幅度：足够小不会造成剧烈扰动，足够大能产生可测的 imbalance 响应
 
 **第二步开始（exploit）**：首步的结果给出 gain 测量值
@@ -240,10 +240,10 @@ observe(imbalance_ms, current_budget):
                     state = STEADY  # false alarm
                 else:
                     state = TRACKING  # real shift
-                    delta = −sign(mean_window) × probe_size  # probe step
+                    delta = sign(mean_window) × probe_size  # probe step; gain < 0
             elif layers_in_transit > transit_timeout:
                 state = TRACKING (forced)
-                delta = −sign(mean_window) × probe_size
+                delta = sign(mean_window) × probe_size
 
     elif state == TRACKING:
         if first step after entering TRACKING:
@@ -367,7 +367,7 @@ else:  # "significant_delta"
 | 真实偏移 | 稳态 → 跳到 +15 ms 稳态 | STEADY → TRANSIT → TRACKING → 回 STEADY |
 | 虚警短扰动 | 稳态 → 短时 +5 ms 3 层 → 恢复 | STEADY → TRANSIT → 回 STEADY |
 | TRANSIT 超时 | 持续高 stdev | 超时后强制 TRACKING |
-| Probe 首步 | 进 TRACKING 后观察首次 Δbudget | 幅度 = probe_size，符号 = −sign(mean_window) |
+| Probe 首步 | 进 TRACKING 后观察首次 Δbudget | 幅度 = probe_size，符号 = sign(mean_window) |
 | RLS gain 保护 | 喂异号 `(b,y)` 对 | Gain 拒绝，保持上一步估计 |
 
 ### 9.2 Offline replay

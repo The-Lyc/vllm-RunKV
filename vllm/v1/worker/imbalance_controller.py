@@ -225,8 +225,10 @@ class ImbalanceController:
         # Proportional nudge: ±1 block if |y| outside deadband, else 0.
         if abs(y) < cfg.deadband_ms:
             return 0
-        # sign(−y) because budget↑ → imbalance↓.
-        return -int(math.copysign(cfg.steady_small_step_blocks, y)) if y != 0 else 0
+        # gain = d(imbalance)/d(budget) < 0, so the corrective Newton
+        # direction sign(-y / gain) is the same as sign(y): positive
+        # imbalance needs more replay budget; negative imbalance needs less.
+        return int(math.copysign(cfg.steady_small_step_blocks, y)) if y != 0 else 0
 
     # ------------------------------------------------------------
     # TRANSIT
@@ -274,12 +276,12 @@ class ImbalanceController:
         self.tracking_settle_count = 0
         # Probe step: use only the sign, not the numeric gain.
         # window_mean > 0 means imbalance was positive → need budget↑ → Δ > 0.
-        # Since gain < 0, sign(Δ) = −sign(mean).
+        # Since gain < 0, sign(Δ) = sign(mean) for Δ = -mean / gain.
         if window_mean == 0.0:
             # Degenerate case: default to positive probe.
             sign = 1
         else:
-            sign = -1 if window_mean > 0 else 1
+            sign = 1 if window_mean > 0 else -1
         delta = sign * cfg.probe_size_blocks
         self._pending_probe_delta = int(delta)
         self._probe_pre_imbalance = window_mean
@@ -340,7 +342,7 @@ class ImbalanceController:
 
         if self.gain is None or abs(self.gain) < 1e-9:
             # No trustworthy gain yet — issue another small sign-only step.
-            sign = -1 if y > 0 else (1 if y < 0 else 0)
+            sign = 1 if y > 0 else (-1 if y < 0 else 0)
             return sign * cfg.steady_small_step_blocks
 
         raw = -y / self.gain
