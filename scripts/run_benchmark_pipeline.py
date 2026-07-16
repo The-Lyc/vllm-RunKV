@@ -88,6 +88,33 @@ def _model_tag(model: str) -> str:
     return _sanitize_token(Path(model).name or model)
 
 
+def _compact_tag_value(value: str) -> str:
+    """Make numeric-looking values short and filename friendly."""
+    try:
+        number = float(value)
+    except ValueError:
+        return _sanitize_token(value)
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:g}".replace(".", "p")
+
+
+def _default_run_tag(args: argparse.Namespace) -> str:
+    """Build a collision-resistant tag that identifies the benchmark setting."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    parts = [
+        timestamp,
+        _model_tag(args.model),
+        f"cpu{_compact_tag_value(args.cpu_memory_gb)}",
+        f"gu{_compact_tag_value(args.gpu_memory_utilization)}",
+        f"gf{_compact_tag_value(args.gpu_memory_fraction)}",
+        f"bs{_compact_tag_value(args.num_prompts)}",
+        f"p{_compact_tag_value(args.prompt_words)}",
+        f"d{_compact_tag_value(args.max_tokens)}",
+    ]
+    return "_".join(parts)
+
+
 def _resolve_tightllm_profile_path(args: argparse.Namespace) -> str:
     if args.tightllm_profile_path:
         return args.tightllm_profile_path
@@ -209,8 +236,11 @@ def build_parser() -> argparse.ArgumentParser:
     ctrl = p.add_argument_group("Pipeline control")
     ctrl.add_argument(
         "--run-tag",
-        default=datetime.now().strftime("%Y%m%d_%H%M"),
-        help="Tag for output file names (default: YYYYMMDD_HHMM)",
+        default="",
+        help=(
+            "Tag for output file names. The default includes timestamp, model, "
+            "memory, batch, prompt, and decode settings."
+        ),
     )
     ctrl.add_argument(
         "--skip-runkv", action="store_true", help="Skip RunKV test step"
@@ -227,13 +257,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ── Test parameters ───────────────────────────────────────────────────
     test = p.add_argument_group("Test parameters")
-    test.add_argument("--model", default="/data/models/opt-2.7b-8k")
+    test.add_argument("--model", default="/data/models/opt-6.7b-8k")
     test.add_argument("--prefix-blocks", default="10000")
     test.add_argument("--num-prompts", default="32")
-    test.add_argument("--prompt-words", default="8000")
+    test.add_argument("--prompt-words", default="2000")
     test.add_argument("--max-tokens", default="32")
     test.add_argument("--gpu-memory-utilization", default="0.9")
-    test.add_argument("--gpu-memory-fraction", default="0.8")
+    test.add_argument("--gpu-memory-fraction", default="0.6")
     test.add_argument("--num-device-buffers", default="3")
     test.add_argument(
         "--max-num-seqs",
@@ -323,7 +353,9 @@ def main() -> None:
             "NSYS_CMD is set."
         )
 
-    run_tag = args.run_tag
+    run_tag = (
+        _sanitize_token(args.run_tag) if args.run_tag else _default_run_tag(args)
+    )
     manifest_dir = MANIFEST_DIR
     manifest_dir.mkdir(parents=True, exist_ok=True)
     runkv_manifest = str(manifest_dir / f"runkv_{run_tag}.json")
@@ -476,8 +508,8 @@ def main() -> None:
         print(f"  RunKV    sqlite:   {runkv_sqlite}")
         print(f"  TightLLM sqlite:   {tightllm_sqlite}")
 
-        # analyze_per_layer_timing.py appends the timestamp parsed from inputs.
-        output_dir = args.analysis_output_dir or str(ANALYSIS_OUTPUT_DIR)
+        output_root = Path(args.analysis_output_dir or ANALYSIS_OUTPUT_DIR)
+        output_dir = str(output_root / run_tag)
 
         analysis_cmd = [
             sys.executable,

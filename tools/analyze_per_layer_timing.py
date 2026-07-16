@@ -2744,8 +2744,10 @@ def main() -> None:
         + ([args.tightllm_sqlite] if args.tightllm_sqlite else [])
     )
     _ts_tag = _extract_run_timestamp(_glob_expand(_candidate_paths) or _candidate_paths)
-    out_dir = Path(args.output_dir) / _ts_tag if _ts_tag else Path(args.output_dir)
-    if _ts_tag:
+    base_dir = Path(args.output_dir)
+    already_tagged = _ts_tag and _ts_tag in base_dir.name
+    out_dir = base_dir / _ts_tag if _ts_tag and not already_tagged else base_dir
+    if _ts_tag and not already_tagged:
         print(f"  [info] output sub-directory: {_ts_tag}")
 
     rpt = Report(out_dir)

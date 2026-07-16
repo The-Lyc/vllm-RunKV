@@ -1,0 +1,53 @@
+{
+  "log_root": "exp_results/logs/benchmark_batch",
+  "defaults": {
+    "prefix_blocks": 10000000,
+    "cpu_memory_fraction": 0.8,
+    "gpu_memory_utilization": 0.7,
+    "num_device_buffers": 3,
+    "max_num_seqs": null,
+    "max_staging_blocks": null
+  },
+  "tests": [
+    {
+      "name": "opt6.7b-bs32-p1k-d64",
+      "model": "/data/models/opt-6.7b-8k",
+      "cpu_memory_gb": 40,
+      "gpu_memory_fraction": 0.9,
+      "tightllm_profile": "exp_results/tightllm_profiles/ubuntu/opt-6.7b-8k.json",
+      "batch_size": 32,
+      "prompt_length": 1000,
+      "decode_length": 128
+    },
+    {
+      "name": "opt6.7b-bs32-p2k-d64",
+      "model": "/data/models/opt-6.7b-8k",
+      "cpu_memory_gb": 40,
+      "gpu_memory_fraction": 0.9,
+      "tightllm_profile": "exp_results/tightllm_profiles/ubuntu/opt-6.7b-8k.json",
+      "batch_size": 32,
+      "prompt_length": 2000,
+      "decode_length": 64
+    },
+    {
+      "name": "opt6.7b-bs32-p4k-d32",
+      "model": "/data/models/opt-6.7b-8k",
+      "cpu_memory_gb": 47.9,
+      "gpu_memory_fraction": 0.9,
+      "tightllm_profile": "exp_results/tightllm_profiles/ubuntu/opt-6.7b-8k.json",
+      "batch_size": 32,
+      "prompt_length": 4000,
+      "decode_length": 32
+    },
+    {
+      "name": "opt6.7b-bs32-p8k-d32",
+      "model": "/data/models/opt-6.7b-8k",
+      "cpu_memory_gb": 47.9,
+      "gpu_memory_fraction": 0.9,
+      "tightllm_profile": "exp_results/tightllm_profiles/ubuntu/opt-6.7b-8k.json",
+      "batch_size": 16,
+      "prompt_length": 8000,
+      "decode_length": 32
+    }
+  ]
+}
