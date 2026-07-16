@@ -7,7 +7,9 @@ from __future__ import annotations
 import argparse
 import contextlib
 import gc
+import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -141,6 +143,19 @@ def parse_args() -> argparse.Namespace:
         "--run-tag",
         default=None,
         help="Tag appended to JSONL output filenames. Defaults to timestamp.",
+    )
+    parser.add_argument(
+        "--step-progress-path",
+        default=None,
+        help="Optional step-index log, flushed after every engine.step().",
+    )
+    parser.add_argument(
+        "--step-metrics-path",
+        default=None,
+        help=(
+            "Optional per-step JSONL with process-comparable monotonic wall "
+            "timestamps, flushed after every engine.step()."
+        ),
     )
     parser.add_argument(
         "--disable-opt-component-mfu-profiling",
@@ -432,6 +447,8 @@ def run_prompts_with_engine(
     max_tokens: int,
     enable_profiling: bool,
     resource_controller: Any | None = None,
+    step_progress_path: str | None = None,
+    step_metrics_path: str | None = None,
 ) -> None:
     from vllm import SamplingParams
     from vllm.sampling_params import RequestOutputKind
@@ -469,10 +486,22 @@ def run_prompts_with_engine(
     if enable_profiling:
         cuda_profiler_start()
 
+    progress_file = None
+    if step_progress_path:
+        progress_path = Path(step_progress_path)
+        progress_path.parent.mkdir(parents=True, exist_ok=True)
+        progress_file = progress_path.open("w")
+    metrics_file = None
+    if step_metrics_path:
+        metrics_path = Path(step_metrics_path)
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_file = metrics_path.open("w")
+
     step = 0
     try:
         with nvtx_range("inference_loop", color="blue"):
             while pending_requests:
+                pending_before = len(pending_requests)
                 resource_context = None
                 step_start_s = None
                 if resource_controller is not None:
@@ -480,13 +509,17 @@ def run_prompts_with_engine(
                     step_start_s = resource_context.get("step_start_s")
                 set_opt_component_mfu_resource_context(resource_context)
 
+                step_start_monotonic_s = time.perf_counter()
                 with nvtx_range(f"step_{step}", color="yellow"):
                     step_outputs = engine.step()
+                step_end_monotonic_s = time.perf_counter()
 
+                finished_count = 0
                 for out in step_outputs:
                     request_id = getattr(out, "request_id", None)
                     if request_id is not None and getattr(out, "finished", False):
                         pending_requests.discard(request_id)
+                        finished_count += 1
 
                 if resource_controller is not None:
                     resource_controller.after_step(
@@ -496,6 +529,28 @@ def run_prompts_with_engine(
                         output_count=len(step_outputs),
                         pending_count=len(pending_requests),
                     )
+                if progress_file is not None:
+                    progress_file.write(f"{step}\n")
+                    progress_file.flush()
+                if metrics_file is not None:
+                    metrics_file.write(
+                        json.dumps(
+                            {
+                                "step": step,
+                                "step_start_monotonic_s": step_start_monotonic_s,
+                                "step_end_monotonic_s": step_end_monotonic_s,
+                                "step_wall_s": (
+                                    step_end_monotonic_s - step_start_monotonic_s
+                                ),
+                                "output_count": len(step_outputs),
+                                "finished_count": finished_count,
+                                "pending_before": pending_before,
+                                "pending_after": len(pending_requests),
+                            }
+                        )
+                        + "\n"
+                    )
+                    metrics_file.flush()
 
                 step += 1
     finally:
@@ -505,6 +560,10 @@ def run_prompts_with_engine(
             cuda_profiler_stop()
         if resource_controller is not None:
             resource_controller.stop()
+        if progress_file is not None:
+            progress_file.close()
+        if metrics_file is not None:
+            metrics_file.close()
 
 
 def _derive_setting_path(
@@ -673,6 +732,8 @@ def main() -> None:
                 max_tokens=args.max_tokens,
                 enable_profiling=args.profile,
                 resource_controller=resource_controller,
+                step_progress_path=args.step_progress_path,
+                step_metrics_path=args.step_metrics_path,
             )
         except Exception:
             if resource_controller is not None and resource_controller_prepared:
