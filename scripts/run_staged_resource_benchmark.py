@@ -289,13 +289,13 @@ def build_parser() -> argparse.ArgumentParser:
     ctrl.add_argument("--skip-analysis", action="store_true")
 
     test = parser.add_argument_group("Test parameters")
-    test.add_argument("--model", default="/data/models/opt-2.7b-8k")
+    test.add_argument("--model", default="/data/models/opt-1.3b-8k")
     test.add_argument("--prefix-blocks", default="10000")
     test.add_argument("--num-prompts", default="64")
-    test.add_argument("--prompt-words", default="1000")
-    test.add_argument("--max-tokens", default="128")
+    test.add_argument("--prompt-words", default="2000")
+    test.add_argument("--max-tokens", default="256")
     test.add_argument("--gpu-memory-utilization", default="0.8")
-    test.add_argument("--gpu-memory-fraction", default="0.7")
+    test.add_argument("--gpu-memory-fraction", default="0.9")
     test.add_argument("--num-device-buffers", default="3")
     test.add_argument(
         "--max-num-seqs",
@@ -317,7 +317,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--cpu-memory-gb",
         "--cpu-kv-memory-gb",
         dest="cpu_memory_gb",
-        default=str(5e10 / (1024**3)),
+        default=str(6e10 / (1024**3)),
         help=(
             "Total CPU cache-store budget in GiB; with dynamic replay this "
             "covers both full-layer KV and hidden-state stores. 0 derives "
