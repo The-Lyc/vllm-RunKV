@@ -133,6 +133,9 @@ class FeedbackControllerLayerUpdate:
     window_stdev_ms: float | None = None
     old_baseline_ms: float | None = None
     plan_change_hint: str | None = None
+    step_cap_blocks: int | None = None
+    step_cap_saturated: bool | None = None
+    step_cap_saturation_streak: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -148,6 +151,9 @@ class FeedbackControllerLayerUpdate:
             "window_stdev_ms": self.window_stdev_ms,
             "old_baseline_ms": self.old_baseline_ms,
             "plan_change_hint": self.plan_change_hint,
+            "step_cap_blocks": self.step_cap_blocks,
+            "step_cap_saturated": self.step_cap_saturated,
+            "step_cap_saturation_streak": self.step_cap_saturation_streak,
         }
 
 
@@ -975,6 +981,11 @@ class FeedbackReplayPlanProvider:
                 window_stdev_ms=decision.window_stdev_ms,
                 old_baseline_ms=decision.old_baseline_ms,
                 plan_change_hint=decision.plan_change_hint,
+                step_cap_blocks=decision.step_cap_blocks,
+                step_cap_saturated=decision.step_cap_saturated,
+                step_cap_saturation_streak=(
+                    decision.step_cap_saturation_streak
+                ),
             )
             cs.last_budget_blocks = budget_before
             cs.last_imbalance_ms = imbalance_value

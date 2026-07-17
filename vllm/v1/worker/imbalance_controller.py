@@ -52,8 +52,12 @@ class ImbalanceControllerConfig:
     steady_small_step_blocks: int = 1
     # TRACKING first-step probe size (blocks).
     probe_size_blocks: int = 2
-    # TRACKING max step size (blocks).
-    tracking_max_step_blocks: int = 10
+    # TRACKING progressive step cap (blocks): 10 -> 15 -> 20.  A cap level is
+    # raised only after the previous update saturated and the next layer still
+    # needs a correction in the same direction.
+    tracking_initial_step_cap_blocks: int = 10
+    tracking_step_cap_increment_blocks: int = 5
+    tracking_max_step_blocks: int = 20
     # TRACKING Newton step damping.
     tracking_damping: float = 0.6
     # TRANSIT force-exit timeout (layers).
@@ -82,6 +86,9 @@ class ControlDecision:
     window_stdev_ms: float | None = None
     old_baseline_ms: float | None = None
     gain_used: float | None = None
+    step_cap_blocks: int | None = None
+    step_cap_saturated: bool = False
+    step_cap_saturation_streak: int = 0
     action: str = "sm"
 
     def to_dict(self) -> dict[str, Any]:
@@ -93,6 +100,9 @@ class ControlDecision:
             "window_stdev_ms": self.window_stdev_ms,
             "old_baseline_ms": self.old_baseline_ms,
             "gain_used": self.gain_used,
+            "step_cap_blocks": self.step_cap_blocks,
+            "step_cap_saturated": self.step_cap_saturated,
+            "step_cap_saturation_streak": self.step_cap_saturation_streak,
             "action": self.action,
         }
 
@@ -132,10 +142,98 @@ class ImbalanceController:
     _rls_pool: deque[tuple[int, float]] = field(init=False)
     # Current gain estimate (ms per block).  None until first valid measurement.
     gain: float | None = field(default=None, init=False)
+    # Progressive TRACKING cap state.  Escalation is local to one continuous
+    # same-direction correction episode and is reset on regime/state changes.
+    _tracking_step_cap_blocks: int = field(default=10, init=False)
+    _tracking_cap_direction: int = field(default=0, init=False)
+    _last_tracking_step_saturated: bool = field(default=False, init=False)
+    _tracking_saturation_streak: int = field(default=0, init=False)
+    # Diagnostics for the current observe() call.
+    _decision_step_cap_blocks: int | None = field(default=None, init=False)
+    _decision_step_cap_saturated: bool = field(default=False, init=False)
+    _decision_step_cap_saturation_streak: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         self._window = deque(maxlen=int(self.config.window_size))
         self._rls_pool = deque(maxlen=int(self.config.rls_window))
+        self._reset_tracking_step_cap()
+
+    def _tracking_initial_cap(self) -> int:
+        return max(
+            1,
+            min(
+                int(self.config.tracking_initial_step_cap_blocks),
+                int(self.config.tracking_max_step_blocks),
+            ),
+        )
+
+    def _tracking_cap_ceiling(self) -> int:
+        return max(
+            self._tracking_initial_cap(),
+            int(self.config.tracking_max_step_blocks),
+        )
+
+    def _reset_tracking_step_cap(self) -> None:
+        self._tracking_step_cap_blocks = self._tracking_initial_cap()
+        self._tracking_cap_direction = 0
+        self._last_tracking_step_saturated = False
+        self._tracking_saturation_streak = 0
+
+    def _prepare_tracking_step_cap(self, correction_direction: int) -> int:
+        """Select this layer's cap from the current saturation episode."""
+        if correction_direction == 0:
+            self._reset_tracking_step_cap()
+            return self._tracking_step_cap_blocks
+
+        if (
+            self._tracking_cap_direction != 0
+            and correction_direction != self._tracking_cap_direction
+        ):
+            # The residual crossed zero.  Start the opposite correction from
+            # the conservative base cap instead of carrying escalation over.
+            self._reset_tracking_step_cap()
+        elif (
+            self._last_tracking_step_saturated
+            and correction_direction == self._tracking_cap_direction
+        ):
+            increment = max(
+                0,
+                int(self.config.tracking_step_cap_increment_blocks),
+            )
+            self._tracking_step_cap_blocks = min(
+                self._tracking_cap_ceiling(),
+                self._tracking_step_cap_blocks + increment,
+            )
+        return self._tracking_step_cap_blocks
+
+    def _record_tracking_cap_result(
+        self,
+        *,
+        correction_direction: int,
+        saturated: bool,
+        allow_escalation: bool,
+    ) -> None:
+        used_step_cap = self._tracking_step_cap_blocks
+        if not allow_escalation:
+            self._reset_tracking_step_cap()
+        elif saturated:
+            if correction_direction == self._tracking_cap_direction:
+                self._tracking_saturation_streak += 1
+            else:
+                self._tracking_cap_direction = correction_direction
+                self._tracking_saturation_streak = 1
+            self._last_tracking_step_saturated = True
+        else:
+            # A non-saturated update ends the consecutive-cap-hit episode.
+            # If a later residual grows again, restart conservatively at the
+            # initial cap instead of retaining an already escalated level.
+            self._reset_tracking_step_cap()
+
+        self._decision_step_cap_blocks = used_step_cap
+        self._decision_step_cap_saturated = saturated
+        self._decision_step_cap_saturation_streak = (
+            self._tracking_saturation_streak
+        )
 
     # ------------------------------------------------------------
     # Public API
@@ -162,6 +260,7 @@ class ImbalanceController:
         self._probe_pre_budget = None
         self._rls_pool.clear()
         self.gain = None
+        self._reset_tracking_step_cap()
 
     def observe(
         self,
@@ -176,6 +275,9 @@ class ImbalanceController:
         """
         cfg = self.config
         y = float(imbalance_ms)
+        self._decision_step_cap_blocks = None
+        self._decision_step_cap_saturated = False
+        self._decision_step_cap_saturation_streak = 0
         self._window.append(y)
 
         # Attach any in-flight probe measurement to the RLS pool first so
@@ -199,6 +301,11 @@ class ImbalanceController:
             window_stdev_ms=stdev,
             old_baseline_ms=self.old_baseline_ms,
             gain_used=self.gain,
+            step_cap_blocks=self._decision_step_cap_blocks,
+            step_cap_saturated=self._decision_step_cap_saturated,
+            step_cap_saturation_streak=(
+                self._decision_step_cap_saturation_streak
+            ),
         )
 
     # ------------------------------------------------------------
@@ -236,6 +343,7 @@ class ImbalanceController:
 
     def _enter_transit(self, current_budget_override: int | None) -> None:
         self.state = SMState.TRANSIT
+        self._reset_tracking_step_cap()
         self.old_baseline_ms = self.baseline_ewma if self._baseline_initialized else None
         self.frozen_budget = current_budget_override
         self.layers_in_transit = 0
@@ -272,6 +380,8 @@ class ImbalanceController:
     def _enter_tracking(self, window_mean: float, current_budget: int) -> int:
         cfg = self.config
         self.state = SMState.TRACKING
+        self._reset_tracking_step_cap()
+        self._decision_step_cap_blocks = self._tracking_step_cap_blocks
         self.layers_in_tracking = 0
         self.tracking_settle_count = 0
         # Probe step: use only the sign, not the numeric gain.
@@ -293,7 +403,9 @@ class ImbalanceController:
         self.layers_in_tracking += 1
 
         # Settle check.
-        if abs(y) < cfg.deadband_ms:
+        in_deadband = abs(y) < cfg.deadband_ms
+        if in_deadband:
+            self._reset_tracking_step_cap()
             self.tracking_settle_count += 1
         else:
             self.tracking_settle_count = 0
@@ -306,6 +418,7 @@ class ImbalanceController:
             self.frozen_budget = None
             self.layers_in_tracking = 0
             self.tracking_settle_count = 0
+            self._reset_tracking_step_cap()
             return 0
 
         # Hard timeout.
@@ -317,6 +430,7 @@ class ImbalanceController:
             self.frozen_budget = None
             self.layers_in_tracking = 0
             self.tracking_settle_count = 0
+            self._reset_tracking_step_cap()
             return 0
 
         # If we just completed a probe, compute measured gain from the
@@ -343,11 +457,22 @@ class ImbalanceController:
         if self.gain is None or abs(self.gain) < 1e-9:
             # No trustworthy gain yet — issue another small sign-only step.
             sign = 1 if y > 0 else (-1 if y < 0 else 0)
+            self._decision_step_cap_blocks = self._tracking_step_cap_blocks
             return sign * cfg.steady_small_step_blocks
 
         raw = -y / self.gain
         damped = cfg.tracking_damping * raw
-        clipped = max(-cfg.tracking_max_step_blocks, min(cfg.tracking_max_step_blocks, damped))
+        correction_direction = 1 if damped > 0 else (-1 if damped < 0 else 0)
+        step_cap = self._tracking_step_cap_blocks
+        if not in_deadband:
+            step_cap = self._prepare_tracking_step_cap(correction_direction)
+        clipped = max(-step_cap, min(step_cap, damped))
+        saturated = abs(damped) >= float(step_cap)
+        self._record_tracking_cap_result(
+            correction_direction=correction_direction,
+            saturated=saturated,
+            allow_escalation=not in_deadband,
+        )
         return int(round(clipped))
 
     # ------------------------------------------------------------

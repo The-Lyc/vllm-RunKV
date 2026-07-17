@@ -140,11 +140,17 @@ TRACKING 的核心挑战是：首步时我们**不知道 gain 的数值**。写�
 
 **第二步开始（exploit）**：首步的结果给出 gain 测量值
 - 观测 probe 后的新 imbalance，计算 `gain_measured = (new_imbalance − mean_window) / probe_size`
-- 从第二步起用 `gain_measured` 做 Newton step：`Δbudget = clip(−current_imbalance / gain × damping, ±max_step)`
+- 从第二步起用 `gain_measured` 做 Newton step：`Δbudget = clip(−current_imbalance / gain × damping, ±step_cap)`
 - 后续每层把新的 `(budget, imbalance)` pair 加入 RLS 样本池（固定长度 6，FIFO），用 OLS 更新 gain
 - **Gain 符号保护**：若 RLS 产出的 gain 与物理要求的符号（负）相反，拒绝更新，保留上一步的 gain 估计
 
-这样整个设计里唯一需要配置的常量是 `probe_size_blocks = 2`，而它是 system-agnostic 的——换硬件、换模型都不用重新调。
+`step_cap` 使用渐进式上限，避免把所有 TRACKING 更新直接放宽为大步长：
+
+- 每个 correction episode 从 `10 blocks` 开始；
+- 如果本层触顶，并且下一层仍需要同方向修正，则下一层放宽为 `15 blocks`；再次连续同方向触顶后放宽为 `20 blocks`，之后不再增加；
+- 未触顶、修正方向反转、进入 deadband、离开 TRACKING、controller reset 或 batch 组成变化时，结束当前 episode，下一次从 `10 blocks` 重新开始。
+
+这样 gain 数值仍然无需按系统预先标定；渐进上限只在反馈明确表明小步长不足时才放宽。
 
 ### 6.5 TRACKING 期间的 gain 累积（可选增强）
 
@@ -182,7 +188,9 @@ t = mean(window) / (max(stdev(window), σ_baseline) / √K)
 | deadband | 0.5 ms | STEADY 和 TRACKING 收敛判定的死区 |
 | steady_small_step_blocks | 1 | STEADY 下的比例控制步长 |
 | probe_size_blocks | 2 | TRACKING 首步探针幅度（system-agnostic） |
-| tracking_max_step_blocks | 10 | TRACKING 下的 step 上限 |
+| tracking_initial_step_cap_blocks | 10 | TRACKING correction episode 的初始 step 上限 |
+| tracking_step_cap_increment_blocks | 5 | 同方向连续触顶后的上限增量 |
+| tracking_max_step_blocks | 20 | TRACKING 渐进 step 上限的硬上界 |
 | tracking_damping | 0.6 | TRACKING 的 Newton step 阻尼 |
 | transit_timeout_layers | 6（2K） | TRANSIT 强制出口 |
 | tracking_settle_layers | 3 | TRACKING 正常收敛判据 |
@@ -216,6 +224,7 @@ t = mean(window) / (max(stdev(window), σ_baseline) / √K)
 
 **观测性扩展**：`FeedbackControllerLayerUpdate` 增加字段
 - `sm_state`、`window_mean_ms`、`window_stdev_ms`、`old_baseline_ms`、`plan_change_hint`
+- `step_cap_blocks`、`step_cap_saturated`、`step_cap_saturation_streak`
 - 下游 JSONL（`opt_component_mfu_*.flat.jsonl`）自动包含这些字段，便于事后分析
 
 关键的 state dispatch 伪代码。`hint` 在最后统一由 Δbudget 导出（不在每个分支里单独写）：
