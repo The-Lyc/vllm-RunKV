@@ -27,6 +27,7 @@ Environment variables (all optional, with sensible defaults):
     MAX_TOKENS             max output tokens (default 32)
     GPU_MEMORY_FRACTION    KV offload GPU fraction (default 0.9)
     NUM_DEVICE_BUFFERS     DMA device buffers (default 3)
+    H2D_COPY_MODE          "segment" or CPU-gather "gather" (default segment)
     ENABLE_NVTX            "1" (default) to emit NVTX scopes
     ENABLE_LAYERWISE_NVTX  "1" to also emit per-module NVTX
     ENABLE_NSYS            "1" to wrap with nsys profile
@@ -78,6 +79,9 @@ def main() -> None:
     max_tokens = os.environ.get("MAX_TOKENS", "32")
     gpu_memory_fraction = os.environ.get("GPU_MEMORY_FRACTION", "0.9")
     num_device_buffers = os.environ.get("NUM_DEVICE_BUFFERS", "3")
+    h2d_copy_mode = os.environ.get("H2D_COPY_MODE", "segment")
+    if h2d_copy_mode not in ("segment", "gather"):
+        raise ValueError(f"Unsupported H2D_COPY_MODE: {h2d_copy_mode!r}")
     gpu_memory_utilization = os.environ.get("GPU_MEMORY_UTILIZATION", "")
     max_num_seqs = os.environ.get("MAX_NUM_SEQS", "")
     max_staging_blocks = os.environ.get("MAX_STAGING_BLOCKS", "")
@@ -148,6 +152,8 @@ def main() -> None:
         gpu_memory_fraction,
         "--num-device-buffers",
         num_device_buffers,
+        "--h2d-copy-mode",
+        h2d_copy_mode,
         "--planner",
         "tightllm",
         "--tightllm-profile-path",
@@ -191,6 +197,7 @@ def main() -> None:
     print(f"  prefix_blocks:      {prefix_blocks}")
     print(f"  gpu_memory_fraction:{gpu_memory_fraction}")
     print(f"  num_device_buffers: {num_device_buffers}")
+    print(f"  h2d_copy_mode:      {h2d_copy_mode}")
     if gpu_memory_utilization:
         print(f"  gpu_memory_utilization:{gpu_memory_utilization}")
     if max_num_seqs:
@@ -262,6 +269,7 @@ def main() -> None:
             "fixed_output_length": True,
             "gpu_memory_fraction": gpu_memory_fraction,
             "num_device_buffers": num_device_buffers,
+            "h2d_copy_mode": h2d_copy_mode,
             "gpu_memory_utilization": gpu_memory_utilization or None,
             "max_num_seqs": max_num_seqs or None,
             "max_staging_blocks": max_staging_blocks or None,

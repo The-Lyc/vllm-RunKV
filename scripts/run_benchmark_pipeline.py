@@ -108,6 +108,8 @@ def _default_run_tag(args: argparse.Namespace) -> str:
         f"cpu{_compact_tag_value(args.cpu_memory_gb)}",
         f"gu{_compact_tag_value(args.gpu_memory_utilization)}",
         f"gf{_compact_tag_value(args.gpu_memory_fraction)}",
+        f"rkcopy-{args.runkv_h2d_copy_mode}",
+        f"tlcopy-{args.tightllm_h2d_copy_mode}",
         f"bs{_compact_tag_value(args.num_prompts)}",
         f"p{_compact_tag_value(args.prompt_words)}",
         f"d{_compact_tag_value(args.max_tokens)}",
@@ -266,6 +268,18 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("--gpu-memory-fraction", default="0.6")
     test.add_argument("--num-device-buffers", default="3")
     test.add_argument(
+        "--runkv-h2d-copy-mode",
+        choices=("segment", "gather"),
+        default="segment",
+        help="KV H2D copy implementation for the RunKV benchmark step.",
+    )
+    test.add_argument(
+        "--tightllm-h2d-copy-mode",
+        choices=("segment", "gather"),
+        default="segment",
+        help="KV H2D copy implementation for the TightLLM benchmark step.",
+    )
+    test.add_argument(
         "--max-num-seqs",
         default="",
         help=(
@@ -392,6 +406,7 @@ def main() -> None:
         runkv_env["OUTPUT_DIR"] = str(RUNKV_OUTPUT_DIR)
         runkv_env["DRY_RUN"] = "0"
         runkv_env["USE_STATE_MACHINE"] = "1"
+        runkv_env["H2D_COPY_MODE"] = args.runkv_h2d_copy_mode
         rc = _run_step(
             "RunKV feedback observation",
             [sys.executable, str(RUNKV_SCRIPT)],
@@ -408,6 +423,7 @@ def main() -> None:
         tightllm_env = dict(common_env)
         tightllm_env["OUTPUT_DIR"] = str(TIGHTLLM_OUTPUT_DIR)
         tightllm_env["TIGHTLLM_PROFILE_PATH"] = tightllm_profile_path
+        tightllm_env["H2D_COPY_MODE"] = args.tightllm_h2d_copy_mode
         rc = _run_step(
             "TightLLM ILP planner observation",
             [sys.executable, str(TIGHTLLM_SCRIPT)],

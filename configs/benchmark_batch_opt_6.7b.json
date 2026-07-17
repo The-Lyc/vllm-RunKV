@@ -5,6 +5,8 @@
     "cpu_memory_fraction": 0.8,
     "gpu_memory_utilization": 0.7,
     "num_device_buffers": 3,
+    "runkv_h2d_copy_mode": "segment",
+    "tightllm_h2d_copy_mode": "gather",
     "max_num_seqs": null,
     "max_staging_blocks": null
   },

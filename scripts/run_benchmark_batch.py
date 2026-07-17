@@ -16,6 +16,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 PIPELINE = ROOT / "scripts/run_benchmark_pipeline.py"
 DEFAULT_LOG_ROOT = ROOT / "exp_results/logs/benchmark_batch"
+H2D_COPY_MODES = ("segment", "gather")
 
 REQUIRED_FIELDS = (
     "model",
@@ -54,6 +55,14 @@ def _load_settings(config_path: Path) -> tuple[dict[str, Any], list[dict[str, An
         missing = [key for key in REQUIRED_FIELDS if key not in setting]
         if missing:
             raise ValueError(f"tests[{index}] is missing: {', '.join(missing)}")
+        for key in ("runkv_h2d_copy_mode", "tightllm_h2d_copy_mode"):
+            mode = setting.get(key, "segment")
+            if mode not in H2D_COPY_MODES:
+                choices = ", ".join(H2D_COPY_MODES)
+                raise ValueError(
+                    f"tests[{index}].{key} must be one of: {choices}; got {mode!r}"
+                )
+            setting[key] = mode
         settings.append(setting)
     return config, settings
 
@@ -70,6 +79,8 @@ def _run_tag(setting: dict[str, Any], index: int, timestamp: str) -> str:
             f"cpu{_tag_number(setting['cpu_memory_gb'])}",
             f"gu{_tag_number(setting['gpu_memory_utilization'])}",
             f"gf{_tag_number(setting['gpu_memory_fraction'])}",
+            f"rkcopy-{_sanitize(setting['runkv_h2d_copy_mode'])}",
+            f"tlcopy-{_sanitize(setting['tightllm_h2d_copy_mode'])}",
             f"bs{_sanitize(setting['batch_size'])}",
             f"p{_sanitize(setting['prompt_length'])}",
             f"d{_sanitize(setting['decode_length'])}",
@@ -109,6 +120,10 @@ def _command(setting: dict[str, Any], run_tag: str) -> list[str]:
         str(setting["gpu_memory_fraction"]),
         "--num-device-buffers",
         str(setting.get("num_device_buffers", 3)),
+        "--runkv-h2d-copy-mode",
+        str(setting["runkv_h2d_copy_mode"]),
+        "--tightllm-h2d-copy-mode",
+        str(setting["tightllm_h2d_copy_mode"]),
         "--tightllm-profile-path",
         str(profile),
     ]
