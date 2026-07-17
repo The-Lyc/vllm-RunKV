@@ -99,8 +99,19 @@ def load_mfu_flat(paths: list[str]) -> list[dict]:
                     # step-level nested record — expand
                     for lr in rec["layers"]:
                         flat = dict(lr)
-                        flat.setdefault("step", rec.get("step"))
-                        flat.setdefault("rank", rec.get("rank"))
+                        for key in (
+                            "step",
+                            "rank",
+                            "num_reqs",
+                            "total_scheduled_tokens",
+                            "phase",
+                            "inference_phase",
+                            "num_prefill_tokens",
+                            "prefill_scheduled_tokens",
+                            "num_decode_tokens",
+                            "decode_scheduled_tokens",
+                        ):
+                            flat.setdefault(key, rec.get(key))
                         records.append(flat)
                 else:
                     records.append(rec)
@@ -684,16 +695,134 @@ def extract_inference_loop_seconds(nvtx: list[dict]) -> float | None:
     return sum(durations_s) if durations_s else None
 
 
+def _decode_only_step_summaries(flat_records: list[dict]) -> dict[int, dict]:
+    """Return one scheduling summary per decode-only model step.
+
+    Current non-speculative traces identify decode-only work by scheduling one
+    token per active request.  Explicit phase/prefill-token fields take
+    precedence when they are available in newer traces.
+    """
+    by_step: dict[int, dict] = {}
+    for record in flat_records:
+        step = record.get("step")
+        if step is not None:
+            by_step.setdefault(int(step), record)
+
+    decode_only: dict[int, dict] = {}
+    for step, record in by_step.items():
+        phase = record.get("phase") or record.get("inference_phase")
+        if phase is not None:
+            is_decode_only = (
+                str(phase).lower().replace("-", "_") == "decode_only"
+            )
+        else:
+            prefill_tokens = next(
+                (
+                    record.get(key)
+                    for key in ("num_prefill_tokens", "prefill_scheduled_tokens")
+                    if record.get(key) is not None
+                ),
+                None,
+            )
+            if prefill_tokens is not None:
+                is_decode_only = (
+                    float(prefill_tokens) == 0
+                    and float(record.get("total_scheduled_tokens", 0) or 0) > 0
+                )
+            else:
+                num_reqs = float(record.get("num_reqs", 0) or 0)
+                total_tokens = float(
+                    record.get("total_scheduled_tokens", 0) or 0
+                )
+                is_decode_only = num_reqs > 0 and total_tokens == num_reqs
+        if is_decode_only:
+            decode_only[step] = record
+    return decode_only
+
+
+def _step_ranges_text(step_ids: list[int]) -> str:
+    ranges: list[list[int]] = []
+    for step in sorted(set(step_ids)):
+        if not ranges or step != ranges[-1][-1] + 1:
+            ranges.append([step])
+        else:
+            ranges[-1].append(step)
+    return ",".join(
+        str(group[0]) if len(group) == 1 else f"{group[0]}-{group[-1]}"
+        for group in ranges
+    )
+
+
+def extract_decode_only_step_stats(
+    nvtx: list[dict],
+    flat_records: list[dict],
+) -> dict[str, Any] | None:
+    """Sum NVTX durations for all decode-only model steps."""
+    decode_steps = _decode_only_step_summaries(flat_records)
+    if not decode_steps:
+        return None
+
+    by_step: dict[int, tuple[int, int]] = {}
+    for event in nvtx:
+        match = re.fullmatch(r"step_(\d+)", str(event.get("text") or ""))
+        if match is None:
+            continue
+        step = int(match.group(1))
+        interval = (int(event["start_ns"]), int(event["end_ns"]))
+        previous = by_step.get(step)
+        if (
+            previous is None
+            or interval[1] - interval[0] > previous[1] - previous[0]
+        ):
+            by_step[step] = interval
+
+    marker = "step_*"
+    if not by_step:
+        forwards = sorted(
+            (
+                (int(event["start_ns"]), int(event["end_ns"]))
+                for event in nvtx
+                if event.get("text") == "gpu_model_runner: forward"
+            ),
+            key=lambda interval: interval[0],
+        )
+        by_step = {step: interval for step, interval in enumerate(forwards)}
+        marker = "gpu_model_runner: forward"
+
+    matched_steps = [step for step in sorted(decode_steps) if step in by_step]
+    if not matched_steps:
+        return None
+    duration_s = sum(
+        by_step[step][1] - by_step[step][0] for step in matched_steps
+    ) / 1e9
+    return {
+        "marker": marker,
+        "step_count": len(matched_steps),
+        "step_ranges": _step_ranges_text(matched_steps),
+        "duration_s": duration_s,
+        "scheduled_tokens": sum(
+            int(
+                float(
+                    decode_steps[step].get("total_scheduled_tokens", 0) or 0
+                )
+            )
+            for step in matched_steps
+        ),
+    }
+
+
 def analyze_decode_throughput(
     rpt: Report,
     runkv_nvtx: list[dict],
     tightllm_nvtx: list[dict],
+    runkv_flat: list[dict],
+    tightllm_flat: list[dict],
     num_prompts: int | None,
     max_tokens: int | None,
     decode_tokens: int | None,
     fixed_output_length: bool,
 ) -> None:
-    rpt.h1("END-TO-END DECODE THROUGHPUT")
+    rpt.h1("DECODE THROUGHPUT (DECODE-ONLY MODEL STEPS)")
     if decode_tokens is not None:
         total_tokens = decode_tokens
         token_source = "explicit --decode-tokens"
@@ -726,14 +855,34 @@ def analyze_decode_throughput(
             "token counts and requests could terminate early at EOS."
         )
 
+    rpt.row(
+        "  Denominator: sum of decode-only model-step NVTX durations; "
+        "mixed prefill/decode steps are excluded."
+    )
     rows: list[list[Any]] = []
-    for label, nvtx in (("RunKV", runkv_nvtx), ("TightLLM", tightllm_nvtx)):
-        seconds = extract_inference_loop_seconds(nvtx)
-        if seconds is None:
-            rows.append([label, "N/A", "N/A"])
+    for label, nvtx, flat in (
+        ("RunKV", runkv_nvtx, runkv_flat),
+        ("TightLLM", tightllm_nvtx, tightllm_flat),
+    ):
+        stats = extract_decode_only_step_stats(nvtx, flat)
+        if stats is None or stats["duration_s"] <= 0:
+            rows.append([label, "N/A", "N/A", "N/A", "N/A"])
         else:
-            rows.append([label, f"{seconds:.6f}", f"{total_tokens / seconds:.3f}"])
-    rpt.table(["system", "loop_s", throughput_header], rows, col_width=16)
+            seconds = float(stats["duration_s"])
+            rows.append(
+                [
+                    label,
+                    stats["step_count"],
+                    stats["step_ranges"],
+                    f"{seconds:.6f}",
+                    f"{total_tokens / seconds:.3f}",
+                ]
+            )
+    rpt.table(
+        ["system", "steps", "ranges", "decode_s", throughput_header],
+        rows,
+        col_width=16,
+    )
 
 
 def analyze_layer_total_gpu(
@@ -2755,10 +2904,10 @@ def main() -> None:
     skip = args.skip_warmup_steps
 
     print("\nLoading data...")
-    runkv_flat = load_mfu_flat(_glob_expand(args.runkv_mfu))
-    tightllm_flat = load_mfu_flat(_glob_expand(args.tightllm_mfu))
-    runkv_flat = [r for r in runkv_flat if r.get("step", 0) >= skip]
-    tightllm_flat = [r for r in tightllm_flat if r.get("step", 0) >= skip]
+    runkv_flat_all = load_mfu_flat(_glob_expand(args.runkv_mfu))
+    tightllm_flat_all = load_mfu_flat(_glob_expand(args.tightllm_mfu))
+    runkv_flat = [r for r in runkv_flat_all if r.get("step", 0) >= skip]
+    tightllm_flat = [r for r in tightllm_flat_all if r.get("step", 0) >= skip]
 
     runkv_nvtx = load_nvtx(args.runkv_sqlite) if args.runkv_sqlite else []
     tightllm_nvtx = load_nvtx(args.tightllm_sqlite) if args.tightllm_sqlite else []
@@ -2869,6 +3018,8 @@ def main() -> None:
         rpt,
         runkv_nvtx,
         tightllm_nvtx,
+        runkv_flat_all,
+        tightllm_flat_all,
         args.num_prompts,
         args.max_tokens,
         args.decode_tokens,

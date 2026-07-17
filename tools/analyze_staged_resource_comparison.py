@@ -20,6 +20,7 @@ import csv
 import glob
 import json
 import math
+import re
 import sqlite3
 import sys
 from collections import defaultdict
@@ -539,20 +540,22 @@ def _write_summary_md(
         )
     lines.append("")
     if throughput_rows:
-        lines.append("## Decode Throughput (nsys sqlite step-span)")
+        lines.append("## Decode Throughput (decode-only nsys steps)")
         lines.append("")
         lines.append(
-            "| system | total tokens | marker | steps | window (s) | tokens/s |"
+            "| system | total tokens | marker | decode-only steps | ranges | "
+            "decode-only time (s) | tokens/s |"
         )
-        lines.append("|---|---:|---|---:|---:|---:|")
+        lines.append("|---|---:|---|---:|---|---:|---:|")
         for row in throughput_rows:
             lines.append(
                 "| "
                 f"{row['system']} | "
                 f"{_format_value(row.get('total_tokens'))} | "
                 f"{row.get('step_marker') or '—'} | "
-                f"{_format_value(row.get('step_count'))} | "
-                f"{_format_value(row.get('decode_window_s'))} | "
+                f"{_format_value(row.get('decode_only_step_count'))} | "
+                f"{row.get('decode_only_step_ranges') or '—'} | "
+                f"{_format_value(row.get('decode_only_step_time_s'))} | "
                 f"{_format_value(row.get('decode_throughput_tokens_per_s'))} |"
             )
         lines.append("")
@@ -604,15 +607,86 @@ _STEP_NVTX_CANDIDATES: tuple[tuple[str, str], ...] = (
 )
 
 
-def _query_step_span_ns(sqlite_path: Path) -> tuple[int, int, int, str] | None:
-    """Return ``(min_start_ns, max_end_ns, step_count, marker)`` over the best
-    available step-boundary NVTX range in the nsys-exported sqlite database.
+def _is_decode_only_step(record: dict[str, Any]) -> bool:
+    """Return whether an MFU step contains decode work and no prefill work.
 
-    Probes candidates in ``_STEP_NVTX_CANDIDATES`` in priority order and
-    returns the first non-empty match together with the marker label that
-    won, so callers can record which range was used.
+    Newer traces may persist an explicit prefill-token count or phase.  Older
+    traces only contain ``num_reqs`` and ``total_scheduled_tokens``; for the
+    non-speculative benchmark configuration, one scheduled token per request
+    is the decode-only signature.
+    """
+    phase = record.get("phase") or record.get("inference_phase")
+    if phase is not None:
+        return str(phase).lower().replace("-", "_") == "decode_only"
+
+    for key in ("num_prefill_tokens", "prefill_scheduled_tokens"):
+        prefill_tokens = _safe_float(record.get(key))
+        if prefill_tokens is not None:
+            decode_tokens = _safe_float(
+                record.get("num_decode_tokens", record.get("decode_scheduled_tokens"))
+            )
+            total_tokens = _safe_float(record.get("total_scheduled_tokens"))
+            has_decode = (
+                decode_tokens is not None and decode_tokens > 0
+            ) or (total_tokens is not None and total_tokens > 0)
+            return prefill_tokens == 0 and has_decode
+
+    num_reqs = _safe_float(record.get("num_reqs"))
+    total_tokens = _safe_float(record.get("total_scheduled_tokens"))
+    return (
+        num_reqs is not None
+        and num_reqs > 0
+        and total_tokens is not None
+        and total_tokens == num_reqs
+    )
+
+
+def _mfu_step_records_for_run(run: RunInputs) -> dict[int, dict[str, Any]]:
+    records = _load_mfu_step_records(run.mfu_steps)
+    if records:
+        return records
+
+    # Manual/legacy invocations sometimes provide only the flat MFU JSONL.
+    # Every layer row repeats the step-level scheduling fields, so one row per
+    # step is sufficient for phase classification.
+    for record in _load_jsonl(run.mfu_flat):
+        step = record.get("step")
+        if step is not None:
+            records.setdefault(int(step), record)
+    return records
+
+
+def _format_step_ranges(step_ids: list[int]) -> str | None:
+    if not step_ids:
+        return None
+    ranges: list[list[int]] = []
+    for step in sorted(set(step_ids)):
+        if not ranges or step != ranges[-1][-1] + 1:
+            ranges.append([step])
+        else:
+            ranges[-1].append(step)
+    return ",".join(
+        str(group[0]) if len(group) == 1 else f"{group[0]}-{group[-1]}"
+        for group in ranges
+    )
+
+
+def _query_decode_only_steps_ns(
+    sqlite_path: Path,
+    decode_step_ids: list[int],
+) -> tuple[int, int, int, int, str] | None:
+    """Return timing for the selected decode-only model steps.
+
+    The first field is the *sum* of the selected NVTX durations, not the span
+    between their endpoints.  Decode-only intervals can be interrupted by a
+    later mixed prefill/decode step when another waiting request is admitted.
+    The remaining fields are ``min_start``, ``max_end``, matched count, and
+    marker label.
     """
     if not sqlite_path.exists():
+        return None
+    selected_steps = sorted(set(decode_step_ids))
+    if not selected_steps:
         return None
     try:
         conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
@@ -626,14 +700,50 @@ def _query_step_span_ns(sqlite_path: Path) -> tuple[int, int, int, str] | None:
         if cur.fetchone() is None:
             return None
         for marker, like_pattern in _STEP_NVTX_CANDIDATES:
-            row = cur.execute(
-                "SELECT MIN(start), MAX(end), COUNT(*) "
-                "FROM NVTX_EVENTS WHERE text LIKE ? ESCAPE '\\'",
+            rows = cur.execute(
+                "SELECT text, start, end FROM NVTX_EVENTS "
+                "WHERE text LIKE ? ESCAPE '\\' AND end IS NOT NULL "
+                "ORDER BY start",
                 (like_pattern,),
-            ).fetchone()
-            if row is None or row[0] is None or row[1] is None or (row[2] or 0) == 0:
+            ).fetchall()
+            if not rows:
                 continue
-            return int(row[0]), int(row[1]), int(row[2]), marker
+
+            by_step: dict[int, tuple[int, int]] = {}
+            if marker == "step_*":
+                for text, start, end in rows:
+                    match = re.fullmatch(r"step_(\d+)", str(text or ""))
+                    if match is None:
+                        continue
+                    step = int(match.group(1))
+                    interval = (int(start), int(end))
+                    previous = by_step.get(step)
+                    if (
+                        previous is None
+                        or interval[1] - interval[0] > previous[1] - previous[0]
+                    ):
+                        by_step[step] = interval
+            else:
+                # There is one gpu_model_runner forward range per model step,
+                # ordered identically to the zero-based MFU step counter.
+                by_step = {
+                    step: (int(row[1]), int(row[2]))
+                    for step, row in enumerate(rows)
+                }
+
+            intervals = [
+                by_step[step] for step in selected_steps if step in by_step
+            ]
+            if not intervals:
+                continue
+            total_duration_ns = sum(end - start for start, end in intervals)
+            return (
+                total_duration_ns,
+                min(start for start, _ in intervals),
+                max(end for _, end in intervals),
+                len(intervals),
+                marker,
+            )
     finally:
         conn.close()
     return None
@@ -645,7 +755,7 @@ def _decode_throughput_for_run(
     total_tokens: int | None,
     sqlite_override: Path | None = None,
 ) -> dict[str, Any]:
-    """Compute decode throughput for one run from its nsys sqlite + token count.
+    """Compute decode throughput from decode-only nsys steps + token count.
 
     ``total_tokens`` is the *total decode token count* for the whole run
     (typically ``num_prompts * max_tokens``). When sqlite or total_tokens is
@@ -662,23 +772,40 @@ def _decode_throughput_for_run(
         "total_tokens": total_tokens,
         "step_marker": None,
         "step_count": None,
+        "decode_only_step_count": None,
+        "decode_only_step_ranges": None,
+        "decode_only_scheduled_tokens": None,
         "first_step_start_ns": None,
         "last_step_end_ns": None,
         "decode_window_s": None,
+        "decode_only_step_time_s": None,
         "decode_throughput_tokens_per_s": None,
     }
     if sqlite_path is None:
         return record
-    span = _query_step_span_ns(sqlite_path)
-    if span is None:
+    mfu_steps = _mfu_step_records_for_run(run)
+    decode_steps = [
+        step
+        for step, step_record in sorted(mfu_steps.items())
+        if _is_decode_only_step(step_record)
+    ]
+    timing = _query_decode_only_steps_ns(sqlite_path, decode_steps)
+    if timing is None:
         return record
-    start_ns, end_ns, step_count, marker = span
-    window_s = (end_ns - start_ns) / 1e9
+    duration_ns, start_ns, end_ns, step_count, marker = timing
+    window_s = duration_ns / 1e9
     record["step_marker"] = marker
     record["first_step_start_ns"] = start_ns
     record["last_step_end_ns"] = end_ns
     record["step_count"] = step_count
+    record["decode_only_step_count"] = step_count
+    record["decode_only_step_ranges"] = _format_step_ranges(decode_steps)
+    record["decode_only_scheduled_tokens"] = sum(
+        int(float(mfu_steps[step].get("total_scheduled_tokens", 0) or 0))
+        for step in decode_steps
+    )
     record["decode_window_s"] = window_s
+    record["decode_only_step_time_s"] = window_s
     if total_tokens is not None and window_s > 0:
         record["decode_throughput_tokens_per_s"] = total_tokens / window_s
     return record
@@ -718,8 +845,8 @@ def build_parser() -> argparse.ArgumentParser:
     # Decode-throughput inputs. Sqlite paths are optional — when omitted, the
     # script auto-picks the newest *.sqlite under each run_dir. Token totals
     # come from the inference config; pass either ``--total-decode-tokens``
-    # directly or the (num_prompts, max_tokens) pair so the window from
-    # step_0 start → last step end can be turned into tokens/s.
+    # directly or the (num_prompts, max_tokens) pair. MFU scheduling metadata
+    # identifies decode-only steps, whose NVTX durations form the denominator.
     parser.add_argument("--runkv-sqlite", nargs="*", default=[])
     parser.add_argument("--tightllm-sqlite", nargs="*", default=[])
     parser.add_argument("--dryrun-sqlite", nargs="*", default=[])
