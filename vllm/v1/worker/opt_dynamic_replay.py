@@ -579,6 +579,67 @@ def _allocate_budget_to_requests(
     return allocated
 
 
+def _resize_allocation_from_seed(
+    *,
+    seed_allocated_blocks_per_req: np.ndarray,
+    budget_blocks: int,
+    replayable_blocks_per_req: np.ndarray,
+) -> np.ndarray:
+    """Resize a sticky per-request allocation to ``budget_blocks``.
+
+    The seed is the allocation projected from the previous model step.  When
+    the target budget is unchanged, every surviving request keeps exactly its
+    previous allocation.  Feedback-driven budget increases fill remaining
+    capacity in the existing short-request-first order; decreases remove from
+    the reverse order so the allocator retains that preference without
+    needlessly reshuffling unaffected requests.
+
+    This function is intentionally pure.  Dynamic plans may be built on the
+    speculative builder thread, so allocation must not depend on call order.
+    """
+    replayable = _coerce_int32_array(
+        "replayable_blocks_per_req", replayable_blocks_per_req
+    )
+    seed = _coerce_int32_array(
+        "seed_allocated_blocks_per_req", seed_allocated_blocks_per_req
+    )
+    if seed.shape != replayable.shape:
+        raise ValueError(
+            "seed allocation and replayable capacity must have the same shape, "
+            f"got {seed.shape} and {replayable.shape}."
+        )
+
+    allocated = np.minimum(seed, replayable).astype(np.int32, copy=True)
+    target_budget = max(0, min(int(budget_blocks), int(replayable.sum())))
+    current_budget = int(allocated.sum())
+    priority = np.argsort(replayable, kind="stable")
+
+    if target_budget > current_budget:
+        remaining = target_budget - current_budget
+        for idx in priority:
+            capacity = int(replayable[idx] - allocated[idx])
+            added = min(remaining, capacity)
+            allocated[idx] += added
+            remaining -= added
+            if remaining == 0:
+                break
+    elif target_budget < current_budget:
+        remaining = current_budget - target_budget
+        for idx in priority[::-1]:
+            removed = min(remaining, int(allocated[idx]))
+            allocated[idx] -= removed
+            remaining -= removed
+            if remaining == 0:
+                break
+
+    if int(allocated.sum()) != target_budget:
+        raise AssertionError(
+            "sticky replay allocation did not reach target budget: "
+            f"target={target_budget}, actual={int(allocated.sum())}."
+        )
+    return allocated
+
+
 @dataclass
 class StaticReplayPlanProvider:
     io_prefix_blocks: list[int]
@@ -680,6 +741,18 @@ class FeedbackReplayPlanProvider:
     _imbalance_decode_only: list[float] = field(init=False, default_factory=list)
     _imbalance_has_prefill: list[float] = field(init=False, default_factory=list)
     _current_step_is_decode_only: bool = field(init=False, default=True)
+    # Cross-step allocation policy.  The materialized LayerReplayPlan is never
+    # reused because its slot mapping and token metadata are step-specific.
+    # Instead, remember the previous step's final target allocation by request
+    # id and project it onto the next batch.
+    _current_step_req_ids: tuple[str, ...] = field(init=False, default=())
+    _current_step_seed_allocations: np.ndarray = field(
+        init=False,
+        default_factory=lambda: np.zeros(0, dtype=np.int32),
+    )
+    _last_step_allocation_by_req_id: dict[str, int] = field(
+        init=False, default_factory=dict
+    )
 
     def __post_init__(self) -> None:
         self.static_provider = StaticReplayPlanProvider(
@@ -701,12 +774,52 @@ class FeedbackReplayPlanProvider:
             return float(self._sm_controller.config.deadband_ms)
         return float(self.deadband_ms)
 
+    def _snapshot_current_step_allocation(self) -> None:
+        """Save the previous step's final controller target by request id."""
+        if (
+            self.current_step_summary is None
+            or self.dry_run
+        ):
+            return
+        replayable = self.current_step_summary.replayable_blocks_per_req
+        allocated = _resize_allocation_from_seed(
+            seed_allocated_blocks_per_req=self._current_step_seed_allocations,
+            budget_blocks=self.controller_state.global_budget_blocks,
+            replayable_blocks_per_req=replayable,
+        )
+        if len(self._current_step_req_ids) != len(allocated):
+            raise AssertionError(
+                "request ids and final replay allocation have different lengths: "
+                f"{len(self._current_step_req_ids)} and {len(allocated)}."
+            )
+        self._last_step_allocation_by_req_id = {
+            req_id: int(allocated[req_idx])
+            for req_idx, req_id in enumerate(self._current_step_req_ids)
+        }
+
+    def _reset_feedback_causality_after_batch_change(self) -> None:
+        """Drop feedback history that cannot cross a membership change.
+
+        The projected allocation remains the new operating point.  Only the
+        secant/probe history is cleared so request churn is not mistaken for a
+        response to a controller budget change.
+        """
+        cs = self.controller_state
+        cs.estimated_local_gain = None
+        cs.last_budget_blocks = None
+        cs.last_imbalance_ms = None
+        cs.probe_state = FeedbackPlannerProbeState()
+        cs.reinit_generation += 1
+        if self._sm_controller is not None:
+            self._sm_controller.reset()
+
     def begin_step(self, **metadata: Any) -> None:
         # Step-boundary metadata is still owned by LayerRecomputeManager.
         # The planner only derives compact summaries from it and stores the
         # cross-step controller state that later steps will evolve.
         _nvtx.range_push("feedback:begin_step")
         self.begin_step_count += 1
+        self._snapshot_current_step_allocation()
         req_ids = tuple(str(req_id) for req_id in metadata.get("req_ids", ()))
         computed_lens = _coerce_int32_array(
             "computed_lens",
@@ -726,6 +839,15 @@ class FeedbackReplayPlanProvider:
             raise ValueError(
                 "FeedbackReplayPlanProvider.begin_step requires block_size."
             )
+        if len(req_ids) != len(computed_lens):
+            _nvtx.range_pop()
+            raise ValueError(
+                "req_ids and computed_lens must have the same length, got "
+                f"{len(req_ids)} and {len(computed_lens)}."
+            )
+        if len(set(req_ids)) != len(req_ids):
+            _nvtx.range_pop()
+            raise ValueError("FeedbackReplayPlanProvider requires unique req_ids.")
 
         # Phase detection: decode-only if all requests have computed_lens > 0
         num_reqs = len(computed_lens)
@@ -762,11 +884,34 @@ class FeedbackReplayPlanProvider:
         if not self._budget_seeded and total_replayable_blocks > 0:
             cs.global_budget_blocks = total_replayable_blocks
             self._budget_seeded = True
+            step_seed_allocations = replayable_blocks_per_req.copy()
+        elif self._last_step_allocation_by_req_id and not self.dry_run:
+            previous_req_ids = set(self._last_step_allocation_by_req_id)
+            current_req_ids = set(req_ids)
+            step_seed_allocations = np.asarray(
+                [
+                    min(
+                        self._last_step_allocation_by_req_id.get(req_id, 0),
+                        int(replayable_blocks_per_req[req_idx]),
+                    )
+                    for req_idx, req_id in enumerate(req_ids)
+                ],
+                dtype=np.int32,
+            )
+            cs.global_budget_blocks = int(step_seed_allocations.sum())
+            if previous_req_ids != current_req_ids:
+                self._reset_feedback_causality_after_batch_change()
         else:
             cs.global_budget_blocks = max(
                 0, min(cs.global_budget_blocks, total_replayable_blocks)
             )
+            step_seed_allocations = _allocate_budget_to_requests(
+                budget_blocks=cs.global_budget_blocks,
+                replayable_blocks_per_req=replayable_blocks_per_req,
+            )
 
+        self._current_step_req_ids = req_ids
+        self._current_step_seed_allocations = step_seed_allocations
         self._budget_history.append(cs.global_budget_blocks)
         self.last_feedback_by_layer.clear()
         self._layer_controller_updates.clear()
@@ -1014,6 +1159,12 @@ class FeedbackReplayPlanProvider:
                 ),
             },
             "current_step_summary": step_summary,
+            "current_step_seed_allocations": (
+                self._current_step_seed_allocations.tolist()
+            ),
+            "last_step_allocation_by_req_id": dict(
+                self._last_step_allocation_by_req_id
+            ),
             "last_feedback_by_layer": dict(self.last_feedback_by_layer),
             "layer_controller_updates": {
                 layer_idx: update.to_dict()
@@ -1047,10 +1198,13 @@ class FeedbackReplayPlanProvider:
             )
 
         # --- Budget-based per-request allocation (Step 9) ---
-        # Use the short-request-first greedy allocator to distribute the
-        # controller's global budget across requests in the current batch.
+        # Start from the previous step's surviving-request allocation.  An
+        # unchanged budget preserves it exactly; layer feedback adjusts only
+        # the budget delta from that seed.
         replayable = self.current_step_summary.replayable_blocks_per_req[:num_reqs]
-        allocated = _allocate_budget_to_requests(
+        seed_allocated = self._current_step_seed_allocations[:num_reqs]
+        allocated = _resize_allocation_from_seed(
+            seed_allocated_blocks_per_req=seed_allocated,
             budget_blocks=self.controller_state.global_budget_blocks,
             replayable_blocks_per_req=replayable,
         )
