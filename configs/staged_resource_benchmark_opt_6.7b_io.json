@@ -1,0 +1,56 @@
+{
+  "log_root": "exp_results/logs/staged_resource_benchmark_batch",
+  "defaults": {
+    "model": "/data/models/opt-6.7b-8k",
+    "tightllm_profile": "exp_results/tightllm_profiles/ubuntu/opt-6.7b-8k.json",
+    "prefix_blocks": 10000000,
+    "cpu_memory_gb": 47.9,
+    "cpu_memory_fraction": 0.8,
+    "gpu_memory_utilization": 0.7,
+    "gpu_memory_fraction": 0.9,
+    "num_device_buffers": 3,
+    "repeats": 1,
+    "resource_pressure_kind": "io",
+    "resource_pressure_clock": "step",
+    "resource_pressure_pattern": "0:24,16:12,32:8",
+    "resource_pattern_name": "io_pcie12_step",
+    "resource_pressure_mode": "process",
+    "resource_pressure_device": "cuda:0",
+    "resource_pressure_direction": "h2d",
+    "resource_pressure_buffer_mb": 256,
+    "resource_pressure_io_max_gbps": 24.0,
+    "enable_nsys": true,
+    "enable_nvtx": true,
+    "enable_profile": true,
+    "enable_prehook_timing": true,
+    "skip_sqlite_export": false,
+    "skip_stage_analysis": false,
+    "skip_per_layer_analysis": false
+  },
+  "tests": [
+    {
+      "name": "opt6.7b-bs32-p1k-d128",
+      "batch_size": 32,
+      "prompt_length": 1000,
+      "decode_length": 128
+    },
+    {
+      "name": "opt6.7b-bs32-p2k-d64",
+      "batch_size": 32,
+      "prompt_length": 2000,
+      "decode_length": 64
+    },
+    {
+      "name": "opt6.7b-bs32-p4k-d32",
+      "batch_size": 32,
+      "prompt_length": 4000,
+      "decode_length": 32
+    },
+    {
+      "name": "opt6.7b-bs16-p8k-d32",
+      "batch_size": 16,
+      "prompt_length": 8000,
+      "decode_length": 32
+    }
+  ]
+}
