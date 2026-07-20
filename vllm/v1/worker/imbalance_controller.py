@@ -409,6 +409,22 @@ class ImbalanceController:
             self.tracking_settle_count += 1
         else:
             self.tracking_settle_count = 0
+
+        # If this observation is the response to a probe, retain the measured
+        # gain even when the response has already landed in the deadband.  The
+        # feedback sample remains useful; only the next budget actuation is
+        # suppressed below.
+        if self._pending_probe_delta != 0:
+            if self._probe_pre_imbalance is not None:
+                g = (y - self._probe_pre_imbalance) / float(
+                    self._pending_probe_delta
+                )
+                if abs(g) > 1e-9 and (g < 0 if cfg.gain_sign < 0 else g > 0):
+                    self.gain = g
+            self._pending_probe_delta = 0
+            self._probe_pre_imbalance = None
+            self._probe_pre_budget = None
+
         if self.tracking_settle_count >= cfg.tracking_settle_layers:
             # Converged — adopt current window mean as new baseline.
             self.baseline_ewma = _safe_mean(self._window) or y
@@ -433,19 +449,15 @@ class ImbalanceController:
             self._reset_tracking_step_cap()
             return 0
 
-        # If we just completed a probe, compute measured gain from the
-        # probe pair before doing a Newton step.
-        if self._pending_probe_delta != 0:
-            if (
-                self._probe_pre_imbalance is not None
-                and self._pending_probe_delta != 0
-            ):
-                g = (y - self._probe_pre_imbalance) / float(self._pending_probe_delta)
-                if abs(g) > 1e-9 and (g < 0 if cfg.gain_sign < 0 else g > 0):
-                    self.gain = g
-            self._pending_probe_delta = 0
-            self._probe_pre_imbalance = None
-            self._probe_pre_budget = None
+        # The deadband is an actuation-free region.  Keep observing every
+        # layer (and retain an in-flight probe measurement above), but freeze
+        # the replay budget while confirming convergence.  Previously the
+        # first ``tracking_settle_layers - 1`` samples in the deadband still
+        # fell through to the Newton update below.  A noisy residual close to
+        # zero could therefore produce alternating, sometimes cap-sized,
+        # budget changes before the controller finally returned to STEADY.
+        if in_deadband:
+            return 0
 
         # Refresh gain from RLS pool if we have enough samples.
         g_rls = self._ols_gain()
@@ -463,9 +475,7 @@ class ImbalanceController:
         raw = -y / self.gain
         damped = cfg.tracking_damping * raw
         correction_direction = 1 if damped > 0 else (-1 if damped < 0 else 0)
-        step_cap = self._tracking_step_cap_blocks
-        if not in_deadband:
-            step_cap = self._prepare_tracking_step_cap(correction_direction)
+        step_cap = self._prepare_tracking_step_cap(correction_direction)
         clipped = max(-step_cap, min(step_cap, damped))
         saturated = abs(damped) >= float(step_cap)
         self._record_tracking_cap_result(

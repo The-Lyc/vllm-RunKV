@@ -162,7 +162,7 @@ STEADY 期间的 ±1 block proportional 微调其实也携带 gain 信息。可�
 
 两种退出路径：
 
-- **正常收敛**：连续 `tracking_settle_layers`（=3）层的 `|imbalance| < deadband`，说明 budget 已经调到新最优。`baseline_ewma = window_mean`，回 STEADY。
+- **正常收敛**：连续 `tracking_settle_layers`（=3）层的 `|imbalance| < deadband`，说明 budget 已经调到新最优。确认期间继续逐层采样（包括消费尚未完成的 probe 测量），但冻结 budget、强制输出 `Δbudget=0`；达到阈值后令 `baseline_ewma = window_mean`，回 STEADY。
 - **硬超时**：TRACKING 停留超过 `tracking_timeout_layers`（=20）层仍未稳定，强制回 STEADY。用作失败保险，避免陷在 TRACKING 里无限消耗大步长。
 
 ## 7. 判据与参数
@@ -307,9 +307,9 @@ Speculative plan building（post_hook 提交 spec(L+2)，pre_hook pop 并组装�
 - **TRANSIT**（冻结） → Δ=0 → `unchanged`
 - **TRACKING 的 probe 步** → |Δ|=probe_size=2 → `significant_delta`
 - **TRACKING 正常步** → 根据 Newton step 幅度决定
-- **TRACKING 收敛阶段**（`|imbalance| < deadband`） → Newton step 自然算出 Δ≈0 → `unchanged`
+- **TRACKING 收敛阶段**（`|imbalance| < deadband`） → deadband 显式禁止 actuation，强制 Δ=0 → `unchanged`
 
-最后这条尤其重要：**TRACKING 正式退出条件是连续 `tracking_settle_layers` 层 `|imbalance| < deadband`**，但在那几层里 Newton step 本身就会产出 Δ=0（因为 residual 在死区里）。用 Δ 驱动 hint 意味着这几层**自动走 stable successor 分支**，省掉 hidden states H2D，不会再白白消耗 speculative build 的产物。这解决了"imbalance 已经降到 deadband 还用 spec 是浪费"的问题。
+最后这条尤其重要：**TRACKING 正式退出条件是连续 `tracking_settle_layers` 层 `|imbalance| < deadband`**。这几层仍保留实时反馈采样，用于确认系统确实稳定；但不再把接近 0 的噪声除以不稳定的 gain 后继续执行 Newton 微调，而是明确冻结 budget。用 Δ 驱动 hint 意味着这些层**自动走 stable successor 分支**，避免无意义的 allocation 抖动、hidden states CPU-fill 和 speculative plan 消耗。这解决了“已经进入 deadband，却在正式退出 TRACKING 前继续微调”的问题。
 
 这套判据比旧版 `last_observed_stable()` 更强的原因：
 - 旧版基于连续 deadband 计数，是行为启发式，没有明确物理含义。而且旧实现里是尝试**直接复用 plan(L) 作为 plan(L+1)**，这在层间 `replay_token_count` 对不上时会触发 `Expected N replay tokens but assembled M` 的 assertion（session 早期踩过的 bug）。新设计不做 plan 复用，而是**重建一个 cpu_fill=0 的新 plan**，从源头上避开了 token 数对不齐的风险
