@@ -25,7 +25,9 @@
     "enable_prehook_timing": true,
     "skip_sqlite_export": false,
     "skip_stage_analysis": false,
-    "skip_per_layer_analysis": false
+    "skip_per_layer_analysis": false,
+    "runkv_replay_allocation_policy": "concentrate",
+    "tightllm_replay_allocation_policy": "spread"
   },
   "tests": [
     {

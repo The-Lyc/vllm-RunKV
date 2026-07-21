@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 PIPELINE = ROOT / "scripts/run_benchmark_pipeline.py"
 DEFAULT_LOG_ROOT = ROOT / "exp_results/logs/benchmark_batch"
 H2D_COPY_MODES = ("segment", "gather")
+REPLAY_ALLOCATION_POLICIES = ("spread", "concentrate")
+TIGHTLLM_ALLOCATION_POLICIES = ("concentrate", "spread")
 
 REQUIRED_FIELDS = (
     "model",
@@ -63,6 +65,22 @@ def _load_settings(config_path: Path) -> tuple[dict[str, Any], list[dict[str, An
                     f"tests[{index}].{key} must be one of: {choices}; got {mode!r}"
                 )
             setting[key] = mode
+        policy = setting.get("runkv_replay_allocation_policy", "spread")
+        if policy not in REPLAY_ALLOCATION_POLICIES:
+            choices = ", ".join(REPLAY_ALLOCATION_POLICIES)
+            raise ValueError(
+                f"tests[{index}].runkv_replay_allocation_policy must be one "
+                f"of: {choices}; got {policy!r}"
+            )
+        setting["runkv_replay_allocation_policy"] = policy
+        tl_policy = setting.get("tightllm_replay_allocation_policy", "concentrate")
+        if tl_policy not in TIGHTLLM_ALLOCATION_POLICIES:
+            choices = ", ".join(TIGHTLLM_ALLOCATION_POLICIES)
+            raise ValueError(
+                f"tests[{index}].tightllm_replay_allocation_policy must be "
+                f"one of: {choices}; got {tl_policy!r}"
+            )
+        setting["tightllm_replay_allocation_policy"] = tl_policy
         settings.append(setting)
     return config, settings
 
@@ -70,22 +88,34 @@ def _load_settings(config_path: Path) -> tuple[dict[str, Any], list[dict[str, An
 def _run_tag(setting: dict[str, Any], index: int, timestamp: str) -> str:
     model = Path(str(setting["model"])).name
     name = setting.get("name", f"case{index:03d}")
-    return "_".join(
-        [
-            timestamp,
-            f"j{index:03d}",
-            _sanitize(name),
-            _sanitize(model),
-            f"cpu{_tag_number(setting['cpu_memory_gb'])}",
-            f"gu{_tag_number(setting['gpu_memory_utilization'])}",
-            f"gf{_tag_number(setting['gpu_memory_fraction'])}",
-            f"rkcopy-{_sanitize(setting['runkv_h2d_copy_mode'])}",
-            f"tlcopy-{_sanitize(setting['tightllm_h2d_copy_mode'])}",
-            f"bs{_sanitize(setting['batch_size'])}",
-            f"p{_sanitize(setting['prompt_length'])}",
-            f"d{_sanitize(setting['decode_length'])}",
-        ]
-    )
+    parts = [
+        timestamp,
+        f"j{index:03d}",
+        _sanitize(name),
+        _sanitize(model),
+        f"cpu{_tag_number(setting['cpu_memory_gb'])}",
+        f"gu{_tag_number(setting['gpu_memory_utilization'])}",
+        f"gf{_tag_number(setting['gpu_memory_fraction'])}",
+        f"rkcopy-{_sanitize(setting['runkv_h2d_copy_mode'])}",
+        f"tlcopy-{_sanitize(setting['tightllm_h2d_copy_mode'])}",
+        f"bs{_sanitize(setting['batch_size'])}",
+        f"p{_sanitize(setting['prompt_length'])}",
+        f"d{_sanitize(setting['decode_length'])}",
+    ]
+    # Keep legacy tags byte-identical for the default policy.
+    if setting["runkv_replay_allocation_policy"] != "spread":
+        parts.insert(
+            8, f"rkalloc-{_sanitize(setting['runkv_replay_allocation_policy'])}"
+        )
+    if setting["tightllm_replay_allocation_policy"] != "concentrate":
+        tl_idx = (
+            parts.index(f"tlcopy-{_sanitize(setting['tightllm_h2d_copy_mode'])}") + 1
+        )
+        parts.insert(
+            tl_idx,
+            f"tlalloc-{_sanitize(setting['tightllm_replay_allocation_policy'])}",
+        )
+    return "_".join(parts)
 
 
 def _command(setting: dict[str, Any], run_tag: str) -> list[str]:
@@ -122,8 +152,12 @@ def _command(setting: dict[str, Any], run_tag: str) -> list[str]:
         str(setting.get("num_device_buffers", 3)),
         "--runkv-h2d-copy-mode",
         str(setting["runkv_h2d_copy_mode"]),
+        "--runkv-replay-allocation-policy",
+        str(setting["runkv_replay_allocation_policy"]),
         "--tightllm-h2d-copy-mode",
         str(setting["tightllm_h2d_copy_mode"]),
+        "--tightllm-replay-allocation-policy",
+        str(setting["tightllm_replay_allocation_policy"]),
         "--tightllm-profile-path",
         str(profile),
     ]

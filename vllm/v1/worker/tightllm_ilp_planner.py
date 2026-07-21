@@ -46,6 +46,7 @@ from vllm.v1.profiling.tightllm_offline_profiler import TightLLMProfileData
 from vllm.v1.worker.opt_dynamic_replay import (
     LayerReplayPlan,
     StaticReplayPlanProvider,
+    _allocate_budget_spread_to_requests,
     _allocate_budget_to_requests,
     _coerce_int32_array,
     compute_layer_replay_plan_for_layer,
@@ -249,6 +250,15 @@ class TightLLMReplayPlanProvider:
     feedback_correction_gain: float = 0.15  # blocks per ms of imbalance
     feedback_correction_max: int = 4  # max |correction| in blocks
 
+    # Per-request budget distribution policy (experimental contrast knob).
+    # "concentrate" (default): native short-request-first greedy that fills
+    # requests fully, producing an all-or-nothing shape.
+    # "spread": capacity-proportional allocation that equalises the replay
+    # ratio across requests, mimicking the shape RunKV's sticky "spread"
+    # policy converges to under batch churn.  Only for A/B experiments;
+    # leave at the default to preserve baseline semantics.
+    allocation_policy: str = "concentrate"
+
     # Fallback static provider (used when no replayable blocks)
     static_provider: StaticReplayPlanProvider = field(init=False)
 
@@ -275,6 +285,11 @@ class TightLLMReplayPlanProvider:
     _budget_history: list[int] = field(init=False, default_factory=list)
 
     def __post_init__(self) -> None:
+        if self.allocation_policy not in ("concentrate", "spread"):
+            raise ValueError(
+                "allocation_policy must be 'concentrate' or 'spread', "
+                f"got {self.allocation_policy!r}."
+            )
         self.static_provider = StaticReplayPlanProvider(
             io_prefix_blocks=list(self.io_prefix_blocks)
         )
@@ -450,10 +465,16 @@ class TightLLMReplayPlanProvider:
 
         # Distribute ILP-optimal budget across requests
         replayable = self._current_replayable_per_req[:num_reqs]
-        allocated = _allocate_budget_to_requests(
-            budget_blocks=self._current_budget_blocks,
-            replayable_blocks_per_req=replayable,
-        )
+        if self.allocation_policy == "spread":
+            allocated = _allocate_budget_spread_to_requests(
+                budget_blocks=self._current_budget_blocks,
+                replayable_blocks_per_req=replayable,
+            )
+        else:
+            allocated = _allocate_budget_to_requests(
+                budget_blocks=self._current_budget_blocks,
+                replayable_blocks_per_req=replayable,
+            )
 
         # Convert to per-request replay start tokens
         computed_lens_i32 = _coerce_int32_array("computed_lens", computed_lens)
@@ -532,6 +553,7 @@ class TightLLMReplayPlanProvider:
     def get_debug_snapshot(self) -> dict[str, Any]:
         return {
             "provider": "TightLLMReplayPlanProvider",
+            "allocation_policy": self.allocation_policy,
             "step_count": self._step_count,
             "ilp_budget_blocks": self._ilp_budget_blocks,
             "feedback_correction_blocks": self._feedback_correction_blocks,

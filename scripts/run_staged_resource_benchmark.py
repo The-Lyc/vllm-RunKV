@@ -358,6 +358,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run TightLLM with additive feedback correction ablation.",
     )
+    test.add_argument(
+        "--runkv-replay-allocation-policy",
+        choices=("spread", "concentrate"),
+        default="spread",
+        help=(
+            "Per-request replay budget redistribution policy for the RunKV "
+            "feedback planner. 'spread' is the legacy behaviour; "
+            "'concentrate' keeps replay concentrated on few requests."
+        ),
+    )
+    test.add_argument(
+        "--tightllm-replay-allocation-policy",
+        choices=("concentrate", "spread"),
+        default="concentrate",
+        help=(
+            "Per-request budget distribution for the TightLLM planner. "
+            "'concentrate' is the native greedy baseline; 'spread' "
+            "equalises the replay ratio across requests (experimental "
+            "contrast knob)."
+        ),
+    )
 
     pressure = parser.add_argument_group("Resource pressure")
     pressure.add_argument("--resource-pressure-kind", choices=["io", "sm"], default="io")
@@ -859,7 +880,12 @@ def main() -> None:
                 pattern_name=pattern_name,
                 repeat_idx=repeat_idx,
                 system_dir_name="runkv_feedback",
-                extra_env={"PLANNER": "feedback", "DRY_RUN": "0", "USE_STATE_MACHINE": "1"},
+                extra_env={
+                    "PLANNER": "feedback",
+                    "DRY_RUN": "0",
+                    "USE_STATE_MACHINE": "1",
+                    "REPLAY_ALLOCATION_POLICY": args.runkv_replay_allocation_policy,
+                },
             )
             pipeline_manifest["runs"].append(result)
             runkv_results.append(result)
@@ -872,6 +898,9 @@ def main() -> None:
             tightllm_extra_env = {
                 "TIGHTLLM_PROFILE_PATH": args.tightllm_profile_path,
                 "TIGHTLLM_FEEDBACK_CORRECTION": "1" if args.tightllm_feedback_correction else "0",
+                "TIGHTLLM_REPLAY_ALLOCATION_POLICY": (
+                    args.tightllm_replay_allocation_policy
+                ),
             }
             result = _run_system(
                 system=(

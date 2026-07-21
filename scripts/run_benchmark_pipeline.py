@@ -114,6 +114,13 @@ def _default_run_tag(args: argparse.Namespace) -> str:
         f"p{_compact_tag_value(args.prompt_words)}",
         f"d{_compact_tag_value(args.max_tokens)}",
     ]
+    # Keep legacy tags byte-identical for the default policy so existing
+    # tooling that matches directory names is unaffected.
+    if args.runkv_replay_allocation_policy != "spread":
+        parts.insert(6, f"rkalloc-{args.runkv_replay_allocation_policy}")
+    if args.tightllm_replay_allocation_policy != "concentrate":
+        tl_idx = parts.index(f"tlcopy-{args.tightllm_h2d_copy_mode}") + 1
+        parts.insert(tl_idx, f"tlalloc-{args.tightllm_replay_allocation_policy}")
     return "_".join(parts)
 
 
@@ -274,10 +281,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="KV H2D copy implementation for the RunKV benchmark step.",
     )
     test.add_argument(
+        "--runkv-replay-allocation-policy",
+        choices=("spread", "concentrate"),
+        default="spread",
+        help=(
+            "Per-request replay budget redistribution policy for the RunKV "
+            "feedback planner. 'spread' is the legacy behaviour; "
+            "'concentrate' keeps replay concentrated on few requests."
+        ),
+    )
+    test.add_argument(
         "--tightllm-h2d-copy-mode",
         choices=("segment", "gather"),
         default="segment",
         help="KV H2D copy implementation for the TightLLM benchmark step.",
+    )
+    test.add_argument(
+        "--tightllm-replay-allocation-policy",
+        choices=("concentrate", "spread"),
+        default="concentrate",
+        help=(
+            "Per-request budget distribution for the TightLLM planner. "
+            "'concentrate' is the native greedy baseline; 'spread' "
+            "equalises the replay ratio across requests (experimental "
+            "contrast knob)."
+        ),
     )
     test.add_argument(
         "--max-num-seqs",
@@ -407,6 +435,7 @@ def main() -> None:
         runkv_env["DRY_RUN"] = "0"
         runkv_env["USE_STATE_MACHINE"] = "1"
         runkv_env["H2D_COPY_MODE"] = args.runkv_h2d_copy_mode
+        runkv_env["REPLAY_ALLOCATION_POLICY"] = args.runkv_replay_allocation_policy
         rc = _run_step(
             "RunKV feedback observation",
             [sys.executable, str(RUNKV_SCRIPT)],
@@ -424,6 +453,9 @@ def main() -> None:
         tightllm_env["OUTPUT_DIR"] = str(TIGHTLLM_OUTPUT_DIR)
         tightllm_env["TIGHTLLM_PROFILE_PATH"] = tightllm_profile_path
         tightllm_env["H2D_COPY_MODE"] = args.tightllm_h2d_copy_mode
+        tightllm_env["TIGHTLLM_REPLAY_ALLOCATION_POLICY"] = (
+            args.tightllm_replay_allocation_policy
+        )
         rc = _run_step(
             "TightLLM ILP planner observation",
             [sys.executable, str(TIGHTLLM_SCRIPT)],

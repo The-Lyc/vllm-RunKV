@@ -107,6 +107,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--replay-allocation-policy",
+        choices=["spread", "concentrate"],
+        default="spread",
+        help=(
+            "Per-request replay budget redistribution policy for the "
+            "feedback planner. 'spread' (legacy) equalises allocations "
+            "under batch churn; 'concentrate' keeps replay concentrated "
+            "on few requests to minimise attention FLOPs."
+        ),
+    )
+    parser.add_argument(
         "--no-async-plan-build",
         action="store_true",
         help=(
@@ -129,6 +140,17 @@ def parse_args() -> argparse.Namespace:
         "--tightllm-feedback-correction",
         action="store_true",
         help="Enable additive feedback correction on top of TightLLM ILP prediction.",
+    )
+    parser.add_argument(
+        "--tightllm-replay-allocation-policy",
+        choices=["concentrate", "spread"],
+        default="concentrate",
+        help=(
+            "Per-request budget distribution for the TightLLM planner. "
+            "'concentrate' (default) is the native short-request-first "
+            "greedy; 'spread' equalises the replay ratio across requests "
+            "(experimental contrast)."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -360,8 +382,10 @@ def make_kv_offload_config(
     async_plan_build: bool = True,
     h2d_copy_mode: str = "segment",
     use_state_machine: bool = False,
+    replay_allocation_policy: str = "spread",
     tightllm_profile_path: str | None = None,
     tightllm_feedback_correction: bool = False,
+    tightllm_replay_allocation_policy: str = "concentrate",
 ) -> dict:
     cpu_memory_limit = (
         int(cpu_memory_gb * 1024**3) if cpu_memory_gb > 0 else None
@@ -387,6 +411,7 @@ def make_kv_offload_config(
         config["layer_recompute_async_plan_build"] = async_plan_build
         config["h2d_copy_mode"] = h2d_copy_mode
         config["layer_recompute_use_state_machine"] = use_state_machine
+        config["layer_recompute_replay_allocation_policy"] = replay_allocation_policy
         if planner == "tightllm":
             if not tightllm_profile_path:
                 raise ValueError(
@@ -394,6 +419,9 @@ def make_kv_offload_config(
                 )
             config["tightllm_profile_path"] = tightllm_profile_path
             config["tightllm_enable_feedback_correction"] = tightllm_feedback_correction
+            config["tightllm_replay_allocation_policy"] = (
+                tightllm_replay_allocation_policy
+            )
     return config
 
 
@@ -712,8 +740,12 @@ def main() -> None:
                         async_plan_build=not args.no_async_plan_build,
                         h2d_copy_mode=args.h2d_copy_mode,
                         use_state_machine=args.use_state_machine,
+                        replay_allocation_policy=args.replay_allocation_policy,
                         tightllm_profile_path=args.tightllm_profile_path,
                         tightllm_feedback_correction=args.tightllm_feedback_correction,
+                        tightllm_replay_allocation_policy=(
+                            args.tightllm_replay_allocation_policy
+                        ),
                     ),
                     enable_opt_component_mfu_profiling=mfu_profiler_enabled,
                     opt_component_mfu_output_path=_mfu_out,

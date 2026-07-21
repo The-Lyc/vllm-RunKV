@@ -73,6 +73,14 @@ def main() -> None:
     tightllm_feedback_correction = (
         os.environ.get("TIGHTLLM_FEEDBACK_CORRECTION", "0") == "1"
     )
+    tightllm_replay_allocation_policy = os.environ.get(
+        "TIGHTLLM_REPLAY_ALLOCATION_POLICY", "concentrate"
+    )
+    if tightllm_replay_allocation_policy not in ("concentrate", "spread"):
+        raise ValueError(
+            "Unsupported TIGHTLLM_REPLAY_ALLOCATION_POLICY: "
+            f"{tightllm_replay_allocation_policy!r}"
+        )
     prefix_blocks = os.environ.get("PREFIX_BLOCKS", "1000")
     num_prompts = os.environ.get("NUM_PROMPTS", "32")
     prompt_words = os.environ.get("PROMPT_WORDS", "4000")
@@ -158,6 +166,8 @@ def main() -> None:
         "tightllm",
         "--tightllm-profile-path",
         tightllm_profile_path,
+        "--tightllm-replay-allocation-policy",
+        tightllm_replay_allocation_policy,
         "--output-dir",
         output_dir,
         "--run-tag",
@@ -190,6 +200,7 @@ def main() -> None:
     print("  planner:            tightllm")
     print(f"  profile:            {tightllm_profile_path}")
     print(f"  feedback_correction:{int(tightllm_feedback_correction)}")
+    print(f"  replay_allocation_policy: {tightllm_replay_allocation_policy}")
     print(f"  opt_component_mfu:  {int(enable_opt_component_mfu)}")
     print(f"  nvtx_scopes:        {int(enable_nvtx)}")
     print(f"  layerwise_nvtx:     {int(enable_layerwise_nvtx)}")
@@ -276,6 +287,7 @@ def main() -> None:
             "cpu_memory_gb": cpu_memory_gb or None,
             "cpu_memory_fraction": cpu_memory_fraction or None,
             "planner": "tightllm",
+            "tightllm_replay_allocation_policy": tightllm_replay_allocation_policy,
             "model": model,
             "nsys_report": str(Path(nsys_stem + ".nsys-rep").resolve())
             if enable_nsys

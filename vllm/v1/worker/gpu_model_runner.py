@@ -8876,6 +8876,13 @@ class GPUModelRunner(
                         False,
                     )
                 ),
+                allocation_policy=str(
+                    getattr(
+                        self.kv_offload_config,
+                        "layer_recompute_replay_allocation_policy",
+                        "spread",
+                    )
+                ),
             )
         elif planner_mode == "tightllm":
             profile_path = getattr(
@@ -8899,6 +8906,13 @@ class GPUModelRunner(
                         self.kv_offload_config,
                         "tightllm_enable_feedback_correction",
                         False,
+                    )
+                ),
+                allocation_policy=str(
+                    getattr(
+                        self.kv_offload_config,
+                        "tightllm_replay_allocation_policy",
+                        "concentrate",
                     )
                 ),
             )

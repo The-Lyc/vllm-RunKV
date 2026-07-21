@@ -585,24 +585,85 @@ def _allocate_budget_to_requests(
     return allocated
 
 
+def _allocate_budget_spread_to_requests(
+    budget_blocks: int,
+    replayable_blocks_per_req: np.ndarray,
+) -> np.ndarray:
+    """Capacity-proportional (spread) budget allocator.
+
+    Distributes *budget_blocks* proportionally to each request's replayable
+    capacity, so every request receives roughly the same replay *ratio*.
+    This is the stateless equivalent of the shape the sticky "spread"
+    policy converges to under batch churn, and serves as an experimental
+    contrast to the concentrated short-request-first greedy.
+
+    Rounding uses the largest-remainder method with a stable tie-break by
+    request index, so the result is deterministic and sums exactly to
+    ``min(budget_blocks, total_replayable)``.
+    """
+    num_reqs = len(replayable_blocks_per_req)
+    allocated = np.zeros(num_reqs, dtype=np.int32)
+    replayable = replayable_blocks_per_req.astype(np.int64)
+    total = int(replayable.sum())
+    if budget_blocks <= 0 or num_reqs == 0 or total <= 0:
+        return allocated
+
+    budget = min(int(budget_blocks), total)
+    shares = replayable.astype(np.float64) * (budget / total)
+    base = np.floor(shares).astype(np.int64)
+    allocated[:] = base.astype(np.int32)
+    remainder = budget - int(base.sum())
+    if remainder > 0:
+        # Hand out leftover blocks by largest fractional share, skipping
+        # requests already at capacity; ties break by request index.
+        fractional = shares - base
+        order = np.lexsort((np.arange(num_reqs), -fractional))
+        for idx in order:
+            if remainder == 0:
+                break
+            if allocated[idx] < replayable[idx]:
+                allocated[idx] += 1
+                remainder -= 1
+    assert remainder >= 0 and int(allocated.sum()) == budget
+    return allocated
+
+
 def _resize_allocation_from_seed(
     *,
     seed_allocated_blocks_per_req: np.ndarray,
     budget_blocks: int,
     replayable_blocks_per_req: np.ndarray,
+    allocation_policy: str = "spread",
 ) -> np.ndarray:
     """Resize a sticky per-request allocation to ``budget_blocks``.
 
     The seed is the allocation projected from the previous model step.  When
     the target budget is unchanged, every surviving request keeps exactly its
-    previous allocation.  Feedback-driven budget increases fill remaining
-    capacity in the existing short-request-first order; decreases remove from
-    the reverse order so the allocator retains that preference without
-    needlessly reshuffling unaffected requests.
+    previous allocation regardless of policy.  Only the budget delta is
+    redistributed, according to ``allocation_policy``:
+
+    * ``"spread"`` (legacy): increases fill remaining capacity in
+      short-request-first order; decreases remove from the reverse order.
+      Under batch churn this gradually equalises allocations across
+      requests.
+    * ``"concentrate"``: keeps replay concentrated on as few requests as
+      possible.  The marginal attention cost of one extra replay block on
+      request *i* is proportional to its un-replayed prefix length
+      ``remaining_i = replayable_i - allocated_i`` (causal-suffix attention
+      cost is concave in the suffix length).  Increases therefore fill the
+      cheapest requests (smallest ``remaining``) to capacity first;
+      decreases drain the most expensive allocations (largest
+      ``remaining``) first.  At steady state this reproduces the
+      all-or-nothing shape of the short-request-first greedy allocator.
 
     This function is intentionally pure.  Dynamic plans may be built on the
     speculative builder thread, so allocation must not depend on call order.
     """
+    if allocation_policy not in ("spread", "concentrate"):
+        raise ValueError(
+            "allocation_policy must be 'spread' or 'concentrate', "
+            f"got {allocation_policy!r}."
+        )
     replayable = _coerce_int32_array(
         "replayable_blocks_per_req", replayable_blocks_per_req
     )
@@ -618,25 +679,60 @@ def _resize_allocation_from_seed(
     allocated = np.minimum(seed, replayable).astype(np.int32, copy=True)
     target_budget = max(0, min(int(budget_blocks), int(replayable.sum())))
     current_budget = int(allocated.sum())
-    priority = np.argsort(replayable, kind="stable")
 
-    if target_budget > current_budget:
-        remaining = target_budget - current_budget
-        for idx in priority:
-            capacity = int(replayable[idx] - allocated[idx])
-            added = min(remaining, capacity)
-            allocated[idx] += added
-            remaining -= added
-            if remaining == 0:
-                break
-    elif target_budget < current_budget:
-        remaining = current_budget - target_budget
-        for idx in priority[::-1]:
-            removed = min(remaining, int(allocated[idx]))
-            allocated[idx] -= removed
-            remaining -= removed
-            if remaining == 0:
-                break
+    if allocation_policy == "concentrate":
+        req_indices = np.arange(len(allocated))
+        remaining_capacity = (replayable - allocated).astype(np.int64)
+        if target_budget > current_budget:
+            # Cheapest blocks first: smallest remaining prefix, then
+            # shortest request, then request index (all ascending).
+            # Filling a request only shrinks its remaining prefix, so a
+            # single full-fill pass matches the block-by-block greedy.
+            order = np.lexsort(
+                (req_indices, replayable.astype(np.int64), remaining_capacity)
+            )
+            remaining = target_budget - current_budget
+            for idx in order:
+                added = min(remaining, int(remaining_capacity[idx]))
+                allocated[idx] += added
+                remaining -= added
+                if remaining == 0:
+                    break
+        elif target_budget < current_budget:
+            # Most expensive blocks first: largest remaining prefix, then
+            # longest request, then request index.  Draining a request
+            # only grows its remaining prefix, so a single full-drain
+            # pass matches the block-by-block greedy.
+            order = np.lexsort(
+                (req_indices, -replayable.astype(np.int64), -remaining_capacity)
+            )
+            remaining = current_budget - target_budget
+            for idx in order:
+                removed = min(remaining, int(allocated[idx]))
+                allocated[idx] -= removed
+                remaining -= removed
+                if remaining == 0:
+                    break
+    else:
+        priority = np.argsort(replayable, kind="stable")
+
+        if target_budget > current_budget:
+            remaining = target_budget - current_budget
+            for idx in priority:
+                capacity = int(replayable[idx] - allocated[idx])
+                added = min(remaining, capacity)
+                allocated[idx] += added
+                remaining -= added
+                if remaining == 0:
+                    break
+        elif target_budget < current_budget:
+            remaining = current_budget - target_budget
+            for idx in priority[::-1]:
+                removed = min(remaining, int(allocated[idx]))
+                allocated[idx] -= removed
+                remaining -= removed
+                if remaining == 0:
+                    break
 
     if int(allocated.sum()) != target_budget:
         raise AssertionError(
@@ -716,6 +812,13 @@ class FeedbackReplayPlanProvider:
     # use_state_machine is True, defaults from ImbalanceControllerConfig
     # are used.
     state_machine_config: ImbalanceControllerConfig | None = None
+    # Per-request budget redistribution policy used by
+    # _resize_allocation_from_seed.  "spread" (legacy) gradually equalises
+    # allocations across requests under batch churn; "concentrate" keeps
+    # replay concentrated on few requests (all-or-nothing shape) to
+    # minimise attention FLOPs at equal budget.  Sticky cross-step
+    # semantics (unchanged budget -> unchanged allocation) hold for both.
+    allocation_policy: str = "spread"
 
     static_provider: StaticReplayPlanProvider = field(init=False)
     controller_state: FeedbackPlannerControllerState = field(
@@ -761,6 +864,11 @@ class FeedbackReplayPlanProvider:
     )
 
     def __post_init__(self) -> None:
+        if self.allocation_policy not in ("spread", "concentrate"):
+            raise ValueError(
+                "allocation_policy must be 'spread' or 'concentrate', "
+                f"got {self.allocation_policy!r}."
+            )
         self.static_provider = StaticReplayPlanProvider(
             io_prefix_blocks=list(self.io_prefix_blocks)
         )
@@ -792,6 +900,7 @@ class FeedbackReplayPlanProvider:
             seed_allocated_blocks_per_req=self._current_step_seed_allocations,
             budget_blocks=self.controller_state.global_budget_blocks,
             replayable_blocks_per_req=replayable,
+            allocation_policy=self.allocation_policy,
         )
         if len(self._current_step_req_ids) != len(allocated):
             raise AssertionError(
@@ -1140,6 +1249,7 @@ class FeedbackReplayPlanProvider:
         return {
             "provider": type(self).__name__,
             "dry_run": self.dry_run,
+            "allocation_policy": self.allocation_policy,
             "begin_step_count": self.begin_step_count,
             "observe_feedback_count": self.observe_feedback_count,
             "controller_state": {
@@ -1218,6 +1328,7 @@ class FeedbackReplayPlanProvider:
             seed_allocated_blocks_per_req=seed_allocated,
             budget_blocks=self.controller_state.global_budget_blocks,
             replayable_blocks_per_req=replayable,
+            allocation_policy=self.allocation_policy,
         )
 
         # Convert per-request block allocation to per-request replay start

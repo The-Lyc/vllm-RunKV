@@ -82,6 +82,15 @@ class RunKVOffloadConfig:
     # derived from the runtime imbalance signal (compute vs DMA).
     tightllm_enable_feedback_correction: bool = False
 
+    # Per-request budget distribution policy for the TightLLM planner
+    # (experimental contrast knob).  "concentrate" (default) is the native
+    # short-request-first greedy; "spread" equalises the replay ratio
+    # across requests, mimicking RunKV's legacy spread shape.  Leave at
+    # the default to preserve baseline semantics.
+    tightllm_replay_allocation_policy: Literal["concentrate", "spread"] = (
+        "concentrate"
+    )
+
     # --- Feedback planner: state-machine controller ---
     # When True, FeedbackReplayPlanProvider uses the three-state
     # imbalance controller (STEADY / TRANSIT / TRACKING) described in
@@ -90,3 +99,15 @@ class RunKVOffloadConfig:
     # pre_hook switches from the `last_observed_stable()` heuristic to a
     # Δbudget-driven hint (unchanged / small_delta / significant_delta).
     layer_recompute_use_state_machine: bool = False
+
+    # --- Feedback planner: per-request budget redistribution policy ---
+    # "spread" (legacy): budget deltas fill remaining capacity in
+    # short-request-first order, which under batch churn gradually
+    # equalises replay allocations across requests.
+    # "concentrate": budget deltas keep replay concentrated on as few
+    # requests as possible (all-or-nothing shape), minimising attention
+    # FLOPs at equal replay budget.  Sticky cross-step semantics are
+    # identical for both policies.  Only affects the feedback planner.
+    layer_recompute_replay_allocation_policy: Literal["spread", "concentrate"] = (
+        "spread"
+    )

@@ -6,7 +6,9 @@
     "gpu_memory_utilization": 0.7,
     "num_device_buffers": 3,
     "runkv_h2d_copy_mode": "segment",
-    "tightllm_h2d_copy_mode": "gather",
+    "runkv_replay_allocation_policy": "concentrate",
+    "tightllm_h2d_copy_mode": "segment",
+    "tightllm_replay_allocation_policy": "spread",
     "max_num_seqs": null,
     "max_staging_blocks": null
   },
@@ -14,7 +16,7 @@
     {
       "name": "opt2.7b-bs32-p1k-d64",
       "model": "/data/models/opt-2.7b-8k",
-      "cpu_memory_gb": 40,
+      "cpu_memory_gb": 47.9,
       "gpu_memory_fraction": 0.9,
       "tightllm_profile": "exp_results/tightllm_profiles/ubuntu/opt-2.7b-8k.json",
       "batch_size": 32,
@@ -24,7 +26,7 @@
     {
       "name": "opt2.7b-bs32-p2k-d64",
       "model": "/data/models/opt-2.7b-8k",
-      "cpu_memory_gb": 40,
+      "cpu_memory_gb": 47.9,
       "gpu_memory_fraction": 0.9,
       "tightllm_profile": "exp_results/tightllm_profiles/ubuntu/opt-2.7b-8k.json",
       "batch_size": 32,

@@ -69,6 +69,8 @@ VALUE_OPTIONS = {
     "hardware_platform": "--hardware-platform",
     "tightllm_profile_root": "--tightllm-profile-root",
     "tightllm_profile_path": "--tightllm-profile-path",
+    "runkv_replay_allocation_policy": "--runkv-replay-allocation-policy",
+    "tightllm_replay_allocation_policy": "--tightllm-replay-allocation-policy",
     "resource_pressure_kind": "--resource-pressure-kind",
     "resource_pressure_clock": "--resource-pressure-clock",
     "resource_pressure_pattern": "--resource-pressure-pattern",

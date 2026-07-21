@@ -48,6 +48,11 @@ def main() -> None:
     planner = os.environ.get("PLANNER", "feedback")
     dry_run = os.environ.get("DRY_RUN", "1") == "1"
     use_state_machine = os.environ.get("USE_STATE_MACHINE", "0") == "1"
+    replay_allocation_policy = os.environ.get("REPLAY_ALLOCATION_POLICY", "spread")
+    if replay_allocation_policy not in ("spread", "concentrate"):
+        raise ValueError(
+            f"Unsupported REPLAY_ALLOCATION_POLICY: {replay_allocation_policy!r}"
+        )
     async_plan_build = os.environ.get("ASYNC_PLAN_BUILD", "1") == "1"
     h2d_copy_mode = os.environ.get("H2D_COPY_MODE", "segment")
     if h2d_copy_mode not in ("segment", "gather"):
@@ -132,6 +137,7 @@ def main() -> None:
         cmd.append("--planner-dry-run")
     if use_state_machine:
         cmd.append("--use-state-machine")
+    cmd.extend(["--replay-allocation-policy", replay_allocation_policy])
     if not async_plan_build:
         cmd.append("--no-async-plan-build")
     cmd.extend(["--h2d-copy-mode", h2d_copy_mode])
@@ -155,6 +161,7 @@ def main() -> None:
     print(f"  planner: {planner}")
     print(f"  planner_dry_run: {int(dry_run)}")
     print(f"  use_state_machine: {int(use_state_machine)}")
+    print(f"  replay_allocation_policy: {replay_allocation_policy}")
     print(f"  async_plan_build: {int(async_plan_build)}")
     print(f"  h2d_copy_mode: {h2d_copy_mode}")
     if planner == "tightllm":
@@ -236,6 +243,7 @@ def main() -> None:
             "layer_recompute_async_plan_build": async_plan_build,
             "h2d_copy_mode": h2d_copy_mode,
             "layer_recompute_use_state_machine": use_state_machine,
+            "layer_recompute_replay_allocation_policy": replay_allocation_policy,
             "model": model,
             "nsys_report": str(Path(nsys_stem + ".nsys-rep").resolve())
             if enable_nsys
