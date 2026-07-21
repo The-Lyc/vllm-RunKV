@@ -795,19 +795,38 @@ def extract_decode_only_step_stats(
     duration_s = sum(
         by_step[step][1] - by_step[step][0] for step in matched_steps
     ) / 1e9
+
+    def _step_tokens(step: int) -> int:
+        return int(
+            float(decode_steps[step].get("total_scheduled_tokens", 0) or 0)
+        )
+
+    # Steady subset: decode-only steps running at the maximum concurrent
+    # batch size.  Under chunked prefill, early-finishing requests decode
+    # inside mixed steps and the tail drains with a shrinking batch; only
+    # the full-batch steps reflect steady decode performance.
+    reqs_by_step = {
+        step: int(float(decode_steps[step].get("num_reqs", 0) or 0))
+        for step in matched_steps
+    }
+    max_reqs = max(reqs_by_step.values(), default=0)
+    steady_steps = [s for s in matched_steps if reqs_by_step[s] == max_reqs]
+    steady_duration_s = sum(
+        by_step[step][1] - by_step[step][0] for step in steady_steps
+    ) / 1e9
     return {
         "marker": marker,
         "step_count": len(matched_steps),
         "step_ranges": _step_ranges_text(matched_steps),
         "duration_s": duration_s,
         "scheduled_tokens": sum(
-            int(
-                float(
-                    decode_steps[step].get("total_scheduled_tokens", 0) or 0
-                )
-            )
-            for step in matched_steps
+            _step_tokens(step) for step in matched_steps
         ),
+        "steady_num_reqs": max_reqs,
+        "steady_step_count": len(steady_steps),
+        "steady_step_ranges": _step_ranges_text(steady_steps),
+        "steady_duration_s": steady_duration_s,
+        "steady_tokens": sum(_step_tokens(step) for step in steady_steps),
     }
 
 
@@ -859,7 +878,13 @@ def analyze_decode_throughput(
         "  Denominator: sum of decode-only model-step NVTX durations; "
         "mixed prefill/decode steps are excluded."
     )
+    rpt.row(
+        "  WARNING: with chunked prefill, decode tokens generated inside "
+        "mixed steps are counted by the configured budget but their time "
+        "is not; prefer the window-consistent metrics below."
+    )
     rows: list[list[Any]] = []
+    window_rows: list[list[Any]] = []
     for label, nvtx, flat in (
         ("RunKV", runkv_nvtx, runkv_flat),
         ("TightLLM", tightllm_nvtx, tightllm_flat),
@@ -867,6 +892,7 @@ def analyze_decode_throughput(
         stats = extract_decode_only_step_stats(nvtx, flat)
         if stats is None or stats["duration_s"] <= 0:
             rows.append([label, "N/A", "N/A", "N/A", "N/A"])
+            window_rows.append([label] + ["N/A"] * 7)
         else:
             seconds = float(stats["duration_s"])
             rows.append(
@@ -878,10 +904,56 @@ def analyze_decode_throughput(
                     f"{total_tokens / seconds:.3f}",
                 ]
             )
+            window_tokens = int(stats["scheduled_tokens"])
+            steady_seconds = float(stats["steady_duration_s"])
+            steady_tokens = int(stats["steady_tokens"])
+            window_rows.append(
+                [
+                    label,
+                    window_tokens,
+                    f"{window_tokens / seconds:.3f}",
+                    stats["steady_num_reqs"],
+                    stats["steady_step_ranges"],
+                    steady_tokens,
+                    f"{steady_seconds:.6f}",
+                    (
+                        f"{steady_tokens / steady_seconds:.3f}"
+                        if steady_seconds > 0
+                        else "N/A"
+                    ),
+                ]
+            )
     rpt.table(
         ["system", "steps", "ranges", "decode_s", throughput_header],
         rows,
         col_width=16,
+    )
+    rpt.row("")
+    rpt.row(
+        "  Window-consistent decode throughput (numerator = decode tokens "
+        "actually scheduled inside the counted steps):"
+    )
+    rpt.row(
+        "    win_*:    all decode-only steps (includes shrinking-batch "
+        "drain tail)."
+    )
+    rpt.row(
+        "    steady_*: decode-only steps at the maximum concurrent batch "
+        "size only."
+    )
+    rpt.table(
+        [
+            "system",
+            "win_tokens",
+            "win_tok/s",
+            "steady_reqs",
+            "steady_ranges",
+            "steady_tok",
+            "steady_s",
+            "steady_tok/s",
+        ],
+        window_rows,
+        col_width=14,
     )
 
 
