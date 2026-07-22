@@ -23,6 +23,20 @@ def _mk_controller(**overrides) -> ImbalanceController:
     return ImbalanceController(config=cfg)
 
 
+def _mk_tracking_controller() -> ImbalanceController:
+    ctl = _mk_controller(
+        deadband_ms=0.5,
+        tracking_settle_layers=100,
+        tracking_damping=1.0,
+        tracking_initial_step_cap_blocks=10,
+        tracking_step_cap_increment_blocks=5,
+        tracking_max_step_blocks=20,
+    )
+    ctl.state = SMState.TRACKING
+    ctl.gain = -0.1
+    return ctl
+
+
 def test_hint_from_delta_buckets():
     assert _hint_from_delta(0) == "unchanged"
     assert _hint_from_delta(1) == "small_delta"
@@ -135,8 +149,11 @@ def test_tracking_converges_back_to_steady():
             break
     assert ctl.state == SMState.TRACKING
     # Now supply converged samples (|y|<deadband) for several layers.
+    deadband_decisions = []
     for _ in range(5):
         d = ctl.observe(imbalance_ms=0.1, current_budget=10)
+        deadband_decisions.append(d)
+    assert all(d.delta_budget == 0 for d in deadband_decisions)
     assert ctl.state == SMState.STEADY
 
 
@@ -191,6 +208,147 @@ def test_hint_matches_delta():
         assert d.plan_change_hint == _hint_from_delta(d.delta_budget)
 
 
+@pytest.mark.parametrize("imbalance_ms", [10.0, -10.0])
+def test_tracking_step_cap_progresses_after_same_direction_saturation(
+    imbalance_ms: float,
+):
+    ctl = _mk_tracking_controller()
+
+    decisions = [
+        ctl.observe(imbalance_ms=imbalance_ms, current_budget=50)
+        for _ in range(4)
+    ]
+
+    direction = 1 if imbalance_ms > 0 else -1
+    assert [d.delta_budget for d in decisions] == [
+        direction * 10,
+        direction * 15,
+        direction * 20,
+        direction * 20,
+    ]
+    assert [d.step_cap_blocks for d in decisions] == [10, 15, 20, 20]
+    assert all(d.step_cap_saturated for d in decisions)
+    assert [d.step_cap_saturation_streak for d in decisions] == [1, 2, 3, 4]
+
+
+def test_tracking_step_cap_resets_on_direction_change():
+    ctl = _mk_tracking_controller()
+
+    first = ctl.observe(imbalance_ms=10.0, current_budget=50)
+    escalated = ctl.observe(imbalance_ms=10.0, current_budget=50)
+    reversed_direction = ctl.observe(imbalance_ms=-10.0, current_budget=50)
+
+    assert first.step_cap_blocks == 10
+    assert escalated.step_cap_blocks == 15
+    assert reversed_direction.delta_budget == -10
+    assert reversed_direction.step_cap_blocks == 10
+    assert reversed_direction.step_cap_saturated
+    assert reversed_direction.step_cap_saturation_streak == 1
+
+
+def test_tracking_step_cap_resets_after_non_saturated_update():
+    ctl = _mk_tracking_controller()
+
+    ctl.observe(imbalance_ms=10.0, current_budget=50)
+    escalated = ctl.observe(imbalance_ms=10.0, current_budget=50)
+    non_saturated = ctl.observe(imbalance_ms=0.6, current_budget=50)
+    next_saturated = ctl.observe(imbalance_ms=10.0, current_budget=50)
+
+    assert escalated.step_cap_blocks == 15
+    assert non_saturated.delta_budget == 6
+    assert non_saturated.step_cap_blocks == 20
+    assert not non_saturated.step_cap_saturated
+    assert non_saturated.step_cap_saturation_streak == 0
+    assert next_saturated.delta_budget == 10
+    assert next_saturated.step_cap_blocks == 10
+    assert next_saturated.step_cap_saturation_streak == 1
+
+
+def test_tracking_step_cap_resets_in_deadband():
+    ctl = _mk_tracking_controller()
+
+    ctl.observe(imbalance_ms=10.0, current_budget=50)
+    ctl.observe(imbalance_ms=10.0, current_budget=50)
+    in_deadband = ctl.observe(imbalance_ms=0.0, current_budget=50)
+    next_saturated = ctl.observe(imbalance_ms=10.0, current_budget=50)
+
+    assert in_deadband.delta_budget == 0
+    # No cap is applied because deadband observations do not actuate.
+    assert in_deadband.step_cap_blocks is None
+    assert not in_deadband.step_cap_saturated
+    assert in_deadband.step_cap_saturation_streak == 0
+    assert next_saturated.delta_budget == 10
+    assert next_saturated.step_cap_blocks == 10
+
+
+def test_tracking_deadband_freezes_budget_while_confirming_settle():
+    ctl = _mk_controller(
+        deadband_ms=0.5,
+        tracking_settle_layers=3,
+        tracking_damping=1.0,
+        tracking_initial_step_cap_blocks=10,
+        tracking_max_step_blocks=20,
+    )
+    ctl.state = SMState.TRACKING
+    # This deliberately steep gain would turn a residual just inside the
+    # deadband into a cap-sized Newton step without the no-actuation guard.
+    ctl.gain = -0.01
+
+    first = ctl.observe(imbalance_ms=0.49, current_budget=50)
+    second = ctl.observe(imbalance_ms=-0.49, current_budget=50)
+    settled = ctl.observe(imbalance_ms=0.1, current_budget=50)
+
+    assert [first.delta_budget, second.delta_budget, settled.delta_budget] == [
+        0,
+        0,
+        0,
+    ]
+    assert first.plan_change_hint == "unchanged"
+    assert second.plan_change_hint == "unchanged"
+    assert first.state == SMState.TRACKING
+    assert second.state == SMState.TRACKING
+    assert settled.state == SMState.STEADY
+
+
+def test_tracking_resumes_correction_after_leaving_deadband():
+    ctl = _mk_controller(
+        deadband_ms=0.5,
+        tracking_settle_layers=3,
+        tracking_damping=1.0,
+        tracking_initial_step_cap_blocks=10,
+        tracking_max_step_blocks=20,
+    )
+    ctl.state = SMState.TRACKING
+    ctl.gain = -0.1
+
+    frozen = ctl.observe(imbalance_ms=0.1, current_budget=50)
+    settle_count_while_frozen = ctl.tracking_settle_count
+    resumed = ctl.observe(imbalance_ms=1.0, current_budget=50)
+
+    assert frozen.delta_budget == 0
+    assert settle_count_while_frozen == 1
+    assert ctl.tracking_settle_count == 0
+    assert resumed.delta_budget == 10
+    assert resumed.plan_change_hint == "significant_delta"
+    assert resumed.state == SMState.TRACKING
+
+
+def test_tracking_deadband_still_consumes_probe_measurement():
+    ctl = _mk_controller(deadband_ms=0.5, tracking_settle_layers=3)
+    ctl.state = SMState.TRACKING
+    ctl._pending_probe_delta = 2
+    ctl._probe_pre_imbalance = 2.0
+    ctl._probe_pre_budget = 10
+
+    decision = ctl.observe(imbalance_ms=0.2, current_budget=12)
+
+    assert decision.delta_budget == 0
+    assert ctl._pending_probe_delta == 0
+    assert ctl._probe_pre_imbalance is None
+    assert ctl._probe_pre_budget is None
+    assert ctl.gain == pytest.approx(-0.9)
+
+
 def test_reset_returns_to_clean_steady():
     ctl = _mk_controller()
     for _ in range(5):
@@ -202,6 +360,10 @@ def test_reset_returns_to_clean_steady():
     assert ctl.old_baseline_ms is None
     assert ctl.gain is None
     assert len(ctl._window) == 0
+    assert ctl._tracking_step_cap_blocks == 10
+    assert ctl._tracking_cap_direction == 0
+    assert not ctl._last_tracking_step_saturated
+    assert ctl._tracking_saturation_streak == 0
 
 
 if __name__ == "__main__":
