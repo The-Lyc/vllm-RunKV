@@ -21,7 +21,7 @@
       "tightllm_profile": "exp_results/tightllm_profiles/ubuntu/opt-2.7b-8k.json",
       "batch_size": 32,
       "prompt_length": 1000,
-      "decode_length": 128
+      "decode_length": 64
     },
     {
       "name": "opt2.7b-bs32-p2k-d64",
