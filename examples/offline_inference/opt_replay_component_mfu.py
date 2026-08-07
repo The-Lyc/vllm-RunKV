@@ -16,14 +16,23 @@ from typing import Any
 import torch
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run real OPT inference with RunKV replay enabled and summarize "
-            "attention/FFN MFU versus replay ratio."
+            "Run real OPT/Llama inference with RunKV replay enabled and "
+            "summarize component timing versus replay ratio."
         )
     )
     parser.add_argument("--model", default="facebook/opt-125m")
+    parser.add_argument(
+        "--model-family",
+        choices=["opt", "llama"],
+        default="opt",
+        help=(
+            "Model family used for compatibility checks and output messages. "
+            "The default preserves the legacy OPT runner behavior."
+        ),
+    )
     parser.add_argument("--peak-tflops", type=float, default=None)
     parser.add_argument(
         "--prefix-blocks",
@@ -36,6 +45,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num-prompts", type=int, default=16)
     parser.add_argument("--prompt-words", type=int, default=512)
+    parser.add_argument(
+        "--prompt-word",
+        default="replay",
+        help=(
+            "Token-like word repeated to construct synthetic prompts. "
+            "Defaults to the legacy OPT value 'replay'."
+        ),
+    )
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--gpu-memory-fraction", type=float, default=0.9)
     parser.add_argument("--num-device-buffers", type=int, default=3)
@@ -157,8 +174,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Directory to write per-step JSONL trace files "
-            "(opt_component_mfu_<prefix>_<tag>.jsonl and .flat.jsonl). "
+            "(<component-artifact-prefix>_<prefix>_<tag>.jsonl and "
+            ".flat.jsonl). "
             "If omitted, no JSONL is emitted."
+        ),
+    )
+    parser.add_argument(
+        "--component-artifact-prefix",
+        default="opt_component_mfu",
+        help=(
+            "Filename prefix for component timing JSONL artifacts. The default "
+            "preserves the legacy OPT filenames."
         ),
     )
     parser.add_argument(
@@ -180,11 +206,13 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--disable-component-timing-profiling",
         "--disable-opt-component-mfu-profiling",
+        dest="disable_opt_component_mfu_profiling",
         action="store_true",
         help=(
-            "Disable OPT component profiling hooks entirely. Useful when only "
-            "collecting Nsight Systems traces."
+            "Disable RunKV component timing hooks entirely. The legacy "
+            "--disable-opt-component-mfu-profiling spelling remains supported."
         ),
     )
     parser.add_argument(
@@ -219,7 +247,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resource-pressure-pattern",
         default="0:0",
-        help="Comma-separated start:target schedule. Step clock uses step:target; time clock uses second:target.",
+        help=(
+            "Comma-separated start:target schedule. Step clock uses "
+            "step:target; time clock uses second:target."
+        ),
     )
     parser.add_argument(
         "--resource-pressure-log-path",
@@ -307,7 +338,7 @@ def parse_args() -> argparse.Namespace:
             "state layer time observed in a baseline run."
         ),
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 @contextlib.contextmanager
@@ -346,8 +377,15 @@ def cuda_profiler_stop() -> None:
         torch.cuda.cudart().cudaProfilerStop()
 
 
-def build_prompts(num_prompts: int, prompt_words: int) -> list[str]:
-    repeated = " ".join(["replay"] * prompt_words)
+def build_prompts(
+    num_prompts: int,
+    prompt_words: int,
+    prompt_word: str = "replay",
+) -> list[str]:
+    prompt_word = prompt_word.strip()
+    if not prompt_word:
+        raise ValueError("--prompt-word must not be empty")
+    repeated = " ".join([prompt_word] * prompt_words)
     return [
         f"Request {idx}: summarize the pattern and continue briefly. {repeated}"
         for idx in range(num_prompts)
@@ -674,6 +712,17 @@ def main() -> None:
         raise ValueError("--cpu-memory-gb must be >= 0")
     if not (0.0 < args.cpu_memory_fraction <= 1.0):
         raise ValueError("--cpu-memory-fraction must be in (0, 1]")
+    if not args.prompt_word.strip():
+        raise ValueError("--prompt-word must not be empty")
+    component_artifact_prefix = args.component_artifact_prefix.strip()
+    if (
+        not component_artifact_prefix
+        or Path(component_artifact_prefix).name != component_artifact_prefix
+        or component_artifact_prefix in {".", ".."}
+    ):
+        raise ValueError(
+            "--component-artifact-prefix must be a non-empty filename prefix"
+        )
     if not args.disable_nvtx_scopes:
         os.environ.setdefault("VLLM_NVTX_SCOPES_FOR_PROFILING", "1")
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -691,14 +740,18 @@ def main() -> None:
     prefix_settings = parse_prefix_settings(args.prefix_blocks)
 
     for setting in prefix_settings:
-        prompts = build_prompts(args.num_prompts, args.prompt_words)
+        prompts = build_prompts(
+            args.num_prompts,
+            args.prompt_words,
+            args.prompt_word,
+        )
 
         # Build per-setting JSONL output path if --output-dir was given
         if mfu_profiler_enabled and args.output_dir:
             os.makedirs(args.output_dir, exist_ok=True)
             _mfu_out = os.path.join(
                 args.output_dir,
-                f"opt_component_mfu_{setting}_{_run_tag}.jsonl",
+                f"{component_artifact_prefix}_{setting}_{_run_tag}.jsonl",
             )
         else:
             _mfu_out = None
@@ -793,10 +846,11 @@ def main() -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    print("\nOPT replay run finished.")
+    print(f"\n{args.model_family.upper()} replay run finished.")
     if mfu_profiler_enabled and args.output_dir:
         print(
-            f"JSONL traces written to: {args.output_dir}/opt_component_mfu_*_{_run_tag}.jsonl"
+            "JSONL traces written to: "
+            f"{args.output_dir}/{component_artifact_prefix}_*_{_run_tag}.jsonl"
         )
     else:
         print("JSONL trace emission disabled (pass --output-dir to enable).")

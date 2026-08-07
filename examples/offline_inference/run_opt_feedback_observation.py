@@ -8,8 +8,32 @@ import os
 import shlex
 import subprocess
 import sys
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+
+@dataclass(frozen=True)
+class FeedbackObservationDefaults:
+    model_family: str
+    model: str
+    output_dir: str
+    prompt_word: str
+    component_artifact_prefix: str
+    nsys_prefix: str
+    display_name: str
+
+
+OPT_OBSERVATION_DEFAULTS = FeedbackObservationDefaults(
+    model_family="opt",
+    model="/data/models/opt-2.7b-8k",
+    output_dir="/home/lyc/inference/vllm/exp_results/opt_feedback_observation",
+    prompt_word="replay",
+    component_artifact_prefix="opt_component_mfu",
+    nsys_prefix="opt_gap",
+    display_name="OPT",
+)
 
 
 def _sanitize_token(value: str) -> str:
@@ -23,18 +47,39 @@ def _model_tag(model: str) -> str:
     return _sanitize_token(Path(model).name or model)
 
 
-def main() -> None:
+def run_feedback_observation(
+    defaults: FeedbackObservationDefaults,
+    *,
+    passthrough_args: Sequence[str] | None = None,
+) -> None:
+    if defaults.model_family not in {"llama", "opt"}:
+        raise ValueError(f"Unsupported model family: {defaults.model_family!r}")
+
     root_dir = Path(__file__).resolve().parents[2]
-    passthrough_args = sys.argv[1:]
-    python_bin = os.environ.get("PYTHON_BIN", sys.executable)
-    model = os.environ.get("MODEL", "/data/models/opt-2.7b-8k")
-    output_dir = os.environ.get(
-        "OUTPUT_DIR",
-        "/home/lyc/inference/vllm/exp_results/opt_feedback_observation",
+    passthrough_args = list(
+        sys.argv[1:] if passthrough_args is None else passthrough_args
     )
+    python_bin = os.environ.get("PYTHON_BIN", sys.executable)
+    model = os.environ.get("MODEL", defaults.model)
+    output_dir = os.environ.get("OUTPUT_DIR", defaults.output_dir)
+    component_artifact_prefix = os.environ.get(
+        "COMPONENT_ARTIFACT_PREFIX",
+        defaults.component_artifact_prefix,
+    )
+    if (
+        not component_artifact_prefix
+        or Path(component_artifact_prefix).name != component_artifact_prefix
+        or component_artifact_prefix in {".", ".."}
+    ):
+        raise ValueError(
+            "COMPONENT_ARTIFACT_PREFIX must be a non-empty filename prefix"
+        )
     prefix_blocks = os.environ.get("PREFIX_BLOCKS", "10000")
     num_prompts = os.environ.get("NUM_PROMPTS", "32")
     prompt_words = os.environ.get("PROMPT_WORDS", "1000")
+    prompt_word = os.environ.get("PROMPT_WORD", defaults.prompt_word)
+    if not prompt_word.strip():
+        raise ValueError("PROMPT_WORD must not be empty")
     max_tokens = os.environ.get("MAX_TOKENS", "128")
     gpu_memory_fraction = os.environ.get("GPU_MEMORY_FRACTION", "0.7")
     num_device_buffers = os.environ.get("NUM_DEVICE_BUFFERS", "3")
@@ -63,8 +108,12 @@ def main() -> None:
     )
     enable_nvtx = os.environ.get("ENABLE_NVTX", "1") == "1"
     enable_layerwise_nvtx = os.environ.get("ENABLE_LAYERWISE_NVTX", "0") == "1"
-    enable_opt_component_mfu = (
-        os.environ.get("ENABLE_OPT_COMPONENT_MFU_PROFILING", "1") == "1"
+    enable_component_timing = (
+        os.environ.get(
+            "ENABLE_COMPONENT_TIMING_PROFILING",
+            os.environ.get("ENABLE_OPT_COMPONENT_MFU_PROFILING", "1"),
+        )
+        == "1"
     )
     enable_profile = os.environ.get("ENABLE_PROFILE", "0") == "1"
     enable_nsys = os.environ.get("ENABLE_NSYS", "0") == "1"
@@ -81,8 +130,7 @@ def main() -> None:
         str(
             nsys_output_dir
             / (
-                "opt_gap"
-                f"_{_model_tag(model)}"
+                defaults.nsys_prefix + f"_{_model_tag(model)}"
                 f"_pb{_sanitize_token(prefix_blocks)}"
                 f"_{planner}"
                 f"_{layerwise_tag}"
@@ -105,12 +153,16 @@ def main() -> None:
         str(root_dir / "examples/offline_inference/opt_replay_component_mfu.py"),
         "--model",
         model,
+        "--model-family",
+        defaults.model_family,
         "--prefix-blocks",
         prefix_blocks,
         "--num-prompts",
         num_prompts,
         "--prompt-words",
         prompt_words,
+        "--prompt-word",
+        prompt_word,
         "--max-tokens",
         max_tokens,
         "--gpu-memory-fraction",
@@ -121,6 +173,8 @@ def main() -> None:
         planner,
         "--output-dir",
         output_dir,
+        "--component-artifact-prefix",
+        component_artifact_prefix,
         "--run-tag",
         run_tag,
     ]
@@ -145,8 +199,8 @@ def main() -> None:
         cmd.extend(["--tightllm-profile-path", tightllm_profile_path])
     if tightllm_feedback_correction:
         cmd.append("--tightllm-feedback-correction")
-    if not enable_opt_component_mfu:
-        cmd.append("--disable-opt-component-mfu-profiling")
+    if not enable_component_timing:
+        cmd.append("--disable-component-timing-profiling")
     if not enable_nvtx:
         cmd.append("--disable-nvtx-scopes")
     if enable_layerwise_nvtx:
@@ -156,8 +210,9 @@ def main() -> None:
     if passthrough_args:
         cmd.extend(passthrough_args)
 
-    print("Running OPT feedback observation")
+    print(f"Running {defaults.display_name} feedback observation")
     print(f"  model: {model}")
+    print(f"  model_family: {defaults.model_family}")
     print(f"  planner: {planner}")
     print(f"  planner_dry_run: {int(dry_run)}")
     print(f"  use_state_machine: {int(use_state_machine)}")
@@ -167,11 +222,12 @@ def main() -> None:
     if planner == "tightllm":
         print(f"  tightllm_profile: {tightllm_profile_path}")
         print(f"  tightllm_feedback_correction: {int(tightllm_feedback_correction)}")
-    print(f"  opt_component_mfu: {int(enable_opt_component_mfu)}")
+    print(f"  component_timing: {int(enable_component_timing)}")
     print(f"  nvtx_scopes: {int(enable_nvtx)}")
     print(f"  layerwise_nvtx: {int(enable_layerwise_nvtx)}")
     print(f"  cuda_profiler_capture: {int(enable_profile)}")
     print(f"  prefix_blocks: {prefix_blocks}")
+    print(f"  prompt_word: {prompt_word}")
     print(f"  gpu_memory_fraction: {gpu_memory_fraction}")
     print(f"  num_device_buffers:  {num_device_buffers}")
     if gpu_memory_utilization:
@@ -211,8 +267,8 @@ def main() -> None:
 
     print()
     print("Trace files:")
-    print(f"  {output_dir}/opt_component_mfu_*.jsonl")
-    print(f"  {output_dir}/opt_component_mfu_*.flat.jsonl")
+    print(f"  {output_dir}/{component_artifact_prefix}_*.jsonl")
+    print(f"  {output_dir}/{component_artifact_prefix}_*.flat.jsonl")
     if enable_nsys:
         print("Nsight Systems:")
         print(f"  {nsys_stem}.nsys-rep")
@@ -230,6 +286,7 @@ def main() -> None:
             "prefix_blocks": prefix_blocks,
             "num_prompts": num_prompts,
             "prompt_words": prompt_words,
+            "prompt_word": prompt_word,
             "max_tokens": max_tokens,
             "fixed_output_length": True,
             "gpu_memory_fraction": gpu_memory_fraction,
@@ -240,6 +297,8 @@ def main() -> None:
             "cpu_memory_gb": cpu_memory_gb or None,
             "cpu_memory_fraction": cpu_memory_fraction or None,
             "planner": planner,
+            "model_family": defaults.model_family,
+            "component_artifact_prefix": component_artifact_prefix,
             "layer_recompute_async_plan_build": async_plan_build,
             "h2d_copy_mode": h2d_copy_mode,
             "layer_recompute_use_state_machine": use_state_machine,
@@ -249,16 +308,30 @@ def main() -> None:
             if enable_nsys
             else None,
             "mfu_jsonl_glob": str(
-                Path(output_dir) / f"opt_component_mfu_*_{run_tag}.jsonl"
+                Path(output_dir)
+                / f"{component_artifact_prefix}_*_{run_tag}.jsonl"
             ),
             "mfu_flat_jsonl_glob": str(
-                Path(output_dir) / f"opt_component_mfu_*_{run_tag}.flat.jsonl"
+                Path(output_dir)
+                / f"{component_artifact_prefix}_*_{run_tag}.flat.jsonl"
+            ),
+            "component_jsonl_glob": str(
+                Path(output_dir)
+                / f"{component_artifact_prefix}_*_{run_tag}.jsonl"
+            ),
+            "component_flat_jsonl_glob": str(
+                Path(output_dir)
+                / f"{component_artifact_prefix}_*_{run_tag}.flat.jsonl"
             ),
             "passthrough_args": passthrough_args,
         }
         Path(manifest_file).parent.mkdir(parents=True, exist_ok=True)
         Path(manifest_file).write_text(_json.dumps(_manifest, indent=2) + "\n")
         print(f"\nManifest written to: {manifest_file}")
+
+
+def main() -> None:
+    run_feedback_observation(OPT_OBSERVATION_DEFAULTS)
 
 
 if __name__ == "__main__":

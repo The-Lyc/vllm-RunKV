@@ -2,8 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""
-TightLLM ILP planner observation runner.
+"""TightLLM ILP planner observation runner for OPT and Llama.
 
 Wraps opt_replay_component_mfu.py with --planner=tightllm and optionally
 wraps the whole run with nsys so that TightLLM-specific NVTX ranges
@@ -19,6 +18,9 @@ Usage (with nsys trace):
 
 Environment variables (all optional, with sensible defaults):
     MODEL                  model path
+    MODEL_FAMILY           "opt" (default) or "llama"
+    PROMPT_WORD            repeated synthetic prompt word
+    COMPONENT_ARTIFACT_PREFIX  component timing file prefix
     TIGHTLLM_PROFILE_PATH  offline profile JSON (required)
     TIGHTLLM_FEEDBACK_CORRECTION  set to "1" to enable hybrid ILP+feedback
     PREFIX_BLOCKS          io prefix blocks (default 1000)
@@ -62,11 +64,40 @@ def main() -> None:
     root_dir = Path(__file__).resolve().parents[2]
     passthrough_args = sys.argv[1:]
     python_bin = os.environ.get("PYTHON_BIN", sys.executable)
-    model = os.environ.get("MODEL", "/data/models/opt-2.7b-8k")
+    model_family = os.environ.get("MODEL_FAMILY", "opt").strip().lower()
+    if model_family not in {"llama", "opt"}:
+        raise ValueError(f"Unsupported MODEL_FAMILY: {model_family!r}")
+    default_model = (
+        "/data/models/Llama-2-7b-hf-8k"
+        if model_family == "llama"
+        else "/data/models/opt-2.7b-8k"
+    )
+    default_prompt_word = "the" if model_family == "llama" else "replay"
+    default_component_prefix = (
+        "llama_tightllm_component"
+        if model_family == "llama"
+        else "opt_component_mfu"
+    )
+    model = os.environ.get("MODEL", default_model)
     output_dir = os.environ.get(
         "OUTPUT_DIR",
         "/home/lyc/inference/vllm/exp_results/tightllm_observation",
     )
+    prompt_word = os.environ.get("PROMPT_WORD", default_prompt_word)
+    if not prompt_word.strip():
+        raise ValueError("PROMPT_WORD must not be empty")
+    component_artifact_prefix = os.environ.get(
+        "COMPONENT_ARTIFACT_PREFIX",
+        default_component_prefix,
+    )
+    if (
+        not component_artifact_prefix
+        or Path(component_artifact_prefix).name != component_artifact_prefix
+        or component_artifact_prefix in {".", ".."}
+    ):
+        raise ValueError(
+            "COMPONENT_ARTIFACT_PREFIX must be a non-empty filename prefix"
+        )
     tightllm_profile_path = os.environ.get(
         "TIGHTLLM_PROFILE_PATH", "tightllm_profile.json"
     )
@@ -99,8 +130,12 @@ def main() -> None:
     cpu_memory_fraction = os.environ.get("CPU_MEMORY_FRACTION", "")
     enable_nvtx = os.environ.get("ENABLE_NVTX", "1") == "1"
     enable_layerwise_nvtx = os.environ.get("ENABLE_LAYERWISE_NVTX", "0") == "1"
-    enable_opt_component_mfu = (
-        os.environ.get("ENABLE_OPT_COMPONENT_MFU_PROFILING", "1") == "1"
+    enable_component_timing = (
+        os.environ.get(
+            "ENABLE_COMPONENT_TIMING_PROFILING",
+            os.environ.get("ENABLE_OPT_COMPONENT_MFU_PROFILING", "1"),
+        )
+        == "1"
     )
     enable_profile = os.environ.get("ENABLE_PROFILE", "0") == "1"
     enable_nsys = os.environ.get("ENABLE_NSYS", "0") == "1"
@@ -131,7 +166,10 @@ def main() -> None:
         print(f"ERROR: TightLLM profile not found: {tightllm_profile_path}")
         print("Run the offline profiler first:")
         print("  python -m vllm.v1.profiling.tightllm_offline_profiler \\")
-        print(f"      --model {model} --output tightllm_profile.json")
+        print(
+            f"      --model {model} --output {tightllm_profile_path} "
+            "--seq-lengths 128 256 512 1024 2048 4096 8192"
+        )
         sys.exit(1)
 
     env = os.environ.copy()
@@ -148,12 +186,16 @@ def main() -> None:
         str(root_dir / "examples/offline_inference/opt_replay_component_mfu.py"),
         "--model",
         model,
+        "--model-family",
+        model_family,
         "--prefix-blocks",
         prefix_blocks,
         "--num-prompts",
         num_prompts,
         "--prompt-words",
         prompt_words,
+        "--prompt-word",
+        prompt_word,
         "--max-tokens",
         max_tokens,
         "--gpu-memory-fraction",
@@ -170,6 +212,8 @@ def main() -> None:
         tightllm_replay_allocation_policy,
         "--output-dir",
         output_dir,
+        "--component-artifact-prefix",
+        component_artifact_prefix,
         "--run-tag",
         run_tag,
     ]
@@ -184,7 +228,7 @@ def main() -> None:
             cmd.extend([option, value])
     if tightllm_feedback_correction:
         cmd.append("--tightllm-feedback-correction")
-    if not enable_opt_component_mfu:
+    if not enable_component_timing:
         cmd.append("--disable-opt-component-mfu-profiling")
     if not enable_nvtx:
         cmd.append("--disable-nvtx-scopes")
@@ -197,11 +241,14 @@ def main() -> None:
 
     print("Running TightLLM ILP planner observation")
     print(f"  model:              {model}")
+    print(f"  model_family:       {model_family}")
     print("  planner:            tightllm")
     print(f"  profile:            {tightllm_profile_path}")
     print(f"  feedback_correction:{int(tightllm_feedback_correction)}")
     print(f"  replay_allocation_policy: {tightllm_replay_allocation_policy}")
-    print(f"  opt_component_mfu:  {int(enable_opt_component_mfu)}")
+    print(f"  prompt_word:        {prompt_word}")
+    print(f"  component_prefix:   {component_artifact_prefix}")
+    print(f"  component_timing:   {int(enable_component_timing)}")
     print(f"  nvtx_scopes:        {int(enable_nvtx)}")
     print(f"  layerwise_nvtx:     {int(enable_layerwise_nvtx)}")
     print(f"  cuda_profiler:      {int(enable_profile)}")
@@ -287,16 +334,29 @@ def main() -> None:
             "cpu_memory_gb": cpu_memory_gb or None,
             "cpu_memory_fraction": cpu_memory_fraction or None,
             "planner": "tightllm",
+            "model_family": model_family,
+            "prompt_word": prompt_word,
+            "component_artifact_prefix": component_artifact_prefix,
             "tightllm_replay_allocation_policy": tightllm_replay_allocation_policy,
             "model": model,
             "nsys_report": str(Path(nsys_stem + ".nsys-rep").resolve())
             if enable_nsys
             else None,
             "mfu_jsonl_glob": str(
-                Path(output_dir) / f"opt_component_mfu_*_{run_tag}.jsonl"
+                Path(output_dir)
+                / f"{component_artifact_prefix}_*_{run_tag}.jsonl"
             ),
             "mfu_flat_jsonl_glob": str(
-                Path(output_dir) / f"opt_component_mfu_*_{run_tag}.flat.jsonl"
+                Path(output_dir)
+                / f"{component_artifact_prefix}_*_{run_tag}.flat.jsonl"
+            ),
+            "component_jsonl_glob": str(
+                Path(output_dir)
+                / f"{component_artifact_prefix}_*_{run_tag}.jsonl"
+            ),
+            "component_flat_jsonl_glob": str(
+                Path(output_dir)
+                / f"{component_artifact_prefix}_*_{run_tag}.flat.jsonl"
             ),
             "passthrough_args": passthrough_args,
         }
