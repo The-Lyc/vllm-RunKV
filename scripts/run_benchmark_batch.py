@@ -11,7 +11,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 PIPELINE = ROOT / "scripts/run_benchmark_pipeline.py"
@@ -118,7 +118,11 @@ def _run_tag(setting: dict[str, Any], index: int, timestamp: str) -> str:
     return "_".join(parts)
 
 
-def _command(setting: dict[str, Any], run_tag: str) -> list[str]:
+def _command(
+    setting: dict[str, Any],
+    run_tag: str,
+    pipeline_args: Sequence[str] = (),
+) -> list[str]:
     profile = Path(str(setting["tightllm_profile"])).expanduser()
     if not profile.is_absolute():
         profile = ROOT / profile
@@ -161,6 +165,7 @@ def _command(setting: dict[str, Any], run_tag: str) -> list[str]:
         "--tightllm-profile-path",
         str(profile),
     ]
+    cmd.extend(pipeline_args)
     for key, option in (
         ("max_num_seqs", "--max-num-seqs"),
         ("max_staging_blocks", "--max-staging-blocks"),
@@ -171,8 +176,12 @@ def _command(setting: dict[str, Any], run_tag: str) -> list[str]:
     return cmd
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(
+    *,
+    pipeline_args: Sequence[str] = (),
+    description: str = __doc__,
+) -> int:
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("config", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -196,7 +205,7 @@ def main() -> int:
         log_path = log_root / fallback_dir / "pipeline.log"
         try:
             run_tag = _run_tag(setting, index, timestamp)
-            cmd = _command(setting, run_tag)
+            cmd = _command(setting, run_tag, pipeline_args)
             log_path = log_root / run_tag / "pipeline.log"
             print(f"\n[{index}/{len(settings)}] {name}")
             print(f"  log: {log_path}")

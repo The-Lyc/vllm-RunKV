@@ -60,6 +60,9 @@ SQLITE_OUTPUT_DIR = ROOT / "exp_results/sqlite"
 ANALYSIS_OUTPUT_DIR = ROOT / "exp_results/analysis/per_layer"
 MANIFEST_DIR = ROOT / "exp_results/manifests"
 DEFAULT_TIGHTLLM_PROFILE_ROOT = ROOT / "exp_results/tightllm_profiles"
+FLUX_ROOT = Path("/home/lyc/inference/val")
+FLUX_VENV_ACTIVATE = Path("diffusion/.venv/bin/activate")
+FLUX_MANAGER = Path("diffusion/manage_flux_contender.py")
 
 
 def _require_plotting_dependency() -> None:
@@ -194,6 +197,71 @@ def _run_step(
     return result.returncode
 
 
+def _run_flux_command(action: str) -> int:
+    """Run the Flux manager in its own virtual environment."""
+    manager_args = [f"./{FLUX_MANAGER}", action]
+    if action == "start":
+        manager_args.extend(["--gpu", "0"])
+    shell_command = " ".join(
+        [
+            "source",
+            shlex.quote(str(FLUX_VENV_ACTIVATE)),
+            "&&",
+            *(shlex.quote(arg) for arg in manager_args),
+        ]
+    )
+
+    print(f"\n[FLUX] {action}")
+    print(f"  cwd: {FLUX_ROOT}")
+    print(f"  cmd: {shell_command}")
+    try:
+        result = subprocess.run(
+            ["/bin/bash", "-lc", shell_command],
+            cwd=FLUX_ROOT,
+        )
+    except OSError as exc:
+        print(f"[ERROR] Flux {action} failed: {exc}")
+        return 1
+    if result.returncode != 0:
+        print(f"[ERROR] Flux {action} failed with code {result.returncode}")
+    else:
+        print(f"[DONE] Flux {action}")
+    return result.returncode
+
+
+def _run_test_step(
+    step_name: str,
+    cmd: list[str],
+    env: dict[str, str],
+    manifest_path: Optional[str],
+    *,
+    with_flux_contender: bool,
+) -> int:
+    """Run one benchmark, optionally with a fresh Flux service around it."""
+    if not with_flux_contender:
+        return _run_step(step_name, cmd, env, manifest_path)
+
+    start_rc = _run_flux_command("start")
+    if start_rc != 0:
+        print(f"[ERROR] {step_name} was not launched because Flux failed to start")
+        return start_rc
+
+    test_rc = 1
+    try:
+        test_rc = _run_step(step_name, cmd, env, manifest_path)
+    finally:
+        stop_rc = _run_flux_command("stop")
+
+    if test_rc != 0:
+        if stop_rc != 0:
+            print(
+                f"[ERROR] Flux also failed to stop with code {stop_rc} "
+                f"after {step_name} failed"
+            )
+        return test_rc
+    return stop_rc
+
+
 def _load_manifest(path: str) -> Optional[dict]:
     """Load a JSON manifest file if it exists."""
     try:
@@ -262,6 +330,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ctrl.add_argument(
         "--skip-analysis", action="store_true", help="Skip per-layer analysis step"
+    )
+    ctrl.add_argument(
+        "--flux-contender",
+        action="store_true",
+        help=(
+            "Start the Flux contender service before each RunKV/TightLLM test "
+            "and stop it immediately afterward."
+        ),
     )
 
     # ── Test parameters ───────────────────────────────────────────────────
@@ -436,11 +512,12 @@ def main() -> None:
         runkv_env["USE_STATE_MACHINE"] = "1"
         runkv_env["H2D_COPY_MODE"] = args.runkv_h2d_copy_mode
         runkv_env["REPLAY_ALLOCATION_POLICY"] = args.runkv_replay_allocation_policy
-        rc = _run_step(
+        rc = _run_test_step(
             "RunKV feedback observation",
             [sys.executable, str(RUNKV_SCRIPT)],
             runkv_env,
             runkv_manifest,
+            with_flux_contender=args.flux_contender,
         )
         if rc != 0:
             sys.exit(rc)
@@ -456,11 +533,12 @@ def main() -> None:
         tightllm_env["TIGHTLLM_REPLAY_ALLOCATION_POLICY"] = (
             args.tightllm_replay_allocation_policy
         )
-        rc = _run_step(
+        rc = _run_test_step(
             "TightLLM ILP planner observation",
             [sys.executable, str(TIGHTLLM_SCRIPT)],
             tightllm_env,
             tightllm_manifest,
+            with_flux_contender=args.flux_contender,
         )
         if rc != 0:
             sys.exit(rc)
