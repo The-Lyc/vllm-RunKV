@@ -1,0 +1,65 @@
+{
+  "log_root": "exp_results/logs/llama2_7b_benchmark_batch",
+  "defaults": {
+    "model": "/data/models/Llama-2-7b-hf-8k",
+    "tightllm_profile": "exp_results/tightllm_profiles/ubuntu/Llama-2-7b-hf-8k.json",
+    "planner": "feedback",
+    "planner_dry_run": false,
+    "prompt_word": "the",
+    "cpu_memory_gb": 47.9,
+    "cpu_memory_fraction": 0.8,
+    "gpu_memory_utilization": 0.7,
+    "gpu_memory_fraction": 0.9,
+    "num_device_buffers": 3,
+    "max_num_seqs": null,
+    "max_staging_blocks": null,
+    "h2d_copy_mode": "segment",
+    "replay_allocation_policy": "concentrate",
+    "tightllm_h2d_copy_mode": "segment",
+    "tightllm_replay_allocation_policy": "spread",
+    "tightllm_feedback_correction": false,
+    "skip_tightllm": false,
+    "use_state_machine": true,
+    "async_plan_build": true,
+    "enable_nsys": true,
+    "enable_nvtx": true,
+    "enable_profile": true,
+    "enable_component_timing": true,
+    "enable_prehook_timing": true,
+    "skip_sqlite_export": false,
+    "skip_analysis": false,
+    "nsys_sample": "cpu",
+    "nsys_extra_args": "--capture-range=cudaProfilerApi --capture-range-end=stop",
+    "output_root": "exp_results/llama2_7b_benchmark"
+  },
+  "tests": [
+    {
+      "name": "llama2-7b-context1k-bs32-decode64",
+      "prefix_blocks": 32,
+      "batch_size": 32,
+      "prompt_length": 1000,
+      "decode_length": 64
+    },
+    {
+      "name": "llama2-7b-context2k-bs32-decode32",
+      "prefix_blocks": 64,
+      "batch_size": 32,
+      "prompt_length": 2000,
+      "decode_length": 32
+    },
+    {
+      "name": "llama2-7b-context4k-bs16-decode32",
+      "prefix_blocks": 128,
+      "batch_size": 16,
+      "prompt_length": 4000,
+      "decode_length": 32
+    },
+    {
+      "name": "llama2-7b-context8k-bs8-decode32",
+      "prefix_blocks": 256,
+      "batch_size": 8,
+      "prompt_length": 8000,
+      "decode_length": 32
+    }
+  ]
+}

@@ -47,6 +47,7 @@ MANIFEST_ROOT = ROOT / "exp_results/manifests/staged_resource"
 ANALYSIS_ROOT = ROOT / "exp_results/analysis/staged_resource"
 PER_LAYER_ANALYSIS_ROOT = ROOT / "exp_results/analysis/staged_resource_per_layer"
 DEFAULT_TIGHTLLM_PROFILE_ROOT = ROOT / "exp_results/tightllm_profiles"
+BENCHMARK_LABEL = "OPT"
 
 
 def _require_plotting_dependency() -> None:
@@ -291,6 +292,14 @@ def build_parser() -> argparse.ArgumentParser:
     test = parser.add_argument_group("Test parameters")
     test.add_argument("--model", default="/data/models/opt-1.3b-8k")
     test.add_argument("--prefix-blocks", default="10000")
+    test.add_argument(
+        "--prompt-word",
+        default="replay",
+        help=(
+            "Word repeated to construct synthetic prompts. Llama configs use "
+            "'the' so prompt_words remains close to tokenizer token count."
+        ),
+    )
     test.add_argument("--num-prompts", default="64")
     test.add_argument("--prompt-words", default="2000")
     test.add_argument("--max-tokens", default="256")
@@ -457,6 +466,18 @@ def build_parser() -> argparse.ArgumentParser:
     profile.add_argument("--enable-profile", dest="enable_profile", action="store_true", default=True)
     profile.add_argument("--disable-profile", dest="enable_profile", action="store_false")
     profile.add_argument(
+        "--enable-component-timing",
+        dest="enable_component_timing",
+        action="store_true",
+        default=True,
+        help="Write per-step and per-layer RunKV component timing JSONL.",
+    )
+    profile.add_argument(
+        "--disable-component-timing",
+        dest="enable_component_timing",
+        action="store_false",
+    )
+    profile.add_argument(
         "--enable-prehook-timing",
         dest="enable_prehook_timing",
         action="store_true",
@@ -494,6 +515,7 @@ def _common_env(args: argparse.Namespace, run_tag: str, output_dir: Path) -> dic
         "RUN_TAG": run_tag,
         "MODEL": args.model,
         "PREFIX_BLOCKS": args.prefix_blocks,
+        "PROMPT_WORD": args.prompt_word,
         "NUM_PROMPTS": args.num_prompts,
         "PROMPT_WORDS": args.prompt_words,
         "MAX_TOKENS": args.max_tokens,
@@ -506,7 +528,12 @@ def _common_env(args: argparse.Namespace, run_tag: str, output_dir: Path) -> dic
         "CPU_MEMORY_FRACTION": args.cpu_memory_fraction,
         "HARDWARE_PLATFORM": args.hardware_platform,
         "OUTPUT_DIR": str(output_dir),
-        "ENABLE_OPT_COMPONENT_MFU_PROFILING": "1",
+        "ENABLE_COMPONENT_TIMING_PROFILING": (
+            "1" if args.enable_component_timing else "0"
+        ),
+        "ENABLE_OPT_COMPONENT_MFU_PROFILING": (
+            "1" if args.enable_component_timing else "0"
+        ),
         "ENABLE_NSYS": "1" if args.enable_nsys else "0",
         "ENABLE_NVTX": "1" if args.enable_nvtx else "0",
         "ENABLE_PROFILE": "1" if args.enable_profile else "0",
@@ -711,32 +738,37 @@ def _run_per_layer_analysis(
         print("[SKIP] per-layer timing analysis because nsys is disabled")
         return []
 
-    pair_count = min(len(runkv_results), len(tightllm_results))
-    if pair_count == 0:
-        print("[SKIP] per-layer timing analysis; missing RunKV or TightLLM runs")
+    analysis_count = max(len(runkv_results), len(tightllm_results))
+    if analysis_count == 0:
+        print("[SKIP] per-layer timing analysis; no benchmark runs")
         return []
     if len(runkv_results) != len(tightllm_results):
         print(
-            "[WARN] per-layer analysis pairs only the first "
-            f"{pair_count} RunKV/TightLLM runs"
+            "[INFO] per-layer analysis will use single-system mode for "
+            "unpaired RunKV/TightLLM runs"
         )
 
     output_dirs: list[str] = []
-    for pair_idx, (runkv_result, tightllm_result) in enumerate(
-        zip(runkv_results, tightllm_results)
-    ):
-        output_dir = PER_LAYER_ANALYSIS_ROOT / pattern_name / args.run_tag / f"r{pair_idx}"
+    for analysis_idx in range(analysis_count):
+        runkv_result = (
+            runkv_results[analysis_idx]
+            if analysis_idx < len(runkv_results)
+            else None
+        )
+        tightllm_result = (
+            tightllm_results[analysis_idx]
+            if analysis_idx < len(tightllm_results)
+            else None
+        )
+        output_dir = (
+            PER_LAYER_ANALYSIS_ROOT
+            / pattern_name
+            / args.run_tag
+            / f"r{analysis_idx}"
+        )
         cmd = [
             sys.executable,
             str(PER_LAYER_ANALYSIS_SCRIPT),
-            "--runkv-mfu",
-            _require_artifact(runkv_result, "mfu_flat_jsonl"),
-            "--tightllm-mfu",
-            _require_artifact(tightllm_result, "mfu_flat_jsonl"),
-            "--runkv-sqlite",
-            _require_artifact(runkv_result, "nsys_sqlite"),
-            "--tightllm-sqlite",
-            _require_artifact(tightllm_result, "nsys_sqlite"),
             "--output-dir",
             str(output_dir),
             "--skip-warmup-steps",
@@ -750,10 +782,22 @@ def _run_per_layer_analysis(
             "--max-tokens",
             str(args.max_tokens),
         ]
+        for result, mfu_option, sqlite_option in (
+            (runkv_result, "--runkv-mfu", "--runkv-sqlite"),
+            (tightllm_result, "--tightllm-mfu", "--tightllm-sqlite"),
+        ):
+            if result is None:
+                continue
+            cmd.extend(
+                [mfu_option, _require_artifact(result, "mfu_flat_jsonl")]
+            )
+            sqlite_path = result.get("artifacts", {}).get("nsys_sqlite")
+            if sqlite_path:
+                cmd.extend([sqlite_option, str(sqlite_path)])
         if not args.runkv_run_dir and not args.tightllm_run_dir:
             cmd.append("--fixed-output-length")
         rc = _run_step(
-            f"Per-layer timing analysis r{pair_idx}",
+            f"Per-layer timing analysis r{analysis_idx}",
             cmd,
             {},
             manifest_path=None,
@@ -766,9 +810,10 @@ def _run_per_layer_analysis(
 
 
 def _print_settings(args: argparse.Namespace, pattern_name: str) -> None:
-    print("Running OPT staged-resource benchmark")
+    print(f"Running {BENCHMARK_LABEL} staged-resource benchmark")
     print(f"  model:                       {args.model}")
     print(f"  prefix_blocks:               {args.prefix_blocks}")
+    print(f"  prompt_word:                 {args.prompt_word}")
     print(f"  num_prompts:                 {args.num_prompts}")
     print(f"  prompt_words:                {args.prompt_words}")
     print(f"  max_tokens:                  {args.max_tokens}")
@@ -799,6 +844,7 @@ def _print_settings(args: argparse.Namespace, pattern_name: str) -> None:
     print(f"  enable_nsys:                 {int(args.enable_nsys)}")
     print(f"  enable_nvtx:                 {int(args.enable_nvtx)}")
     print(f"  enable_profile:              {int(args.enable_profile)}")
+    print(f"  enable_component_timing:     {int(args.enable_component_timing)}")
     print(f"  skip_runkv:                  {int(args.skip_runkv)}")
     print(f"  skip_tightllm:               {int(args.skip_tightllm)}")
     print(f"  skip_analysis:               {int(args.skip_analysis)}")
@@ -823,6 +869,15 @@ def main() -> None:
         not args.skip_stage_analysis or not args.skip_per_layer_analysis
     ):
         _require_plotting_dependency()
+    if (
+        not args.skip_analysis
+        and not args.skip_per_layer_analysis
+        and not args.enable_component_timing
+    ):
+        raise SystemExit(
+            "Per-layer analysis requires --enable-component-timing; "
+            "enable it or pass --skip-per-layer-analysis."
+        )
     args.tightllm_profile_path = _resolve_tightllm_profile_path(args)
     if not args.skip_tightllm and not args.tightllm_run_dir:
         _validate_tightllm_profile_path(args, args.tightllm_profile_path)

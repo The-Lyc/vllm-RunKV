@@ -65,17 +65,42 @@ def _discover_run_inputs(system: str, run_dirs: list[str]) -> list[RunInputs]:
     runs: list[RunInputs] = []
     for raw_dir in run_dirs:
         run_dir = Path(raw_dir)
+        manifest: dict[str, Any] = {}
+        manifest_path = run_dir / "manifest.json"
+        if manifest_path.is_file():
+            try:
+                loaded = json.loads(manifest_path.read_text())
+                if isinstance(loaded, dict):
+                    manifest = loaded
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        mfu_step_pattern = manifest.get("mfu_jsonl_glob")
+        mfu_flat_pattern = manifest.get("mfu_flat_jsonl_glob")
+        if mfu_step_pattern:
+            mfu_steps = [
+                path
+                for path in _expand_patterns([str(mfu_step_pattern)])
+                if ".flat." not in path.name
+            ]
+        else:
+            mfu_steps = sorted(
+                path
+                for path in run_dir.glob("*component*.jsonl")
+                if ".flat." not in path.name
+            )
+        if mfu_flat_pattern:
+            mfu_flat = _expand_patterns([str(mfu_flat_pattern)])
+        else:
+            mfu_flat = sorted(run_dir.glob("*component*.flat.jsonl"))
+
         runs.append(
             RunInputs(
                 system=system,
                 run_dir=run_dir,
                 step_logs=sorted(run_dir.glob("resource_steps*.jsonl")),
-                mfu_steps=sorted(
-                    path
-                    for path in run_dir.glob("opt_component_mfu_*.jsonl")
-                    if ".flat." not in path.name
-                ),
-                mfu_flat=sorted(run_dir.glob("opt_component_mfu_*.flat.jsonl")),
+                mfu_steps=mfu_steps,
+                mfu_flat=mfu_flat,
                 pressure_logs=sorted(run_dir.glob("pressure*.csv")),
                 sqlite_paths=sorted(run_dir.glob("*.sqlite")),
             )

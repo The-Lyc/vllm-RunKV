@@ -1,0 +1,67 @@
+{
+  "log_root": "exp_results/logs/staged_resource_benchmark_llama2_7b/sm",
+  "defaults": {
+    "output_root": "exp_results/staged_llama2_7b",
+    "model": "/data/models/Llama-2-7b-hf-8k",
+    "tightllm_profile": "exp_results/tightllm_profiles/ubuntu/Llama-2-7b-hf-8k.json",
+    "prefix_blocks": 32,
+    "prompt_word": "the",
+    "cpu_memory_gb": 8.0,
+    "cpu_memory_fraction": 0.8,
+    "gpu_memory_utilization": 0.9,
+    "gpu_memory_fraction": 0.9,
+    "num_device_buffers": 3,
+    "max_num_seqs": 8,
+    "max_staging_blocks": 640,
+    "runkv_replay_allocation_policy": "concentrate",
+    "tightllm_replay_allocation_policy": "spread",
+    "repeats": 1,
+    "resource_pressure_kind": "sm",
+    "resource_pressure_clock": "step",
+    "resource_pressure_pattern": "0:100,16:50,32:33.3",
+    "resource_pattern_name": "llama2_7b_sm_process_step",
+    "resource_pressure_mode": "process",
+    "resource_pressure_device": "cuda:0",
+    "resource_pressure_matrix_size": 4096,
+    "resource_pressure_dtype": "float16",
+    "resource_pressure_window_s": 0.25,
+    "resource_pressure_period_ms": 100.0,
+    "resource_pressure_max_fraction": 0.5,
+    "resource_pressure_inline_layer_period_ms": 5.0,
+    "enable_nsys": true,
+    "enable_nvtx": true,
+    "enable_profile": true,
+    "enable_component_timing": true,
+    "enable_prehook_timing": true,
+    "skip_tightllm": false,
+    "skip_sqlite_export": false,
+    "skip_stage_analysis": false,
+    "skip_per_layer_analysis": false
+  },
+  "tests": [
+    {
+      "name": "llama2-7b-bs8-p1k-d128",
+      "batch_size": 8,
+      "prompt_length": 1000,
+      "decode_length": 128
+    },
+    {
+      "name": "llama2-7b-bs4-p2k-d64",
+      "batch_size": 4,
+      "prompt_length": 2000,
+      "decode_length": 64
+    },
+    {
+      "name": "llama2-7b-bs2-p4k-d32",
+      "batch_size": 2,
+      "prompt_length": 4000,
+      "decode_length": 32
+    },
+    {
+      "name": "llama2-7b-bs1-p8k-d32",
+      "batch_size": 1,
+      "prompt_length": 8000,
+      "decode_length": 32
+    }
+  ]
+}
