@@ -1,5 +1,10 @@
 ## RunKV OPT 主干动态 Replay 方案
 
+> 当前实现状态：本文主体记录了最初仅面向 OPT 的分阶段设计过程。现在
+> `prev_layer_output_dynamic` 已支持 causal Llama/OPT；Llama 通过完整
+> residual-stream 层输入和逐请求 RoPE positions 执行回放。当前限制与可运行
+> 命令以 [RunKV Llama 2 7B 指南](../runkv_llama2.md) 和代码校验为准。
+
 ### Summary
 新增一种显式的 layer recompute 模式：`prev_layer_output_dynamic`。该模式只用于 `OPT`，但它不是和现有 `io_hidden_states` 完全独立的另一套机制。
 

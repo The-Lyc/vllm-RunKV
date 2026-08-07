@@ -23,6 +23,10 @@ For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
 This is RunKV version of vLLM(Forked From vanilla vLLM).
 
+Llama 2 7B 的 RunKV、动态逐层回放、TightLLM profiling，以及
+normal/staged RunKV 与 TightLLM 双系统自动化测试方法见
+[docs/runkv_llama2.md](docs/runkv_llama2.md)。
+
 ## Startup
 - Clone the resposity:
 ```
