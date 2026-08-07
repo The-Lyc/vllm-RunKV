@@ -8,7 +8,7 @@
     "runkv_h2d_copy_mode": "segment",
     "runkv_replay_allocation_policy": "concentrate",
     "tightllm_h2d_copy_mode": "segment",
-    "tightllm_replay_allocation_policy": "spread",
+    "tightllm_replay_allocation_policy": "concentrate",
     "max_num_seqs": null,
     "max_staging_blocks": null
   },
