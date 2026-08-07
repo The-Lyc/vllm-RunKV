@@ -25,9 +25,12 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 from collections.abc import Iterable
+from contextlib import contextmanager
 from itertools import islice
 
+import numpy as np
 import torch
+import torch.cuda.nvtx as _nvtx
 from torch import nn
 from transformers import LlamaConfig
 
@@ -37,6 +40,8 @@ from vllm.attention.layers.encoder_only_attention import EncoderOnlyAttention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -73,6 +78,8 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
+logger = init_logger(__name__)
 
 
 class LlamaMLP(nn.Module):
@@ -407,6 +414,8 @@ class LlamaModel(nn.Module):
             self.norm = PPMissingLayer()
 
         self.aux_hidden_state_layers = tuple[int, ...]()
+        self._dynamic_replay_forward_logged = False
+        self._dynamic_replay_nonzero_replay_logged = False
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
@@ -414,6 +423,288 @@ class LlamaModel(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    @contextmanager
+    def _with_runtime_attn_metadata(
+        self,
+        *,
+        layer_idx: int,
+    ):
+        forward_context = get_forward_context()
+        prev_attn_metadata = forward_context.attn_metadata
+        runtime = forward_context.layer_recompute_runtime
+        assert runtime is not None
+        forward_context.attn_metadata = runtime.get_layer_metadata(layer_idx)
+        try:
+            yield
+        finally:
+            forward_context.attn_metadata = prev_attn_metadata
+
+    @staticmethod
+    def _materialize_layer_input(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Return the logical residual-stream value at a decoder boundary."""
+        if residual is None:
+            # Layer 0 aliases `residual` to its input and later updates that
+            # residual in-place. Dynamic replay captures this tensor on a D2H
+            # stream before entering the layer, so keep an independent snapshot
+            # to prevent the copy from racing with the fused residual update.
+            return hidden_states.clone()
+        return hidden_states + residual
+
+    def _assemble_replay_layer_inputs(
+        self,
+        *,
+        plan,
+        cpu_fill_layer_inputs: torch.Tensor | None,
+        prev_layer_replay_inputs: torch.Tensor | None,
+    ) -> torch.Tensor:
+        dtype = None
+        device = None
+        if cpu_fill_layer_inputs is not None:
+            dtype = cpu_fill_layer_inputs.dtype
+            device = cpu_fill_layer_inputs.device
+        elif prev_layer_replay_inputs is not None:
+            dtype = prev_layer_replay_inputs.dtype
+            device = prev_layer_replay_inputs.device
+        else:
+            raise AssertionError("Replay assembly requires at least one input.")
+
+        cpu_fill_cursor = 0
+        replay_segments: list[torch.Tensor] = []
+        cpu_fill_lens_per_req = (
+            np.minimum(plan.prev_gpu_start_per_req, plan.computed_lens_per_req)
+            - plan.kv_replay_start_per_req
+        ).clip(min=0)
+
+        for req_idx, (gpu_start, gpu_end) in enumerate(plan.gpu_reuse_slice_per_req):
+            req_segments: list[torch.Tensor] = []
+
+            cpu_fill_len = int(cpu_fill_lens_per_req[req_idx])
+            if cpu_fill_len > 0:
+                assert cpu_fill_layer_inputs is not None
+                req_segments.append(
+                    cpu_fill_layer_inputs[
+                        cpu_fill_cursor : cpu_fill_cursor + cpu_fill_len
+                    ]
+                )
+                cpu_fill_cursor += cpu_fill_len
+
+            gpu_reuse_len = int(gpu_end - gpu_start)
+            if gpu_reuse_len > 0:
+                if prev_layer_replay_inputs is None:
+                    raise AssertionError(
+                        "gpu_reuse requires previous layer replay inputs."
+                    )
+                req_segments.append(prev_layer_replay_inputs[gpu_start:gpu_end])
+
+            if req_segments:
+                replay_segments.append(torch.cat(req_segments, dim=0))
+
+        if (
+            cpu_fill_layer_inputs is not None
+            and cpu_fill_cursor != cpu_fill_layer_inputs.shape[0]
+        ):
+            raise AssertionError(
+                "Replay assembly did not consume all cpu_fill layer inputs."
+            )
+
+        if replay_segments:
+            replay_layer_inputs = torch.cat(replay_segments, dim=0)
+        else:
+            replay_layer_inputs = torch.empty(
+                (0, self.config.hidden_size),
+                dtype=dtype,
+                device=device,
+            )
+
+        if replay_layer_inputs.shape[0] != plan.replay_token_count:
+            raise AssertionError(
+                f"Expected {plan.replay_token_count} replay tokens but assembled "
+                f"{replay_layer_inputs.shape[0]}."
+            )
+        return replay_layer_inputs
+
+    def _forward_dynamic_replay(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        if not (get_pp_group().is_first_rank and get_pp_group().is_last_rank):
+            raise NotImplementedError(
+                "Dynamic replay currently requires pipeline parallel size 1."
+            )
+
+        runtime = get_forward_context().layer_recompute_runtime
+        assert runtime is not None
+
+        scheduled_hidden_states = hidden_states
+        scheduled_residual = residual
+        scheduled_layer_inputs = self._materialize_layer_input(
+            scheduled_hidden_states, scheduled_residual
+        )
+        replay_layer_inputs: torch.Tensor | None = None
+        aux_hidden_states: list[torch.Tensor] = []
+
+        if not self._dynamic_replay_forward_logged:
+            logger.info(
+                "Llama dynamic replay forward entered: start_layer=%d, "
+                "end_layer=%d, scheduled_tokens=%d, hidden_size=%d.",
+                self.start_layer,
+                self.end_layer,
+                int(hidden_states.shape[0]),
+                int(hidden_states.shape[-1]),
+            )
+            self._dynamic_replay_forward_logged = True
+
+        runtime.capture_scheduled_layer_input(
+            target_layer_idx=self.start_layer,
+            hidden_states=scheduled_layer_inputs,
+        )
+
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
+            relative_idx = layer_idx - self.start_layer
+            if relative_idx in self.aux_hidden_state_layers:
+                aux_hidden_states.append(scheduled_layer_inputs)
+
+            plan = runtime.get_layer_plan(layer_idx)
+            has_next_layer = layer_idx + 1 < self.end_layer
+            _nvtx.range_push(f"runkv:layer_compute:L{layer_idx}")
+
+            layer_start_event: torch.cuda.Event | None = None
+            if scheduled_hidden_states.device.type == "cuda":
+                layer_start_event = torch.cuda.Event(enable_timing=True)
+                layer_start_event.record()
+            runtime.set_layer_start_event(layer_idx, layer_start_event)
+
+            if plan.replay_token_count == 0:
+                fwd_start_event: torch.cuda.Event | None = None
+                if scheduled_hidden_states.device.type == "cuda":
+                    fwd_start_event = torch.cuda.Event(enable_timing=True)
+                    fwd_start_event.record()
+                runtime.set_layer_forward_start_event(layer_idx, fwd_start_event)
+
+                with self._with_runtime_attn_metadata(layer_idx=layer_idx):
+                    scheduled_hidden_states, scheduled_residual = layer(
+                        positions,
+                        scheduled_hidden_states,
+                        scheduled_residual,
+                    )
+                replay_layer_inputs = None
+                if has_next_layer:
+                    scheduled_layer_inputs = self._materialize_layer_input(
+                        scheduled_hidden_states, scheduled_residual
+                    )
+            else:
+                if not self._dynamic_replay_nonzero_replay_logged:
+                    logger.info(
+                        "Llama dynamic replay active on layer %d: "
+                        "replay_tokens=%d (cpu_fill=%d, gpu_reuse=%d), "
+                        "scheduled_tokens=%d, num_actual_tokens=%d.",
+                        layer_idx,
+                        int(plan.replay_token_count),
+                        int(plan.cpu_fill_token_count),
+                        int(plan.gpu_reuse_token_count),
+                        int(plan.scheduled_token_count),
+                        int(plan.num_actual_tokens),
+                    )
+                    self._dynamic_replay_nonzero_replay_logged = True
+
+                cpu_fill_layer_inputs = None
+                if plan.cpu_fill_token_count > 0:
+                    cpu_fill_layer_inputs = runtime.load_cpu_fill(layer_idx, plan)
+
+                replay_layer_inputs = self._assemble_replay_layer_inputs(
+                    plan=plan,
+                    cpu_fill_layer_inputs=cpu_fill_layer_inputs,
+                    prev_layer_replay_inputs=replay_layer_inputs,
+                )
+
+                replay_indices = plan.combined_replay_indices
+                scheduled_indices = plan.combined_scheduled_indices
+                combined_layer_inputs = torch.empty(
+                    (plan.num_actual_tokens, scheduled_layer_inputs.shape[-1]),
+                    dtype=scheduled_layer_inputs.dtype,
+                    device=scheduled_layer_inputs.device,
+                )
+                combined_layer_inputs[replay_indices] = replay_layer_inputs
+                combined_layer_inputs[scheduled_indices] = scheduled_layer_inputs
+
+                fwd_start_event = None
+                if combined_layer_inputs.device.type == "cuda":
+                    fwd_start_event = torch.cuda.Event(enable_timing=True)
+                    fwd_start_event.record()
+                runtime.set_layer_forward_start_event(layer_idx, fwd_start_event)
+
+                with self._with_runtime_attn_metadata(layer_idx=layer_idx):
+                    combined_hidden_states, combined_residual = layer(
+                        plan.combined_positions,
+                        combined_layer_inputs,
+                        None,
+                    )
+
+                if has_next_layer:
+                    combined_layer_outputs = self._materialize_layer_input(
+                        combined_hidden_states, combined_residual
+                    )
+                    replay_layer_inputs = combined_layer_outputs.index_select(
+                        0, replay_indices
+                    )
+                    scheduled_layer_inputs = combined_layer_outputs.index_select(
+                        0, scheduled_indices
+                    )
+                else:
+                    replay_layer_inputs = None
+                scheduled_hidden_states = combined_hidden_states.index_select(
+                    0, scheduled_indices
+                )
+                scheduled_residual = combined_residual.index_select(
+                    0, scheduled_indices
+                )
+
+            _nvtx.range_pop()
+
+            layer_end_event: torch.cuda.Event | None = None
+            if scheduled_hidden_states.device.type == "cuda":
+                layer_end_event = torch.cuda.Event(enable_timing=True)
+                layer_end_event.record()
+            runtime.set_layer_end_event(layer_idx, layer_end_event)
+
+            if (
+                runtime.async_plan_build_enabled
+                and layer_idx + 2 < self.end_layer
+            ):
+                runtime.submit_speculative_build(
+                    target_layer_idx=layer_idx + 2,
+                    current_plan=runtime.get_layer_plan(layer_idx + 1),
+                )
+
+            if has_next_layer:
+                runtime.capture_scheduled_layer_input(
+                    target_layer_idx=layer_idx + 1,
+                    hidden_states=scheduled_layer_inputs,
+                )
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {
+                    "hidden_states": scheduled_hidden_states,
+                    "residual": scheduled_residual,
+                }
+            )
+
+        scheduled_hidden_states, _ = self.norm(
+            scheduled_hidden_states, scheduled_residual
+        )
+        if aux_hidden_states:
+            return scheduled_hidden_states, aux_hidden_states
+        return scheduled_hidden_states
 
     def forward(
         self,
@@ -432,6 +723,10 @@ class LlamaModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+
+        runtime = get_forward_context().layer_recompute_runtime
+        if runtime is not None:
+            return self._forward_dynamic_replay(positions, hidden_states, residual)
 
         aux_hidden_states = []
         for idx, layer in enumerate(

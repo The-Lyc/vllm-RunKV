@@ -11,6 +11,7 @@ from vllm.v1.worker.opt_dynamic_replay import (
     ReplayPlanProvider,
     StaticReplayPlanProvider,
     compute_layer_replay_plan_for_layer,
+    promote_plan_indices_to_device,
 )
 
 
@@ -93,43 +94,79 @@ def test_compute_layer_replay_plan_builds_slot_mapping_and_pack_indices() -> Non
 
     assert np.array_equal(
         plan.kv_replay_start_per_req,
-        np.array([8, 4], dtype=np.int32),
+        np.array([8, 6], dtype=np.int32),
     )
     assert np.array_equal(
         plan.prev_gpu_start_per_req,
         np.array([10, 6], dtype=np.int32),
     )
-    assert plan.cpu_fill_token_count == 4
+    assert plan.cpu_fill_token_count == 2
     assert plan.gpu_reuse_token_count == 0
-    assert plan.replay_token_count == 4
+    assert plan.replay_token_count == 2
     assert plan.scheduled_token_count == 3
-    assert plan.num_actual_tokens == 7
+    assert plan.num_actual_tokens == 5
     assert plan.max_query_len == 4
-    assert torch.equal(plan.query_start_loc, torch.tensor([0, 4, 7], dtype=torch.int32))
+    assert torch.equal(plan.query_start_loc, torch.tensor([0, 4, 5], dtype=torch.int32))
     assert torch.equal(
         plan.slot_mapping,
-        torch.tensor([8, 9, 10, 11, 16, 17, 18], dtype=torch.int64),
+        torch.tensor([8, 9, 10, 11, 18], dtype=torch.int64),
+    )
+    assert torch.equal(
+        plan.combined_positions,
+        torch.tensor([8, 9, 10, 11, 6], dtype=torch.int64),
     )
     assert torch.equal(
         plan.combined_replay_indices,
-        torch.tensor([0, 1, 4, 5], dtype=torch.int64),
+        torch.tensor([0, 1], dtype=torch.int64),
     )
     assert torch.equal(
         plan.combined_scheduled_indices,
-        torch.tensor([2, 3, 6], dtype=torch.int64),
+        torch.tensor([2, 3, 4], dtype=torch.int64),
     )
     assert np.array_equal(
-        plan.cpu_fill_positions, np.array([8, 9, 4, 5], dtype=np.int32)
+        plan.cpu_fill_positions, np.array([8, 9], dtype=np.int32)
     )
     assert np.array_equal(
         plan.cpu_fill_logical_ids,
-        np.array([102, 102, 201, 201], dtype=np.int32),
+        np.array([102, 102], dtype=np.int32),
     )
     assert np.array_equal(
         plan.cpu_fill_block_offsets,
-        np.array([0, 1, 0, 1], dtype=np.int32),
+        np.array([0, 1], dtype=np.int32),
     )
     assert plan.gpu_reuse_slice_per_req == [(0, 0), (0, 0)]
+
+
+def test_promote_plan_positions_only_for_rotary_models() -> None:
+    computed_lens, scheduled_lens, logical_block_tables, mapper_mapping = (
+        _make_test_inputs()
+    )
+
+    def make_plan():
+        return compute_layer_replay_plan_for_layer(
+            layer_idx=0,
+            desired_replay_start_tokens=4,
+            computed_lens=computed_lens,
+            scheduled_lens=scheduled_lens,
+            logical_block_tables=logical_block_tables,
+            block_size=4,
+            mapper_mapping=mapper_mapping,
+            prev_layer_plan=None,
+        )
+
+    opt_plan = make_plan()
+    promote_plan_indices_to_device(opt_plan, torch.device("meta"))
+    assert opt_plan.combined_replay_indices.device.type == "meta"
+    assert opt_plan.combined_scheduled_indices.device.type == "meta"
+    assert opt_plan.combined_positions.device.type == "cpu"
+
+    llama_plan = make_plan()
+    promote_plan_indices_to_device(
+        llama_plan,
+        torch.device("meta"),
+        include_positions=True,
+    )
+    assert llama_plan.combined_positions.device.type == "meta"
 
 
 def test_compute_layer_replay_plan_reuses_gpu_suffix_when_current_layer_shorter() -> (
@@ -273,4 +310,7 @@ def test_random_replay_plan_provider_is_deterministic_and_block_aligned() -> Non
     assert np.array_equal(
         plan_a.kv_replay_start_per_req, plan_b.kv_replay_start_per_req
     )
-    assert np.all(plan_a.kv_replay_start_per_req % 4 == 0)
+    assert np.all(
+        (plan_a.kv_replay_start_per_req == computed_lens)
+        | (plan_a.kv_replay_start_per_req % 4 == 0)
+    )

@@ -867,13 +867,17 @@ class LayerRecomputeManager:
         ):
             # Keep the rows token-contiguous here. sync_hs_d2h() later scatters
             # them into the block-addressed CPU store using the target arrays.
-            default_stream = torch.cuda.current_stream(self.device)
             if self._hs_d2h_stream is not None and packed_hs_gpu.is_cuda:
+                default_stream = torch.cuda.current_stream(self.device)
                 with torch.cuda.stream(self._hs_d2h_stream):
                     self._hs_d2h_stream.wait_stream(default_stream)
                     packed_hs_cpu = packed_hs_gpu.to("cpu", non_blocking=True)
                     event = torch.cuda.Event()
                     event.record(self._hs_d2h_stream)
+                # Let the caching allocator defer reuse of the source storage
+                # until the copy stream is done, without retaining every
+                # layer's activation until the end-of-step synchronization.
+                packed_hs_gpu.record_stream(self._hs_d2h_stream)
                 self._hs_d2h_events_by_layer[layer_idx].append(event)
             else:
                 packed_hs_cpu = packed_hs_gpu.to("cpu")

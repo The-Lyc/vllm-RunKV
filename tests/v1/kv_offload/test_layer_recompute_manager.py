@@ -9,11 +9,17 @@ import pytest
 import torch
 from torch import nn
 
-from vllm.config import CUDAGraphMode
+from vllm.config import CompilationMode, CUDAGraphMode
 from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.v1.core.kv_cache_offload_config import RunKVOffloadConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.profiling.tightllm_offline_profiler import (
+    TightLLMProfileData,
+)
+from vllm.v1.worker.gpu_model_runner import (
+    GPUModelRunner,
+    _validate_tightllm_profile_model,
+)
 from vllm.v1.worker.layer_recompute import LayerRecomputeManager
 from vllm.v1.worker.opt_dynamic_replay import (
     LayerReplayPlan,
@@ -290,11 +296,14 @@ def _make_dynamic_mode_runner(
     *,
     model_type: str = "opt",
     do_layer_norm_before: bool = True,
+    is_causal: bool = True,
+    planner_mode: str = "static",
     tp: int = 1,
     pp: int = 1,
     dp: int = 1,
     dcp: int = 1,
     cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    compilation_mode: CompilationMode = CompilationMode.NONE,
     cascade_attn_enabled: bool = False,
     use_ubatching: bool = False,
 ) -> GPUModelRunner:
@@ -308,11 +317,13 @@ def _make_dynamic_mode_runner(
         enable_layer_recompute=True,
         layer_recompute_io_prefix_blocks=[4],
         layer_recompute_mode="prev_layer_output_dynamic",
+        layer_recompute_planner=planner_mode,
     )
     runner.model_config = SimpleNamespace(
         hf_config=SimpleNamespace(
             model_type=model_type,
             do_layer_norm_before=do_layer_norm_before,
+            is_causal=is_causal,
             hidden_size=16,
         )
     )
@@ -323,10 +334,23 @@ def _make_dynamic_mode_runner(
         decode_context_parallel_size=dcp,
         use_ubatching=use_ubatching,
     )
-    runner.compilation_config = SimpleNamespace(cudagraph_mode=cudagraph_mode)
+    runner.compilation_config = SimpleNamespace(
+        cudagraph_mode=cudagraph_mode,
+        mode=compilation_mode,
+    )
     runner.cascade_attn_enabled = cascade_attn_enabled
     runner.device = torch.device("cpu")
     runner.dtype = torch.float32
+    runner._direct_h2d_kv_token_count_enabled = False
+    runner._dynamic_replay_step_id = 0
+    runner._prehook_timing_enabled = False
+    runner._runkv_active_attention_nvtx_ranges = set()
+    runner._runkv_nvtx_push = None
+    runner._runkv_nvtx_pop = None
+    runner._runkv_nvtx_api_initialized = True
+    runner.paged_block_mappers = [
+        SimpleNamespace(load_stream=None, offload_stream=None)
+    ]
     runner.model = SimpleNamespace(
         model=SimpleNamespace(
             decoder=SimpleNamespace(
@@ -356,6 +380,10 @@ def _make_dynamic_plan(
         kv_replay_start_per_req=np.array([0], dtype=np.int32),
         computed_lens_per_req=np.array([4], dtype=np.int32),
         prev_gpu_start_per_req=np.array([4], dtype=np.int32),
+        replay_blocks_per_req=np.zeros(1, dtype=np.int32),
+        replay_block_count=0,
+        skip_logical_block_ids=np.empty(0, dtype=np.int32),
+        per_req_replay_block_ranges=np.zeros((1, 2), dtype=np.int32),
         cpu_fill_token_count=cpu_fill_token_count,
         gpu_reuse_token_count=0,
         replay_token_count=replay_token_count,
@@ -364,6 +392,7 @@ def _make_dynamic_plan(
         max_query_len=max(replay_token_count + scheduled_token_count, 1),
         query_start_loc=torch.tensor([0, num_actual_tokens], dtype=torch.int32),
         slot_mapping=torch.arange(num_actual_tokens, dtype=torch.int64),
+        combined_positions=torch.arange(num_actual_tokens, dtype=torch.int64),
         combined_replay_indices=torch.arange(replay_token_count, dtype=torch.int64),
         combined_scheduled_indices=torch.arange(
             replay_token_count, num_actual_tokens, dtype=torch.int64
@@ -383,10 +412,186 @@ def test_validate_prev_layer_output_dynamic_mode_accepts_phase1_config() -> None
     )
 
 
-def test_validate_prev_layer_output_dynamic_mode_rejects_non_opt() -> None:
+def test_validate_prev_layer_output_dynamic_mode_accepts_llama() -> None:
     runner = _make_dynamic_mode_runner(model_type="llama")
 
-    with pytest.raises(ValueError, match="supports only OPT models"):
+    runner._validate_prev_layer_output_dynamic_mode(
+        SimpleNamespace(kv_cache_groups=[object()])
+    )
+
+
+def test_validate_prev_layer_output_dynamic_mode_rejects_noncausal_llama() -> None:
+    runner = _make_dynamic_mode_runner(model_type="llama", is_causal=False)
+
+    with pytest.raises(ValueError, match="requires a causal Llama decoder"):
+        runner._validate_prev_layer_output_dynamic_mode(
+            SimpleNamespace(kv_cache_groups=[object()])
+        )
+
+
+def test_validate_prev_layer_output_dynamic_mode_accepts_llama_tightllm() -> None:
+    runner = _make_dynamic_mode_runner(
+        model_type="llama",
+        planner_mode="tightllm",
+    )
+
+    runner._validate_prev_layer_output_dynamic_mode(
+        SimpleNamespace(kv_cache_groups=[object()])
+    )
+
+
+def _tightllm_test_config(
+    *,
+    model_type: str = "llama",
+    num_kv_heads: int = 4,
+) -> SimpleNamespace:
+    common = {
+        "model_type": model_type,
+        "hidden_size": 16,
+        "num_attention_heads": 4,
+        "num_hidden_layers": 2,
+    }
+    if model_type == "llama":
+        return SimpleNamespace(
+            **common,
+            num_key_value_heads=num_kv_heads,
+            head_dim=4,
+            intermediate_size=32,
+            hidden_act="silu",
+            rms_norm_eps=1e-5,
+        )
+    return SimpleNamespace(
+        **common,
+        ffn_dim=64,
+        layer_norm_eps=1e-5,
+    )
+
+
+def _tightllm_test_profile(
+    config: SimpleNamespace,
+    *,
+    score_coefficient: float = 4.0,
+) -> TightLLMProfileData:
+    num_kv_heads = int(
+        getattr(config, "num_key_value_heads", None)
+        or config.num_attention_heads
+    )
+    qkv_coefficient = (
+        2.0 + 4.0 * num_kv_heads / config.num_attention_heads
+    )
+    is_llama = config.model_type == "llama"
+    return TightLLMProfileData(
+        hidden_size=config.hidden_size,
+        num_attention_heads=config.num_attention_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=config.hidden_size // config.num_attention_heads,
+        ffn_dim=(
+            config.intermediate_size if is_llama else config.ffn_dim
+        ),
+        num_layers=config.num_hidden_layers,
+        model_type=config.model_type,
+        attention_qkv_flops_coefficient=qkv_coefficient,
+        attention_output_flops_coefficient=2.0,
+        attention_score_flops_coefficient=score_coefficient,
+        mlp_flops_coefficient=6.0 if is_llama else 4.0,
+    )
+
+
+@pytest.mark.parametrize("num_kv_heads", [4, 1])
+def test_validate_tightllm_profile_model_accepts_llama_mha_and_gqa(
+    num_kv_heads: int,
+) -> None:
+    config = _tightllm_test_config(num_kv_heads=num_kv_heads)
+    profile = _tightllm_test_profile(config)
+
+    _validate_tightllm_profile_model(profile, config)
+
+
+@pytest.mark.parametrize("score_coefficient", [2.0, 4.0])
+def test_validate_tightllm_profile_model_accepts_opt_legacy_and_current_score(
+    score_coefficient: float,
+) -> None:
+    config = _tightllm_test_config(model_type="opt")
+    profile = _tightllm_test_profile(
+        config,
+        score_coefficient=score_coefficient,
+    )
+
+    _validate_tightllm_profile_model(profile, config)
+
+
+def test_validate_tightllm_profile_model_rejects_wrong_model_type() -> None:
+    config = _tightllm_test_config()
+    profile = _tightllm_test_profile(config)
+    profile.model_type = "opt"
+
+    with pytest.raises(ValueError, match="model_type mismatch"):
+        _validate_tightllm_profile_model(profile, config)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "hidden_size",
+        "num_attention_heads",
+        "num_kv_heads",
+        "head_dim",
+        "ffn_dim",
+        "num_layers",
+    ],
+)
+def test_validate_tightllm_profile_model_rejects_dimension_mismatch(
+    field: str,
+) -> None:
+    config = _tightllm_test_config()
+    profile = _tightllm_test_profile(config)
+    setattr(profile, field, getattr(profile, field) + 1)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"architecture mismatch: .*{field}",
+    ):
+        _validate_tightllm_profile_model(profile, config)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "attention_qkv_flops_coefficient",
+        "attention_output_flops_coefficient",
+        "attention_score_flops_coefficient",
+        "mlp_flops_coefficient",
+    ],
+)
+def test_validate_tightllm_profile_model_rejects_llama_coefficient_mismatch(
+    field: str,
+) -> None:
+    config = _tightllm_test_config()
+    profile = _tightllm_test_profile(config)
+    setattr(profile, field, getattr(profile, field) + 0.5)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"FLOP coefficient mismatch: .*{field}",
+    ):
+        _validate_tightllm_profile_model(profile, config)
+
+
+def test_validate_tightllm_profile_rejects_unknown_opt_score() -> None:
+    config = _tightllm_test_config(model_type="opt")
+    profile = _tightllm_test_profile(config, score_coefficient=3.0)
+
+    with pytest.raises(
+        ValueError,
+        match="attention_score_flops_coefficient",
+    ):
+        _validate_tightllm_profile_model(profile, config)
+
+
+def test_validate_prev_layer_output_dynamic_mode_rejects_unsupported_model() -> None:
+    runner = _make_dynamic_mode_runner(model_type="qwen2")
+
+    with pytest.raises(ValueError, match="supports only Llama/OPT models"):
         runner._validate_prev_layer_output_dynamic_mode(
             SimpleNamespace(kv_cache_groups=[object()])
         )
@@ -429,6 +634,17 @@ def test_validate_prev_layer_output_dynamic_mode_rejects_cudagraph() -> None:
     runner = _make_dynamic_mode_runner(cudagraph_mode=CUDAGraphMode.PIECEWISE)
 
     with pytest.raises(ValueError, match="requires cudagraph_mode=NONE"):
+        runner._validate_prev_layer_output_dynamic_mode(
+            SimpleNamespace(kv_cache_groups=[object()])
+        )
+
+
+def test_validate_prev_layer_output_dynamic_mode_rejects_compilation() -> None:
+    runner = _make_dynamic_mode_runner(
+        compilation_mode=CompilationMode.VLLM_COMPILE
+    )
+
+    with pytest.raises(ValueError, match="pass --enforce-eager"):
         runner._validate_prev_layer_output_dynamic_mode(
             SimpleNamespace(kv_cache_groups=[object()])
         )
@@ -493,6 +709,7 @@ def test_prepare_dynamic_replay_runtime_builds_layer0_plan_and_prefetches() -> N
     runner.paged_dirty_blocks = [set()]
     mapper = Mock()
     mapper.mapping = {10: 0, 11: 1}
+    mapper.peek_layer_load_block_count.return_value = 0
     runner.paged_block_mappers = [mapper]
     layer0_plan = _make_dynamic_plan(
         cpu_fill_token_count=2,
@@ -545,6 +762,8 @@ def test_runkv_pre_hook_dynamic_mode_builds_next_plan_and_overlaps_loads() -> No
     ]
     mapper0 = Mock()
     mapper1 = Mock()
+    mapper0.peek_layer_load_block_count.return_value = 0
+    mapper1.peek_layer_load_block_count.return_value = 0
     runner.paged_block_mappers = [mapper0, mapper1]
     runner._get_next_layer_info = Mock(return_value=("layer.1", 1, 1))
 
@@ -614,8 +833,8 @@ def test_runkv_pre_hook_dynamic_mode_builds_next_plan_and_overlaps_loads() -> No
         "sync_kv_0",
         "sync_hs_0",
         "skip_1",
-        "prefetch_kv_1",
         "prefetch_hs_1",
+        "prefetch_kv_1",
     ]
     runner._build_dynamic_layer_plan.assert_called_once_with(
         layer_idx=1,
@@ -646,6 +865,7 @@ def test_prepare_layer_recompute_step_metadata_caches_arrays_and_calls_manager()
     runner.use_runkv = True
     runner.layer_recompute_enabled = True
     runner.layer_recompute_manager = Mock()
+    runner.replay_plan_provider = None
     runner.input_batch = SimpleNamespace(
         block_table=SimpleNamespace(block_tables=[bt]),
         req_ids=["req-0", "req-1"],
@@ -712,6 +932,10 @@ def test_prepare_layer_recompute_step_metadata_clears_cache_when_disabled():
 def test_runkv_pre_hook_layer_recompute_pipeline_order_and_skip_forwarding():
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.layer_recompute_enabled = True
+    runner._runkv_active_attention_nvtx_ranges = set()
+    runner._runkv_nvtx_push = None
+    runner._runkv_nvtx_pop = None
+    runner._runkv_nvtx_api_initialized = True
     runner.kv_offload_config = RunKVOffloadConfig(
         enabled=True,
         enable_layer_recompute=True,
@@ -798,6 +1022,10 @@ def test_runkv_pre_hook_without_layer_recompute_keeps_original_behavior():
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.layer_recompute_enabled = False
     runner.layer_recompute_manager = Mock()
+    runner._runkv_active_attention_nvtx_ranges = set()
+    runner._runkv_nvtx_push = None
+    runner._runkv_nvtx_pop = None
+    runner._runkv_nvtx_api_initialized = True
     runner.kv_offload_config = RunKVOffloadConfig(enabled=True)
     runner.paged_dirty_blocks = [set(), set()]
 

@@ -215,6 +215,100 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
+def _supports_runkv_component_timing(model_type: str | None) -> bool:
+    return model_type in {"llama", "opt"}
+
+
+def _validate_tightllm_profile_model(
+    profile: Any,
+    hf_config: Any,
+) -> None:
+    """Reject a TightLLM profile built for a different architecture."""
+    from vllm.v1.profiling.tightllm_offline_profiler import (
+        resolve_model_profile_spec,
+    )
+
+    model_type = str(getattr(hf_config, "model_type", "")).lower()
+    profile_model_type = str(getattr(profile, "model_type", "opt")).lower()
+    if profile_model_type != model_type:
+        raise ValueError(
+            "TightLLM profile model_type mismatch: "
+            f"profile={profile_model_type!r}, model={model_type!r}. "
+            "Generate a model-specific profile with "
+            "`python -m vllm.v1.profiling.tightllm_offline_profiler`."
+        )
+
+    spec = resolve_model_profile_spec(hf_config)
+    expected = {
+        "hidden_size": spec.hidden_size,
+        "num_attention_heads": spec.num_attention_heads,
+        "num_kv_heads": spec.num_kv_heads,
+        "head_dim": spec.head_dim,
+        "ffn_dim": spec.ffn_dim,
+        "num_layers": spec.num_layers,
+    }
+    mismatches = [
+        f"{name}: profile={int(getattr(profile, name, 0))}, model={value}"
+        for name, value in expected.items()
+        if int(getattr(profile, name, 0)) != value
+    ]
+    if mismatches:
+        raise ValueError(
+            "TightLLM profile architecture mismatch: "
+            + "; ".join(mismatches)
+            + ". Generate a profile for the exact model configuration."
+        )
+
+    coefficient_defaults = {
+        "attention_qkv_flops_coefficient": 6.0,
+        "attention_output_flops_coefficient": 2.0,
+        "attention_score_flops_coefficient": 2.0,
+        "mlp_flops_coefficient": 4.0,
+    }
+    expected_coefficients = {
+        "attention_qkv_flops_coefficient": (
+            spec.attention_qkv_flops_coefficient
+        ),
+        "attention_output_flops_coefficient": (
+            spec.attention_output_flops_coefficient
+        ),
+        "attention_score_flops_coefficient": (
+            spec.attention_score_flops_coefficient
+        ),
+        "mlp_flops_coefficient": spec.mlp_flops_coefficient,
+    }
+    coefficient_mismatches = []
+    for name, expected_value in expected_coefficients.items():
+        profile_value = float(
+            getattr(profile, name, coefficient_defaults[name])
+        )
+        allowed_values = {expected_value}
+        if (
+            model_type == "opt"
+            and name == "attention_score_flops_coefficient"
+        ):
+            # Profiles generated before the score·V correction counted only
+            # QK^T and therefore stored (or load with) coefficient 2.
+            allowed_values.add(2.0)
+        if not any(
+            np.isclose(profile_value, allowed, rtol=1e-9, atol=1e-12)
+            for allowed in allowed_values
+        ):
+            expected_text = "/".join(
+                f"{allowed:g}" for allowed in sorted(allowed_values)
+            )
+            coefficient_mismatches.append(
+                f"{name}: profile={profile_value:g}, "
+                f"expected={expected_text}"
+            )
+    if coefficient_mismatches:
+        raise ValueError(
+            "TightLLM profile FLOP coefficient mismatch: "
+            + "; ".join(coefficient_mismatches)
+            + ". Regenerate the profile for this model architecture."
+        )
+
+
 # RunKV batch copy kernel support (standalone extension module)
 def _get_runkv_batch_copy():
     """Get the batch copy function from standalone runkv_kernels module."""
@@ -1260,12 +1354,19 @@ class GPUModelRunner(
         self.observability_config = vllm_config.observability_config
         self._opt_component_mfu_step = 0
         self._opt_component_mfu_skip_logged = False
-        self._is_opt_model = (
-            getattr(self.model_config.hf_config, "model_type", None) == "opt"
+        component_model_type = getattr(
+            self.model_config.hf_config, "model_type", None
+        )
+        # Keep the OPT-named observability API for compatibility while using
+        # the same runtime-event JSONL path for every model family whose
+        # dynamic replay forward is implemented.
+        self._is_opt_model = component_model_type == "opt"
+        self._supports_runkv_component_timing = _supports_runkv_component_timing(
+            component_model_type
         )
         self._opt_component_mfu_enabled = (
             self.observability_config.enable_opt_component_mfu_profiling
-            and self._is_opt_model
+            and self._supports_runkv_component_timing
         )
         self._opt_component_mfu_output_path = (
             self.observability_config.opt_component_mfu_output_path
@@ -1281,16 +1382,16 @@ class GPUModelRunner(
         )
         self._opt_component_log_enabled = bool(
             (self._opt_component_mfu_enabled or self._opt_component_mfu_output_path)
-            and self._is_opt_model
+            and self._supports_runkv_component_timing
         )
         if (
             self.observability_config.enable_opt_component_mfu_profiling
             or self._opt_component_mfu_output_path
-        ) and not self._is_opt_model:
+        ) and not self._supports_runkv_component_timing:
             logger.warning_once(
-                "OPT component profiling only supports OPT models; "
+                "RunKV component timing only supports Llama/OPT models; "
                 "profiling/logging will be disabled for model_type=%s.",
-                getattr(self.model_config.hf_config, "model_type", None),
+                component_model_type,
             )
         # All step + flat records kept in memory; flushed to JSONL once on
         # process exit so per-step file IO doesn't sit in the forward path.
@@ -3869,7 +3970,18 @@ class GPUModelRunner(
                             if _timing:
                                 _bp_ts = _time.perf_counter()
                             if self.device.type == "cuda":
-                                promote_plan_indices_to_device(next_plan, self.device)
+                                promote_plan_indices_to_device(
+                                    next_plan,
+                                    self.device,
+                                    include_positions=(
+                                        getattr(
+                                            self.model_config.hf_config,
+                                            "model_type",
+                                            "",
+                                        )
+                                        == "llama"
+                                    ),
+                                )
                             if _timing:
                                 self._prehook_t_bp_promote += (
                                     _time.perf_counter() - _bp_ts
@@ -5868,7 +5980,7 @@ class GPUModelRunner(
         if cudagraph_mode != CUDAGraphMode.NONE:
             if not self._opt_component_mfu_skip_logged:
                 logger.warning_once(
-                    "OPT component profiling only supports eager execution. "
+                    "RunKV component timing only supports eager execution. "
                     "Current step uses cudagraph mode %s; skipping profiling/logging. "
                     "Use --enforce-eager for stable measurements.",
                     cudagraph_mode,
@@ -8751,13 +8863,24 @@ class GPUModelRunner(
 
         hf_config = self.model_config.hf_config
         model_type = getattr(hf_config, "model_type", "")
-        if model_type != "opt":
+        if model_type not in {"llama", "opt"}:
             raise ValueError(
                 "RunKV layer_recompute_mode='prev_layer_output_dynamic' "
-                f"currently supports only OPT models; got model_type={model_type!r}."
+                "currently supports only Llama/OPT models; "
+                f"got model_type={model_type!r}."
             )
 
-        if not bool(getattr(hf_config, "do_layer_norm_before", False)):
+        if model_type == "llama" and not bool(
+            getattr(hf_config, "is_causal", True)
+        ):
+            raise ValueError(
+                "RunKV layer_recompute_mode='prev_layer_output_dynamic' "
+                "requires a causal Llama decoder."
+            )
+
+        if model_type == "opt" and not bool(
+            getattr(hf_config, "do_layer_norm_before", False)
+        ):
             raise ValueError(
                 "RunKV layer_recompute_mode='prev_layer_output_dynamic' "
                 "currently supports only pre-LN OPT models "
@@ -8791,6 +8914,12 @@ class GPUModelRunner(
             raise ValueError(
                 "RunKV layer_recompute_mode='prev_layer_output_dynamic' "
                 "requires cudagraph_mode=NONE."
+            )
+
+        if self.compilation_config.mode != CompilationMode.NONE:
+            raise ValueError(
+                "RunKV layer_recompute_mode='prev_layer_output_dynamic' "
+                "requires fully eager execution; pass --enforce-eager."
             )
 
         if self.cascade_attn_enabled:
@@ -8898,6 +9027,10 @@ class GPUModelRunner(
             )
 
             profile_data = TightLLMProfileData.load(profile_path)
+            _validate_tightllm_profile_model(
+                profile_data,
+                self.model_config.hf_config,
+            )
             self.replay_plan_provider = TightLLMReplayPlanProvider(
                 profile=profile_data,
                 io_prefix_blocks=normalized_io_prefix,
@@ -9098,7 +9231,13 @@ class GPUModelRunner(
             prev_layer_plan=None,
         )
         if self.device.type == "cuda":
-            promote_plan_indices_to_device(layer0_plan, self.device)
+            promote_plan_indices_to_device(
+                layer0_plan,
+                self.device,
+                include_positions=(
+                    getattr(self.model_config.hf_config, "model_type", "") == "llama"
+                ),
+            )
         runtime.set_layer_plan(layer0_idx, layer0_plan)
         layer0_metadata = self._build_layer_attn_metadata(
             layer_idx=layer0_idx,

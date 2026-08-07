@@ -28,8 +28,8 @@ NOTE on overlap window (deviates from the paper):
 
     not just ``attn(L) + FFN(L)`` as in the original paper.  ``flops_attn``
     in ``_compute_times`` therefore includes the next layer's QKV
-    projection (extra 6·H² FLOPs/token) so the ILP's compute-side estimate
-    matches the actual overlap window the runtime exposes.
+    projection.  Projection FLOPs are read from the model-aware offline
+    profile so OPT, Llama MHA, and Llama GQA use the matching architecture.
 """
 
 from __future__ import annotations
@@ -103,12 +103,19 @@ def _compute_times(
 
     Eq 3' — Attention compute time (per layer, with next-layer QKV
             credited to the current layer's overlap window):
-        flops_attn = N · ( 8·H²            # QKV(L) + Out(L)
-                          + 6·H²           # QKV(L+1)  (added)
-                          + 2·n_heads·n_ctx·d_head )  # attn scores(L)
+        flops_attn = N · ((2·C_qkv + C_out)·H²
+                          + C_score·n_heads·n_ctx·d_head)
 
-    Eq 4 — FFN compute time:
-        T_ffn  = Nr · 4·d_model·d_ffn / (FLOPS × MFU_ffn)
+        C_qkv=6 for MHA.  For GQA it is
+        2 + 4·num_kv_heads/num_attention_heads.
+        C_score=4 counts both QK^T and score·V in newly generated profiles.
+        Legacy profiles retain their historical coefficient of 2.
+
+    Eq 4 — FFN/MLP compute time:
+        T_ffn = N · C_mlp·d_model·d_ffn / (FLOPS × MFU_ffn)
+
+        C_mlp=4 for OPT's two projections and 6 for Llama SwiGLU's
+        gate/up/down projections.
 
     Eq 5 — KV cache transfer time (CPU-only, Cd=0, Cc=1):
         T_cache = 4·(N_ctx − Nr)·d_model / Bdw_cg
@@ -128,30 +135,35 @@ def _compute_times(
     d_head = profile.head_dim
     peak = profile.gpu_peak_flops
 
-    # MFU lookup — both tables are profiled in the decode regime
-    # (q.len = 1, kv.len = ctx_len), so the look-up key is the per-token
-    # context length, not the batch token count.
+    # MFU lookup uses the effective context length selected by the existing
+    # TightLLM model.  The architecture-specific FLOP coefficients below
+    # must match those used to produce the profile's MFU tables.
     mfu_attn = max(profile.lookup_mfu_attn(avg_context_len), 1e-6)
-    mfu_ffn = max(profile.lookup_mfu_ffn(avg_context_len), 1e-6)
+    mfu_ffn = max(profile.lookup_mfu_ffn(num_actual_tokens), 1e-6)
 
     # --- Attention-block FLOPs  (Eq 3, extended) ---
-    # Per-token coefficients (factor of 2 for FMA already included):
-    #   QKV proj  (L)   : 2·H · 3H            = 6·H²
-    #   Out proj  (L)   : 2·H · H             = 2·H²
-    #   QKV proj  (L+1) : 2·H · 3H            = 6·H²   <-- next-layer
-    #                                                     credited here so
-    #                                                     the overlap window
-    #                                                     ends just before
-    #                                                     attn(L+1).
-    #   Attn scores(L)  : 2·n_heads·n_ctx·d_head
+    # The profile stores coefficients with the factor of 2 for FMA already
+    # included.  Crediting QKV(L+1) makes the overlap window end immediately
+    # before attention(L+1), matching the runtime hook placement.
+    qkv_coefficient = float(
+        getattr(profile, "attention_qkv_flops_coefficient", 6.0)
+    )
+    output_coefficient = float(
+        getattr(profile, "attention_output_flops_coefficient", 2.0)
+    )
+    score_coefficient = float(
+        getattr(profile, "attention_score_flops_coefficient", 2.0)
+    )
     flops_attn = num_actual_tokens * (
-        14 * H * H  # 8·H² (QKV+Out of L) + 6·H² (QKV of L+1)
-        + 2 * n_heads * avg_context_len * d_head  # attention scores
+        (2 * qkv_coefficient + output_coefficient) * H * H
+        + score_coefficient * n_heads * avg_context_len * d_head
     )
 
-    # --- FFN FLOPs  (Eq 4) ---
-    # Two linear layers: bs·Nr · 4·d_model·d_ffn
-    flops_ffn = 4 * num_actual_tokens * H * F_dim
+    # --- FFN/MLP FLOPs  (Eq 4) ---
+    # OPT has two projections (coefficient 4); Llama SwiGLU has three
+    # projections (coefficient 6).
+    mlp_coefficient = float(getattr(profile, "mlp_flops_coefficient", 4.0))
+    flops_ffn = mlp_coefficient * num_actual_tokens * H * F_dim
 
     t_compute = 0.0
     if peak > 0:

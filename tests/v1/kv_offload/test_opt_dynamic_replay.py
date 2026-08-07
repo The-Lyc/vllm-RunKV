@@ -43,6 +43,10 @@ def _make_layer_plan() -> LayerReplayPlan:
         kv_replay_start_per_req=np.array([0, 4], dtype=np.int32),
         computed_lens_per_req=np.array([8, 12], dtype=np.int32),
         prev_gpu_start_per_req=np.array([8, 12], dtype=np.int32),
+        replay_blocks_per_req=np.zeros(2, dtype=np.int32),
+        replay_block_count=0,
+        skip_logical_block_ids=np.empty(0, dtype=np.int32),
+        per_req_replay_block_ranges=np.zeros((2, 2), dtype=np.int32),
         cpu_fill_token_count=3,
         gpu_reuse_token_count=5,
         replay_token_count=8,
@@ -51,6 +55,7 @@ def _make_layer_plan() -> LayerReplayPlan:
         max_query_len=6,
         query_start_loc=torch.tensor([0, 4, 10], dtype=torch.int32),
         slot_mapping=torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], dtype=torch.int64),
+        combined_positions=torch.arange(10, dtype=torch.int64),
         combined_replay_indices=torch.tensor(
             [0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.int64
         ),

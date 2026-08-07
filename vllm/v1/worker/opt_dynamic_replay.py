@@ -37,6 +37,7 @@ class LayerReplayPlan:
     max_query_len: int
     query_start_loc: torch.Tensor
     slot_mapping: torch.Tensor
+    combined_positions: torch.Tensor
     combined_replay_indices: torch.Tensor
     combined_scheduled_indices: torch.Tensor
     cpu_fill_positions: np.ndarray
@@ -326,6 +327,7 @@ def compute_layer_replay_plan_for_layer(
     skip_logical_block_ids: list[int] = []
     per_req_replay_block_ranges: list[tuple[int, int]] = []
     slot_mapping_values: list[int] = []
+    combined_positions: list[int] = []
     combined_replay_indices: list[int] = []
     combined_scheduled_indices: list[int] = []
     gpu_reuse_slice_per_req: list[tuple[int, int]] = []
@@ -377,6 +379,7 @@ def compute_layer_replay_plan_for_layer(
                 mapper_mapping=mapper_mapping,
             )
             slot_mapping_values.append(slot)
+            combined_positions.append(position)
             if position < cpu_fill_end:
                 cpu_fill_positions.append(position)
                 cpu_fill_logical_ids.append(logical_id)
@@ -391,6 +394,7 @@ def compute_layer_replay_plan_for_layer(
                 mapper_mapping=mapper_mapping,
             )
             slot_mapping_values.append(slot)
+            combined_positions.append(position)
 
         combined_prefix = replay_segment_end + scheduled_len
         query_start_loc.append(combined_prefix)
@@ -405,6 +409,9 @@ def compute_layer_replay_plan_for_layer(
     )
     slot_mapping_tensor = torch.tensor(
         slot_mapping_values, dtype=torch.int64, pin_memory=_pin
+    )
+    combined_positions_tensor = torch.tensor(
+        combined_positions, dtype=torch.int64, pin_memory=_pin
     )
     combined_replay_indices_tensor = torch.tensor(
         combined_replay_indices, dtype=torch.int64, pin_memory=_pin
@@ -431,6 +438,11 @@ def compute_layer_replay_plan_for_layer(
             f"layer_idx={layer_idx} built {slot_mapping_tensor.shape[0]} slots for "
             f"{num_actual_tokens} actual tokens."
         )
+    if combined_positions_tensor.shape[0] != num_actual_tokens:
+        raise AssertionError(
+            f"layer_idx={layer_idx} built {combined_positions_tensor.shape[0]} "
+            f"positions for {num_actual_tokens} actual tokens."
+        )
 
     return LayerReplayPlan(
         kv_replay_start_per_req=kv_replay_start_per_req,
@@ -448,6 +460,7 @@ def compute_layer_replay_plan_for_layer(
         max_query_len=int((replay_lens_per_req + scheduled_lens_i32).max(initial=0)),
         query_start_loc=query_start_loc_tensor,
         slot_mapping=slot_mapping_tensor,
+        combined_positions=combined_positions_tensor,
         combined_replay_indices=combined_replay_indices_tensor,
         combined_scheduled_indices=combined_scheduled_indices_tensor,
         cpu_fill_positions=np.asarray(cpu_fill_positions, dtype=np.int32),
@@ -460,16 +473,21 @@ def compute_layer_replay_plan_for_layer(
 def promote_plan_indices_to_device(
     plan: LayerReplayPlan,
     device: torch.device,
+    *,
+    include_positions: bool = False,
 ) -> None:
     """Move scatter indices to GPU in-place via async H2D.
 
     `combined_replay_indices` / `combined_scheduled_indices` feed the
-    `index_put_` scatters that build the layer's `combined_hidden_states`,
-    which in turn is the input to qkv_proj. Doing the H2D inside the
-    forward path (after prefetch has been queued) makes qkv_proj wait
-    behind prefetch on the shared copy engine. Promoting here — inside
-    pre_hook(L-1), before schedule_io queues prefetch(L) — lets the small
-    HtoD slip through the empty FIFO ahead of the big prefetch.
+    `index_put_` scatters that build the layer's `combined_hidden_states`.
+    `combined_positions` is consumed by rotary-position models such as Llama
+    and is copied only when `include_positions` is set, so OPT keeps its
+    existing H2D traffic.
+    Doing these H2D copies inside the forward path (after prefetch has been
+    queued) makes qkv_proj wait behind prefetch on the shared copy engine.
+    Promoting here — inside pre_hook(L-1), before schedule_io queues
+    prefetch(L) — lets the small HtoD copies slip through the empty FIFO ahead
+    of the big prefetch.
 
     Source tensors must be pinned (see `compute_layer_replay_plan_for_layer`)
     for `non_blocking=True` to actually return immediately on the host.
@@ -485,6 +503,8 @@ def promote_plan_indices_to_device(
         plan.combined_scheduled_indices = plan.combined_scheduled_indices.to(
             device, non_blocking=True
         )
+    if include_positions and plan.combined_positions.device != device:
+        plan.combined_positions = plan.combined_positions.to(device, non_blocking=True)
 
 
 def build_stable_successor_plan(prev_plan: LayerReplayPlan) -> LayerReplayPlan:
@@ -536,6 +556,7 @@ def build_stable_successor_plan(prev_plan: LayerReplayPlan) -> LayerReplayPlan:
         max_query_len=int(prev_plan.max_query_len),
         query_start_loc=prev_plan.query_start_loc,
         slot_mapping=prev_plan.slot_mapping,
+        combined_positions=prev_plan.combined_positions,
         combined_replay_indices=prev_plan.combined_replay_indices,
         combined_scheduled_indices=prev_plan.combined_scheduled_indices,
         cpu_fill_positions=empty_i32,

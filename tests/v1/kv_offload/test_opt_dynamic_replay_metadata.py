@@ -55,6 +55,7 @@ class _DummyAttnGroup:
 def _make_runner(builder: _DummyBuilder) -> GPUModelRunner:
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.device = torch.device("cpu")
+    runner._prehook_timing_enabled = False
     runner.attn_groups = [[_DummyAttnGroup(["model.layers.0.attn"], builder)]]
     return runner
 
@@ -71,6 +72,10 @@ def _make_layer_plan(
         kv_replay_start_per_req=np.array([4, 4], dtype=np.int32),
         computed_lens_per_req=np.array([8, 8], dtype=np.int32),
         prev_gpu_start_per_req=np.array([8, 8], dtype=np.int32),
+        replay_blocks_per_req=np.zeros(2, dtype=np.int32),
+        replay_block_count=0,
+        skip_logical_block_ids=np.empty(0, dtype=np.int32),
+        per_req_replay_block_ranges=np.zeros((2, 2), dtype=np.int32),
         cpu_fill_token_count=replay_token_count,
         gpu_reuse_token_count=0,
         replay_token_count=replay_token_count,
@@ -79,6 +84,7 @@ def _make_layer_plan(
         max_query_len=max_query_len,
         query_start_loc=torch.tensor(query_start_loc, dtype=torch.int32),
         slot_mapping=torch.tensor(slot_mapping, dtype=torch.int64),
+        combined_positions=torch.arange(num_actual_tokens, dtype=torch.int64),
         combined_replay_indices=torch.arange(replay_token_count, dtype=torch.int64),
         combined_scheduled_indices=torch.arange(
             replay_token_count, num_actual_tokens, dtype=torch.int64
